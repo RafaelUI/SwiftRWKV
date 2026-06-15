@@ -1,0 +1,254 @@
+import Foundation
+import MLX
+import MLXNN
+import RWKVKernel
+
+// ───────────────────────────────────────────────────────────────────────
+//  RWKV-7 "Goose" x070 — точный порт rwkv_metal/model/rwkv7_x070.py для
+//  загрузки официальных World-весов. Функциональный forward (без nn.Module-
+//  дерева) ради прозрачного паритета logits против Python-эталона.
+//
+//  Отличия от RWKVBackbone (RWKVTrain, версия rwkv7 from-scratch):
+//   1. decay w: sigmoid(w0 + B(tanh(A(xw))))     (w0 = bias w_lora_B)
+//   2. iclr a:  sigmoid(a0 + B(A(xa)))           БЕЗ tanh  (a0 = bias a_lora_B)
+//   3. gate g:  B(sigmoid(A(xg)))                sigmoid ВНУТРИ, линейно наружу
+//   4. ln_x:    GroupNorm по головам (eps=64e-5, pytorch_compatible)
+//   5. порядок: WKV → ln_x → +bonus → *g
+//   6. token-shift: нулевой паддинг t=0 в каждом блоке, БЕЗ межблочного переноса
+//   7. cmix FFN размер D*4
+// ───────────────────────────────────────────────────────────────────────
+
+/// Конфиг x070-модели.
+public struct X070Config: Sendable {
+    public var nLayer: Int
+    public var nEmbd: Int
+    public var headSize: Int
+    public var vocab: Int
+    public var nHead: Int { nEmbd / headSize }
+
+    public init(nLayer: Int, nEmbd: Int, headSize: Int = 64, vocab: Int) {
+        self.nLayer = nLayer
+        self.nEmbd = nEmbd
+        self.headSize = headSize
+        self.vocab = vocab
+    }
+}
+
+// ─────────────────── Утилиты ───────────────────
+
+private func l2norm(_ x: MLXArray) -> MLXArray {
+    x / sqrt((x * x).sum(axis: -1, keepDims: true) + 1e-12)
+}
+
+private func layerNorm(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
+                       eps: Float = 1e-5) -> MLXArray {
+    let mean = x.mean(axis: -1, keepDims: true)
+    let varc = (x - mean).square().mean(axis: -1, keepDims: true)
+    let normed = (x - mean) / sqrt(varc + eps)
+    return normed * weight + bias
+}
+
+// Linear без bias: x[...,in] @ Wᵀ, W хранится [out, in].
+private func linear(_ x: MLXArray, _ w: MLXArray) -> MLXArray {
+    matmul(x, w.transposed())
+}
+private func linear(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray) -> MLXArray {
+    matmul(x, w.transposed()) + b
+}
+
+// ─────────────────── Backbone ───────────────────
+
+/// x070-backbone поверх плоского словаря весов (MLX-имена тензоров).
+public final class X070Backbone {
+    public let cfg: X070Config
+    var w: [String: MLXArray]
+
+    // GroupNorm с pytorch_compatible-семантикой (eps=64e-5). Применяется
+    // per-token к [N, D] (каждый токен нормализуется независимо по головам).
+    private let groupNorm: GroupNorm
+
+    public init(weights: [String: MLXArray], cfg: X070Config,
+                computeDType: DType = .bfloat16) {
+        self.cfg = cfg
+        var conv: [String: MLXArray] = [:]
+        for (k, v) in weights { conv[k] = v.asType(computeDType) }
+        self.w = conv
+
+        // affine=false: вес/смещение ln_x применяем вручную из весов модели,
+        // т.к. они per-layer (blocks.N.tmix.ln_x.{weight,bias}).
+        self.groupNorm = GroupNorm(groupCount: cfg.nHead, dimensions: cfg.nEmbd,
+                                   eps: 64e-5, affine: false, pytorchCompatible: true)
+    }
+
+    private func g(_ key: String) -> MLXArray { w[key]! }
+
+    // token-shift: prev[t]=x[t-1], prev[0]=0 (нулевой паддинг). xx = prev - x.
+    private func tokenShift(_ x: MLXArray) -> MLXArray {
+        let B = x.shape[0], T = x.shape[1], D = x.shape[2]
+        let zero = MLXArray.zeros([B, 1, D], dtype: x.dtype)
+        let shifted = concatenated([zero, x[0..., 0 ..< (T - 1)]], axis: 1)
+        return shifted - x
+    }
+
+    // GroupNorm ln_x. Точно воспроизводим Python: self.ln_x(out.reshape(B,T,D)).
+    //
+    // ВАЖНО: MLX GroupNorm на [B,T,D] трактует batch=B и СМЕШИВАЕТ все T
+    // внутри каждой головы (не per-token!). x070-код опирается именно на
+    // эту семантику, поэтому подаём [B,T,D] НАПРЯМУЮ (не разворачивая в [B*T,...]).
+    private func lnX(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray) -> MLXArray {
+        let normed = groupNorm(x)                  // [B,T,D], batch=B, group=H по всем T
+        return normed * weight + bias
+    }
+
+    // time-mix блока layer. Возвращает (выход, обновлённый v_first).
+    private func tmix(_ x: MLXArray, _ vFirst: MLXArray?, _ layer: Int)
+        -> (MLXArray, MLXArray) {
+        let p = "blocks.\(layer).tmix."
+        let B = x.shape[0], T = x.shape[1], D = cfg.nEmbd
+        let H = cfg.nHead, S = cfg.headSize
+
+        let xx = tokenShift(x)
+        let xr = x + xx * g(p + "x_r")
+        let xw = x + xx * g(p + "x_w")
+        let xk = x + xx * g(p + "x_k")
+        let xv = x + xx * g(p + "x_v")
+        let xa = x + xx * g(p + "x_a")
+        let xg = x + xx * g(p + "x_g")
+
+        var r = linear(xr, g(p + "r_proj.weight")).reshaped([B, T, H, S])
+        var k = linear(xk, g(p + "k_proj.weight")).reshaped([B, T, H, S])
+        var v = linear(xv, g(p + "v_proj.weight")).reshaped([B, T, H, S])
+
+        // gate: B(sigmoid(A(xg))) — sigmoid ВНУТРИ, линейно наружу, без bias.
+        let gate = linear(sigmoid(linear(xg, g(p + "g_lora_A.weight"))),
+                          g(p + "g_lora_B.weight"))
+
+        // value-residual (слои > 0): v0 = bias v_lora_B
+        var vFirstOut: MLXArray
+        if layer == 0 {
+            vFirstOut = v
+        } else {
+            let vv = sigmoid(linear(linear(xv, g(p + "v_lora_A.weight")),
+                                    g(p + "v_lora_B.weight"), g(p + "v_lora_B.bias")))
+                        .reshaped([B, T, H, S])
+            v = v + (vFirst! - v) * vv
+            vFirstOut = vFirst!
+        }
+
+        // iclr a: sigmoid(a0 + B(A(xa))) — БЕЗ tanh.
+        let a = sigmoid(linear(linear(xa, g(p + "a_lora_A.weight")),
+                               g(p + "a_lora_B.weight"), g(p + "a_lora_B.bias")))
+                    .reshaped([B, T, H, S])
+
+        // decay w: exp(-0.606531 * sigmoid(w0 + B(tanh(A(xw))))), reductions в fp32.
+        var ww = linear(tanh(linear(xw, g(p + "w_lora_A.weight"))),
+                        g(p + "w_lora_B.weight"), g(p + "w_lora_B.bias"))
+        ww = exp(-0.606531 * sigmoid(ww.asType(.float32))).asType(x.dtype)
+        ww = ww.reshaped([B, T, H, S])
+
+        // kk = l2norm(k * k_k);  k = k*(1+(a-1)*k_a)
+        let kk = l2norm(k * g(p + "k_k"))
+        k = k * (1.0 + (a - 1.0) * g(p + "k_a"))
+
+        // WKV-7: a_kernel = -kk, b_kernel = kk * a
+        var out = wkv7Forward(r, ww, k, v, -kk, kk * a)   // [B,T,H,S]
+
+        // Порядок официала: ln_x (GroupNorm) ДО bonus.
+        out = lnX(out.reshaped([B, T, D]), g(p + "ln_x.weight"), g(p + "ln_x.bias"))
+              .reshaped([B, T, H, S])
+        let bonus = (r * k * g(p + "r_k")).sum(axis: -1, keepDims: true) * v
+        out = (out + bonus).reshaped([B, T, D])
+
+        let res = linear(out * gate, g(p + "o_proj.weight"))
+        return (res, vFirstOut)
+    }
+
+    // channel-mix: value(relu(key(xk))^2). token-shift свой, нулевой паддинг.
+    private func cmix(_ x: MLXArray, _ layer: Int) -> MLXArray {
+        let p = "blocks.\(layer).cmix."
+        let xx = tokenShift(x)
+        let xk = x + xx * g(p + "x_k")
+        let h = relu(linear(xk, g(p + "key.weight")))
+        return linear(h * h, g(p + "value.weight"))
+    }
+
+    /// body: всё кроме головы. ids [B,T] → ln_out [B,T,D].
+    public func body(_ ids: MLXArray) -> MLXArray {
+        let emb = g("emb.weight").take(ids, axis: 0)        // [B,T,D]
+        var x = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
+        var vFirst: MLXArray? = nil
+        for layer in 0 ..< cfg.nLayer {
+            let (h, vf) = tmix(layerNorm(x, g("blocks.\(layer).ln1.weight"),
+                                         g("blocks.\(layer).ln1.bias")),
+                               vFirst, layer)
+            vFirst = vf
+            x = x + h
+            x = x + cmix(layerNorm(x, g("blocks.\(layer).ln2.weight"),
+                                   g("blocks.\(layer).ln2.bias")), layer)
+        }
+        return layerNorm(x, g("ln_out.weight"), g("ln_out.bias"))
+    }
+
+    /// Полный forward в логиты: ids [B,T] → logits [B,T,vocab].
+    public func callAsFunction(_ ids: MLXArray) -> MLXArray {
+        linear(body(ids), g("head.weight"))
+    }
+
+    // ── Отладка паритета: промежуточные этапы (internal, для тестов) ──
+    func debugPerLayer(_ ids: MLXArray) -> [String: MLXArray] {
+        let emb = g("emb.weight").take(ids, axis: 0)
+        var x = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
+        var vFirst: MLXArray? = nil
+        var out: [String: MLXArray] = [:]
+        for layer in 0 ..< cfg.nLayer {
+            let (h, vf) = tmix(layerNorm(x, g("blocks.\(layer).ln1.weight"),
+                                         g("blocks.\(layer).ln1.bias")), vFirst, layer)
+            vFirst = vf
+            x = x + h
+            x = x + cmix(layerNorm(x, g("blocks.\(layer).ln2.weight"),
+                                   g("blocks.\(layer).ln2.bias")), layer)
+            out["after_blk\(layer)"] = x
+        }
+        return out
+    }
+
+    func debugTmix(_ ids: MLXArray) -> [String: MLXArray] {
+        let emb = g("emb.weight").take(ids, axis: 0)
+        let afterLn0 = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
+        let x = layerNorm(afterLn0, g("blocks.0.ln1.weight"), g("blocks.0.ln1.bias"))
+        let p = "blocks.0.tmix."
+        let B = x.shape[0], T = x.shape[1], D = cfg.nEmbd, H = cfg.nHead, S = cfg.headSize
+        let xx = tokenShift(x)
+        let xr = x + xx * g(p+"x_r"), xw = x + xx * g(p+"x_w"), xk = x + xx * g(p+"x_k")
+        let xv = x + xx * g(p+"x_v"), xa = x + xx * g(p+"x_a"), xg = x + xx * g(p+"x_g")
+        let r = linear(xr, g(p+"r_proj.weight")).reshaped([B,T,H,S])
+        let k = linear(xk, g(p+"k_proj.weight")).reshaped([B,T,H,S])
+        let v = linear(xv, g(p+"v_proj.weight")).reshaped([B,T,H,S])
+        let gate = linear(sigmoid(linear(xg, g(p+"g_lora_A.weight"))), g(p+"g_lora_B.weight"))
+        let a = sigmoid(linear(linear(xa, g(p+"a_lora_A.weight")),
+                               g(p+"a_lora_B.weight"), g(p+"a_lora_B.bias"))).reshaped([B,T,H,S])
+        var ww = linear(tanh(linear(xw, g(p+"w_lora_A.weight"))),
+                        g(p+"w_lora_B.weight"), g(p+"w_lora_B.bias"))
+        ww = exp(-0.606531 * sigmoid(ww.asType(.float32))).asType(x.dtype).reshaped([B,T,H,S])
+        let kk = l2norm(k * g(p+"k_k"))
+        let k2 = k * (1.0 + (a - 1.0) * g(p+"k_a"))
+        let wkv = wkv7Forward(r, ww, k2, v, -kk, kk * a)
+        let outLnx = lnX(wkv.reshaped([B,T,D]), g(p+"ln_x.weight"), g(p+"ln_x.bias")).reshaped([B,T,H,S])
+        let bonus = (r * k2 * g(p+"r_k")).sum(axis: -1, keepDims: true) * v
+        let outF = (outLnx + bonus).reshaped([B,T,D])
+        let res = linear(outF * gate, g(p+"o_proj.weight"))
+        return ["r":r,"k":k,"v":v,"g":gate,"a":a,"w":ww,"kk":kk,"k2":k2,
+                "wkv":wkv,"out_lnx":outLnx,"res":res]
+    }
+
+    func debugStages(_ ids: MLXArray) -> [String: MLXArray] {
+        let emb = g("emb.weight").take(ids, axis: 0)
+        let afterLn0 = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
+        let (h, _) = tmix(layerNorm(afterLn0, g("blocks.0.ln1.weight"),
+                                    g("blocks.0.ln1.bias")), nil, 0)
+        var x2 = afterLn0 + h
+        x2 = x2 + cmix(layerNorm(x2, g("blocks.0.ln2.weight"),
+                                 g("blocks.0.ln2.bias")), 0)
+        return ["after_ln0": afterLn0, "blk0_tmix": h, "after_blk0": x2]
+    }
+}
