@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import RWKVKernel
 
-// Резидентное потребление памяти процессом, МБ (восстановлено из удалённого файла).
+// Резидентное потребление памяти процессом, МБ.
 func residentMemoryMB() -> Double {
     // phys_footprint — то, что показывает Xcode и по чему считает jetsam (вкл. wired/Metal).
     var info = task_vm_info_data_t()

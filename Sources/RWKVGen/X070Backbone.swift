@@ -58,10 +58,35 @@ private func linear(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray) -> MLXArray {
 
 // ─────────────────── Backbone ───────────────────
 
+/// Квантованная (frozen) матрица: упакованные веса + scale/bias по группам.
+struct QuantBase {
+    var wq: MLXArray
+    var scales: MLXArray
+    var biases: MLXArray?
+    var groupSize: Int
+    var bits: Int
+}
+
 /// x070-backbone поверх плоского словаря весов (MLX-имена тензоров).
 public final class X070Backbone {
     public let cfg: X070Config
     var w: [String: MLXArray]
+
+    // ── LoRA / QLoRA / training hooks ──
+    // Инертны для обычного инференса (пустые словари + trainLayers пуст) ⇒
+    // поведение идентично исходному, parity-тесты остаются зелёными.
+    /// Слои, чьё WKV считается через дифференцируемое ядро (wkv7Train).
+    public var trainLayers: Set<Int> = []
+    /// Если true — каждый блок (ln1+tmix+resid+ln2+cmix+resid) считается через
+    /// gradient checkpoint (recompute в backward). Дифф-входы (x, v_first, LoRA)
+    /// протягиваются явными аргументами чекпоинта; frozen-веса захватываются.
+    public var useBlockCheckpoint = false
+    /// LoRA-адаптеры по таргету: "blocks.L.tmix.r_proj" и т.п.
+    var loraA: [String: MLXArray] = [:]      // [rank, in]
+    var loraB: [String: MLXArray] = [:]      // [out, rank]
+    var loraScale: [String: Float] = [:]     // alpha / rank
+    /// Квантованная замороженная база по имени веса (напр. "...r_proj.weight", "head.weight", "emb.weight").
+    var quant: [String: QuantBase] = [:]
 
     // GroupNorm с pytorch_compatible-семантикой (eps=64e-5). Применяется
     // per-token к [N, D] (каждый токен нормализуется независимо по головам).
@@ -82,6 +107,37 @@ public final class X070Backbone {
 
     private func g(_ key: String) -> MLXArray { w[key]! }
 
+    // База проекции: если есть quant — x·Wᵀ с деквантизацией на лету
+    // (веса [out,in] ⇒ transpose: true), иначе обычный linear.
+    private func baseProj(_ x: MLXArray, _ wKey: String) -> MLXArray {
+        if let q = quant[wKey] {
+            return quantizedMM(x, q.wq, scales: q.scales, biases: q.biases,
+                               transpose: true, groupSize: q.groupSize, bits: q.bits)
+        }
+        return matmul(x, w[wKey]!.transposed())
+    }
+
+    // Проекция с опциональным LoRA: base + scale·(x·Aᵀ)·Bᵀ. target=nil ⇒ только база.
+    private func proj(_ x: MLXArray, _ wKey: String, lora target: String?) -> MLXArray {
+        let base = baseProj(x, wKey)
+        guard let t = target, let a = loraA[t], let b = loraB[t] else { return base }
+        let z = matmul(x, a.transposed())                       // [..., rank]
+        return base + (loraScale[t] ?? 1.0) * matmul(z, b.transposed())
+    }
+
+    // Эмбеддинг: gather строк (с деквантизацией, если emb квантован).
+    private func embed(_ ids: MLXArray) -> MLXArray {
+        if let q = quant["emb.weight"] {
+            let rows = q.wq.take(ids, axis: 0)
+            let sc = q.scales.take(ids, axis: 0)
+            let bi = q.biases?.take(ids, axis: 0)
+            return dequantized(rows, scales: sc, biases: bi,
+                               groupSize: q.groupSize, bits: q.bits,
+                               dtype: w["emb.weight"]?.dtype ?? .bfloat16)
+        }
+        return w["emb.weight"]!.take(ids, axis: 0)
+    }
+
     // token-shift: prev[t]=x[t-1], prev[0]=0 (нулевой паддинг). xx = prev - x.
     private func tokenShift(_ x: MLXArray) -> MLXArray {
         let B = x.shape[0], T = x.shape[1], D = x.shape[2]
@@ -90,13 +146,17 @@ public final class X070Backbone {
         return shifted - x
     }
 
-    // GroupNorm ln_x. Точно воспроизводим Python: self.ln_x(out.reshape(B,T,D)).
+    // GroupNorm ln_x (per-token). Канон RWKV: ln_x(x.view(B*T, C)) — каждый
+    // токен нормируется независимо по головам. КАУЗАЛЬНО: токен t не видит
+    // t+1..T-1, поэтому параллельный путь совпадает с рекуррентным lnXStep.
     //
-    // ВАЖНО: MLX GroupNorm на [B,T,D] трактует batch=B и СМЕШИВАЕТ все T
-    // внутри каждой головы (не per-token!). x070-код опирается именно на
-    // эту семантику, поэтому подаём [B,T,D] НАПРЯМУЮ (не разворачивая в [B*T,...]).
+    // ВАЖНО: подаём [B*T, D], НЕ [B,T,D]. MLX GroupNorm на [B,T,D] трактует
+    // batch=B и смешал бы все T внутри головы (cross-token, утечка будущего) —
+    // это была причина старого расхождения уже на позиции 0. Регресс ловится
+    // рекуррентным parity-тестом (recurrent vs parallel).
     private func lnX(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray) -> MLXArray {
-        let normed = groupNorm(x)                  // [B,T,D], batch=B, group=H по всем T
+        let B = x.shape[0], T = x.shape[1], D = x.shape[2]
+        let normed = groupNorm(x.reshaped([B * T, D])).reshaped([B, T, D])
         return normed * weight + bias
     }
 
@@ -115,9 +175,9 @@ public final class X070Backbone {
         let xa = x + xx * g(p + "x_a")
         let xg = x + xx * g(p + "x_g")
 
-        var r = linear(xr, g(p + "r_proj.weight")).reshaped([B, T, H, S])
-        var k = linear(xk, g(p + "k_proj.weight")).reshaped([B, T, H, S])
-        var v = linear(xv, g(p + "v_proj.weight")).reshaped([B, T, H, S])
+        var r = proj(xr, p + "r_proj.weight", lora: p + "r_proj").reshaped([B, T, H, S])
+        var k = proj(xk, p + "k_proj.weight", lora: p + "k_proj").reshaped([B, T, H, S])
+        var v = proj(xv, p + "v_proj.weight", lora: p + "v_proj").reshaped([B, T, H, S])
 
         // gate: B(sigmoid(A(xg))) — sigmoid ВНУТРИ, линейно наружу, без bias.
         let gate = linear(sigmoid(linear(xg, g(p + "g_lora_A.weight"))),
@@ -151,7 +211,9 @@ public final class X070Backbone {
         k = k * (1.0 + (a - 1.0) * g(p + "k_a"))
 
         // WKV-7: a_kernel = -kk, b_kernel = kk * a
-        var out = wkv7Forward(r, ww, k, v, -kk, kk * a)   // [B,T,H,S]
+        var out = trainLayers.contains(layer)
+            ? wkv7Train(r, ww, k, v, -kk, kk * a)
+            : wkv7Forward(r, ww, k, v, -kk, kk * a)         // [B,T,H,S]
 
         // Порядок официала: ln_x (GroupNorm) ДО bonus.
         out = lnX(out.reshaped([B, T, D]), g(p + "ln_x.weight"), g(p + "ln_x.bias"))
@@ -159,7 +221,7 @@ public final class X070Backbone {
         let bonus = (r * k * g(p + "r_k")).sum(axis: -1, keepDims: true) * v
         out = (out + bonus).reshaped([B, T, D])
 
-        let res = linear(out * gate, g(p + "o_proj.weight"))
+        let res = proj(out * gate, p + "o_proj.weight", lora: p + "o_proj")
         return (res, vFirstOut)
     }
 
@@ -168,35 +230,74 @@ public final class X070Backbone {
         let p = "blocks.\(layer).cmix."
         let xx = tokenShift(x)
         let xk = x + xx * g(p + "x_k")
-        let h = relu(linear(xk, g(p + "key.weight")))
-        return linear(h * h, g(p + "value.weight"))
+        let h = relu(proj(xk, p + "key.weight", lora: p + "key"))
+        return proj(h * h, p + "value.weight", lora: p + "value")
+    }
+
+    /// Один блок: ln1+tmix+resid+ln2+cmix+resid. (x0, vFirst?) -> (x', vFirstOut).
+    func blockForward(_ x0: MLXArray, _ vFirst: MLXArray?, _ layer: Int) -> (MLXArray, MLXArray) {
+        let (h, vf) = tmix(layerNorm(x0, g("blocks.\(layer).ln1.weight"),
+                                     g("blocks.\(layer).ln1.bias")), vFirst, layer)
+        var x = x0 + h
+        x = x + cmix(layerNorm(x, g("blocks.\(layer).ln2.weight"),
+                               g("blocks.\(layer).ln2.bias")), layer)
+        return (x, vf)
+    }
+
+    /// Отсортированные ключи LoRA-таргетов слоя (детерминированный порядок упаковки).
+    private func loraKeysForLayer(_ layer: Int) -> [String] {
+        loraA.keys.filter { $0.hasPrefix("blocks.\(layer).") }.sorted()
+    }
+
+    /// blockForward через gradient checkpoint. LoRA-адаптеры слоя идут ЯВНЫМИ
+    /// входами чекпоинта (иначе vjp не даст к ним градиент). v_first и x — тоже
+    /// явные входы, чтобы grad тёк сквозь value-residual и остаточный поток.
+    func blockCheckpointed(_ x0: MLXArray, _ vFirst: MLXArray?, _ layer: Int) -> (MLXArray, MLXArray) {
+        let keys = loraKeysForLayer(layer)
+        let hasV = vFirst != nil
+        var inputs: [MLXArray] = [x0]
+        if hasV { inputs.append(vFirst!) }
+        for t in keys { inputs.append(loraA[t]!); inputs.append(loraB[t]!) }
+
+        let f: ([MLXArray]) -> [MLXArray] = { ins in
+            var i = 0
+            let xin = ins[i]; i += 1
+            var vin: MLXArray? = nil
+            if hasV { vin = ins[i]; i += 1 }
+            for t in keys {
+                self.loraA[t] = ins[i]; i += 1
+                self.loraB[t] = ins[i]; i += 1
+            }
+            let (xo, vo) = self.blockForward(xin, vin, layer)
+            return [xo, vo]
+        }
+        let out = checkpointed(f)(inputs)
+        return (out[0], out[1])
     }
 
     /// body: всё кроме головы. ids [B,T] → ln_out [B,T,D].
     public func body(_ ids: MLXArray) -> MLXArray {
-        let emb = g("emb.weight").take(ids, axis: 0)        // [B,T,D]
+        let emb = embed(ids)        // [B,T,D]
         var x = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
         var vFirst: MLXArray? = nil
         for layer in 0 ..< cfg.nLayer {
-            let (h, vf) = tmix(layerNorm(x, g("blocks.\(layer).ln1.weight"),
-                                         g("blocks.\(layer).ln1.bias")),
-                               vFirst, layer)
+            let (xo, vf): (MLXArray, MLXArray) = useBlockCheckpoint
+                ? blockCheckpointed(x, vFirst, layer)
+                : blockForward(x, vFirst, layer)
+            x = xo
             vFirst = vf
-            x = x + h
-            x = x + cmix(layerNorm(x, g("blocks.\(layer).ln2.weight"),
-                                   g("blocks.\(layer).ln2.bias")), layer)
         }
         return layerNorm(x, g("ln_out.weight"), g("ln_out.bias"))
     }
 
     /// Полный forward в логиты: ids [B,T] → logits [B,T,vocab].
     public func callAsFunction(_ ids: MLXArray) -> MLXArray {
-        linear(body(ids), g("head.weight"))
+        proj(body(ids), "head.weight", lora: nil)
     }
 
     // ── Отладка паритета: промежуточные этапы (internal, для тестов) ──
     func debugPerLayer(_ ids: MLXArray) -> [String: MLXArray] {
-        let emb = g("emb.weight").take(ids, axis: 0)
+        let emb = embed(ids)
         var x = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
         var vFirst: MLXArray? = nil
         var out: [String: MLXArray] = [:]
@@ -213,7 +314,7 @@ public final class X070Backbone {
     }
 
     func debugTmix(_ ids: MLXArray) -> [String: MLXArray] {
-        let emb = g("emb.weight").take(ids, axis: 0)
+        let emb = embed(ids)
         let afterLn0 = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
         let x = layerNorm(afterLn0, g("blocks.0.ln1.weight"), g("blocks.0.ln1.bias"))
         let p = "blocks.0.tmix."
@@ -242,7 +343,7 @@ public final class X070Backbone {
     }
 
     func debugStages(_ ids: MLXArray) -> [String: MLXArray] {
-        let emb = g("emb.weight").take(ids, axis: 0)
+        let emb = embed(ids)
         let afterLn0 = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
         let (h, _) = tmix(layerNorm(afterLn0, g("blocks.0.ln1.weight"),
                                     g("blocks.0.ln1.bias")), nil, 0)

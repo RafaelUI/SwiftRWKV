@@ -108,7 +108,7 @@ extension X070Backbone {
         state.wkv[layer] = hNew
 
         // ln_x (GroupNorm) для одного токена: [1, D]
-        var out = lnXStep(outHD.reshaped([1, D]), gg(p+"ln_x.weight"), gg(p+"ln_x.bias"))
+        var out = lnXStep(outHD.reshaped([1, D]), gg(p+"ln_x.weight"), gg(p+"ln_x.bias"), H: H)
             .reshaped([H, S])
         // bonus = (r*k*r_k).sum(-1, keepdims) * v
         let bonus = (r * k * gg(p+"r_k")).sum(axis: -1, keepDims: true) * v   // [H,S]
@@ -172,4 +172,18 @@ private func layerNorm_(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
 private func linear_(_ x: MLXArray, _ w: MLXArray) -> MLXArray { matmul(x, w.transposed()) }
 private func linear_(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray) -> MLXArray {
     matmul(x, w.transposed()) + b
+}
+
+// Per-token GroupNorm (eps=64e-5, pytorch_compatible): normalizes each head
+// independently and ONLY over the current token — causally correct, unlike the
+// parallel lnX (MLX GroupNorm on [B,T,D] mixes across all T).
+private func lnXStep(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
+                     H: Int, eps: Float = 64e-5) -> MLXArray {
+    let D = x.shape[x.shape.count - 1]
+    let S = D / H
+    let g = x.reshaped([H, S])
+    let mean = g.mean(axis: -1, keepDims: true)
+    let varc = (g - mean).square().mean(axis: -1, keepDims: true)
+    let normed = ((g - mean) / sqrt(varc + eps)).reshaped([1, D])
+    return normed * weight + bias
 }
