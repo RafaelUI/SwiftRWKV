@@ -49,7 +49,7 @@ enum X070Pooling {
 }
 
 // Диск-кэш граничного x [N,T,D] bf16 (mmap). vFirst и (отсутствующий) xPrev не храним.
-struct X070BoundaryCache {
+public struct X070BoundaryCache {
     let mapped: Data
     let T: Int
     let D: Int
@@ -82,14 +82,14 @@ public enum X070PartialFinetune {
         public var params: [String: MLXArray]
     }
 
-    static func clearCache() {
+    public static func clearCache() {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         for n in ["train", "val"] {
             try? FileManager.default.removeItem(at: dir.appendingPathComponent("pf_x070_\(n).bin"))
         }
     }
 
-    static func buildBoundaryCache(
+    public static func buildBoundaryCache(
         backbone: X070Backbone,
         examples: [X070Example],
         freeze: Int,
@@ -143,7 +143,7 @@ public enum X070PartialFinetune {
                                  ids: ids, length: length, label: label)
     }
 
-    static func train(
+    public static func train(
         backbone: X070Backbone,
         trainCache: X070BoundaryCache,
         valCache: X070BoundaryCache,
