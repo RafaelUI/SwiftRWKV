@@ -77,6 +77,9 @@ public final class X070Backbone {
     // поведение идентично исходному, parity-тесты остаются зелёными.
     /// Слои, чьё WKV считается через дифференцируемое ядро (wkv7Train).
     public var trainLayers: Set<Int> = []
+    /// Подмена весов на обучаемые (fp32) во время valueAndGrad для full-weight
+    /// partial-finetune верхних слоёв. nil ⇒ читаются frozen-веса (инференс не меняется).
+    public var wOverride: [String: MLXArray]? = nil
     /// Если true — каждый блок (ln1+tmix+resid+ln2+cmix+resid) считается через
     /// gradient checkpoint (recompute в backward). Дифф-входы (x, v_first, LoRA)
     /// протягиваются явными аргументами чекпоинта; frozen-веса захватываются.
@@ -105,7 +108,9 @@ public final class X070Backbone {
                                    eps: 64e-5, affine: false, pytorchCompatible: true)
     }
 
-    private func g(_ key: String) -> MLXArray { w[key]! }
+    // Чтение веса с учётом wOverride (обучаемая подмена) → frozen.
+    private func wv(_ key: String) -> MLXArray { wOverride?[key] ?? w[key]! }
+    private func g(_ key: String) -> MLXArray { wv(key) }
 
     // База проекции: если есть quant — x·Wᵀ с деквантизацией на лету
     // (веса [out,in] ⇒ transpose: true), иначе обычный linear.
@@ -114,7 +119,7 @@ public final class X070Backbone {
             return quantizedMM(x, q.wq, scales: q.scales, biases: q.biases,
                                transpose: true, groupSize: q.groupSize, bits: q.bits)
         }
-        return matmul(x, w[wKey]!.transposed())
+        return matmul(x, wv(wKey).transposed())
     }
 
     // Проекция с опциональным LoRA: base + scale·(x·Aᵀ)·Bᵀ. target=nil ⇒ только база.
@@ -135,7 +140,7 @@ public final class X070Backbone {
                                groupSize: q.groupSize, bits: q.bits,
                                dtype: w["emb.weight"]?.dtype ?? .bfloat16)
         }
-        return w["emb.weight"]!.take(ids, axis: 0)
+        return wv("emb.weight").take(ids, axis: 0)
     }
 
     // token-shift: prev[t]=x[t-1], prev[0]=0 (нулевой паддинг). xx = prev - x.
@@ -293,6 +298,46 @@ public final class X070Backbone {
     /// Полный forward в логиты: ids [B,T] → logits [B,T,vocab].
     public func callAsFunction(_ ids: MLXArray) -> MLXArray {
         proj(body(ids), "head.weight", lora: nil)
+    }
+
+    // ─────────── Partial-finetune: разрез сети на слое f ───────────
+    // token-shift внутриблочный ⇒ между блоками течёт только (x, vFirst),
+    // межблочного xPrev НЕТ. Поэтому граница = (x после блока f-1, vFirst).
+
+    /// Frozen-проход блоков [0..<f]. Возвращает (x, vFirst) на границе.
+    /// Без gradient checkpoint — этот участок не обучается.
+    public func boundaryState(_ ids: MLXArray, upTo f: Int) -> (MLXArray, MLXArray?) {
+        let emb = embed(ids)
+        var x = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
+        var vFirst: MLXArray? = nil
+        for layer in 0 ..< f {
+            let (xo, vf) = blockForward(x, vFirst, layer)
+            x = xo
+            vFirst = vf
+        }
+        return (x, vFirst)
+    }
+
+    /// Обучаемый хвост: блоки [f..<nLayer] + ln_out. Граничные (x, vFirst)
+    /// приходят из boundaryState (или из дискового кэша). Уважает useBlockCheckpoint.
+    public func forwardFrom(_ x0: MLXArray, _ vFirst0: MLXArray?, from f: Int) -> MLXArray {
+        var x = x0
+        var vFirst = vFirst0
+        for layer in f ..< cfg.nLayer {
+            let (xo, vf): (MLXArray, MLXArray) = useBlockCheckpoint
+                ? blockCheckpointed(x, vFirst, layer)
+                : blockForward(x, vFirst, layer)
+            x = xo
+            vFirst = vf
+        }
+        return layerNorm(x, g("ln_out.weight"), g("ln_out.bias"))
+    }
+
+    /// vFirst (= v слоя 0) для пересчёта на train-шаге без хранения на диске.
+    /// Слой 0 frozen ⇒ вызывать вне grad-тейпа.
+    public func vFirstFrom(_ ids: MLXArray) -> MLXArray {
+        let (_, vFirst) = boundaryState(ids, upTo: 1)
+        return vFirst!
     }
 
     // ── Отладка паритета: промежуточные этапы (internal, для тестов) ──

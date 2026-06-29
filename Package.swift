@@ -19,11 +19,6 @@ let package = Package(
         .visionOS(.v1),
     ],
     products: [
-        // Обучение верхних слоёв + головы, классификация, извлечение фич,
-        // инференс малых моделей. Кастомное WKV-7 Metal-ядро.
-        //   import RWKVTrain
-        .library(name: "RWKVTrain", targets: ["RWKVTrain"]),
-
         // Инференс крупных RWKV-7 World моделей (генерация) + LoRA/QLoRA-файнтюн.
         //   import RWKVGen
         .library(name: "RWKVGen", targets: ["RWKVGen"]),
@@ -36,22 +31,12 @@ let package = Package(
     ],
     targets: [
         // Кастомное WKV-7 Metal-ядро (forward + дифференцируемый checkpoint backward).
-        // Общий фундамент для RWKVTrain и RWKVGen.
+        // Фундамент для RWKVGen.
         .target(
             name: "RWKVKernel",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
-            ]
-        ),
-        .target(
-            name: "RWKVTrain",
-            dependencies: [
-                "RWKVKernel",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXFast", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
             ]
         ),
         .target(
@@ -66,17 +51,11 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "RWKVTrainTests",
-            dependencies: ["RWKVTrain", "RWKVKernel"],
-            resources: [
-                // Эталон паритета WKV-7-ядра: входы + эталонные выходы одного чанка.
-                .copy("Resources/wkv7_kernel_parity.safetensors"),
-            ]
-        ),
-        .testTarget(
             name: "RWKVGenTests",
             dependencies: ["RWKVGen", "RWKVKernel"],
             resources: [
+                // Эталон паритета WKV-7-ядра (перенесён из RWKVTrainTests).
+                .copy("Resources/wkv7_kernel_parity.safetensors"),
                 // Эталон паритета x070: веса World-0.1B + ожидаемые ln_out/logits.
                 .copy("Resources/world_0.1b_x070.safetensors"),
                 .copy("Resources/x070_parity.safetensors"),

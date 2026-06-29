@@ -1,42 +1,62 @@
-# Training Guide — `RWKVTrain`
+# SwiftRWKV
 
-On-device fine-tuning of **RWKV-7** classifiers and feature extractors on Apple
-Silicon (iOS / iPadOS / macOS / visionOS), powered by
-[MLX](https://github.com/ml-explore/mlx) and a custom Metal **WKV-7** kernel.
+On-device **RWKV-7** training and inference for Apple Silicon (iOS / iPadOS /
+macOS / visionOS), powered by [MLX](https://github.com/ml-explore/mlx) and a
+custom Metal **WKV-7** kernel.
 
-This module trains the **top layers + a classification head** on top of a frozen
-pretrained backbone. The frozen part of the network is run once and its boundary
-features are cached to disk; only the small upper part is trained. This keeps
-memory low enough to fine-tune on a phone.
-
-- Module: `import RWKVTrain`
-- Tasks: **text classification**, **feature extraction**
-- Hot path (WKV-7 recurrence): a hand-written Metal kernel, bit-exact against the
-  Python reference (`Δ = 0`, see [Kernel parity](#kernel-parity)).
-
-> For large-model inference and LoRA/QLoRA fine-tuning, see the `RWKVGen` module
-> (coming later).
+Everything is built on one canonical backbone, `X070Backbone` — a faithful port
+of the official RWKV-7 "Goose" x070 architecture. It serves inference,
+generation, LoRA/QLoRA fine-tuning, and N-layer partial fine-tuning from a single
+weight format.
 
 ---
 
-## Table of contents
+## Modules & imports
 
-1. [Requirements](#requirements)
-2. [Installation](#installation)
-3. [The model package format](#the-model-package-format)
-4. [Quick start](#quick-start)
-5. [Providing data](#providing-data)
-6. [`ModelConfig`](#modelconfig)
-7. [`TrainingConfig`](#trainingconfig)
-8. [Logging & metrics](#logging--metrics)
-9. [Cancellation](#cancellation)
-10. [Saving & loading trained models](#saving--loading-trained-models)
-11. [Inference](#inference)
-12. [How it works](#how-it-works)
-13. [Memory & performance](#memory--performance)
-14. [Error handling](#error-handling)
-15. [Kernel parity](#kernel-parity)
-16. [FAQ / gotchas](#faq--gotchas)
+| Module | What it gives you | Import when |
+|---|---|---|
+| `RWKVGen` | Backbone, generation, LoRA/QLoRA, N-layer partial fine-tune, tokenizer | Almost always |
+| `RWKVKernel` | Raw WKV-7 kernels + constants | Only for low-level / custom kernel work |
+
+`RWKVGen` depends on `RWKVKernel`, so importing `RWKVGen` is enough for every
+high-level workflow. The old `RWKVTrain` module (from-scratch backbone +
+classification Trainer) has been **removed**; its partial-fine-tune capability
+now lives on the canonical `X070Backbone` inside `RWKVGen`.
+
+```swift
+import RWKVGen          // backbone, generation, LoRA, partial fine-tune
+import RWKVKernel       // only if you call wkv7* directly
+```
+
+### Public API by use case
+
+**Core model**
+- `X070Config(nLayer:nEmbd:headSize:vocab:)`
+- `X070Backbone(weights:cfg:computeDType:)`
+  - `callAsFunction(ids) -> logits [B,T,vocab]`
+  - `body(ids) -> ln_out [B,T,D]`
+  - split: `boundaryState(ids, upTo:) -> (x, vFirst?)`, `forwardFrom(x, vFirst?, from:) -> ln_out`, `vFirstFrom(ids) -> vFirst`
+  - hooks: `trainLayers: Set<Int>`, `wOverride: [String:MLXArray]?`, `useBlockCheckpoint: Bool`
+- `WorldTokenizer(vocabURL:)` — `encode` / `decode` / `rawBytes` (RWKV **World** trie tokenizer only)
+
+**Generation (streaming, recurrent)**
+- `RWKVState(cfg:dtype:)` — per-layer recurrent state
+- `X070Backbone.prefill(ids, state:&) -> logits`
+- `X070Backbone.step(id, state:&) -> logits`
+
+**LoRA / QLoRA fine-tune** (LM objective)
+- `LoRATargets.tmix` `.cmix`, `LoRASpec(rank:alpha:tmixTargets:cmixTargets:layers:quantizeBits:quantGroupSize:)`
+- `LoRA.add(to:spec:) -> LoRAInfo`, `LoRA.merge`, `LoRA.save` / `.load`, `LoRA.adapterState`, `LoRA.quantizeBaseModel`
+- `LoRAFinetune.run(bb, nextBatch:config:isCancelled:onStep:) -> LoRATrainResult`
+- `LoRAConfig(...)`, `LoRABatch = (x: MLXArray, y: MLXArray)`, `bigQuantTargets`
+
+**N-layer partial fine-tune** (classification / feature head)
+- `X070Example(ids:label:)`, `X070PoolKind` (`.mean` / `.last`)
+- `X070PartialFinetune.run(backbone:cfg:numClasses:trainSet:valSet:freeze:ctxLen:epochs:batchSize:lr:onStep:onEpoch:) -> TrainResult`
+
+**Kernel (RWKVKernel)**
+- `WKV7_CHUNK = 32`, `WKV7_HEAD_SIZE = 64`
+- `wkv7Forward`, `wkv7Train`, `wkv7ChunkForward`, `wkv7Reference`
 
 ---
 
@@ -45,553 +65,245 @@ memory low enough to fine-tune on a phone.
 | | Minimum |
 |---|---|
 | OS | iOS 17 / iPadOS 17 / macOS 14 / visionOS 1 |
-| Hardware | Apple Silicon (M-series / A-series with a GPU) |
+| Hardware | Apple Silicon with a GPU |
 | Toolchain | Swift 5.10+ |
-| Dependency | `mlx-swift` ≥ 0.31.4 (resolved automatically) |
+| Dependency | `mlx-swift` ≥ 0.31.4 |
 
-> The WKV-7 kernel runs on the **GPU via Metal**. It will not run on the iOS
-> Simulator's software renderer reliably — test on a real device or on macOS.
-
----
-
-## Installation
-
-Swift Package Manager. In `Package.swift`:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/RafaelUI/SwiftRWKV", from: "0.1.0"),
-],
-targets: [
-    .target(
-        name: "YourApp",
-        dependencies: [
-            .product(name: "RWKVTrain", package: "SwiftRWKV"),
-        ]
-    ),
-]
-```
-
-Or in Xcode: **File → Add Package Dependencies…** and paste the repo URL.
-
-```swift
-import RWKVTrain
-```
+The WKV-7 kernel runs on the **Metal GPU**. Test on a real device or macOS, not
+the iOS Simulator's software renderer.
 
 ---
 
-## The model package format
+## Loading a model
 
-A model is a **self-contained folder** with exactly three files:
+A model is a flat `safetensors` of x070-named tensors plus a tokenizer. Load the
+weights and build the backbone:
+
+```swift
+import RWKVGen
+import MLX
+
+let weights = try loadArrays(url: URL(fileURLWithPath: ".../model_x070.safetensors"))
+let cfg = X070Config(nLayer: 18, nEmbd: 448, headSize: 64, vocab: 16000)
+let bb  = X070Backbone(weights: weights, cfg: cfg)
+```
+
+Weight naming the backbone expects (x070 / official RWKV layout):
 
 ```
-my-model/
-├── config.json          # ModelConfig (architecture + optional task/training fields)
-├── model.safetensors    # backbone weights (+ head, if trained)
-└── tokenizer.json        # HF-format byte-level BPE tokenizer
+emb.weight, ln0.{weight,bias}, ln_out.{weight,bias}, head.weight
+blocks.N.ln1.{weight,bias}, blocks.N.ln2.{weight,bias}
+blocks.N.tmix.{x_r,x_w,x_k,x_v,x_a,x_g}
+blocks.N.tmix.{r,k,v,o}_proj.weight
+blocks.N.tmix.{k_k,k_a,r_k}                 # per-head, shape [H,S]
+blocks.N.tmix.{a,g,w}_lora_{A,B}.weight     # (+ a/w lora_B.bias)
+blocks.N.tmix.v_lora_{A,B}.weight (+bias)   # layers > 0 only
+blocks.N.tmix.ln_x.{weight,bias}
+blocks.N.cmix.{x_k, key.weight, value.weight}
 ```
 
-This format lets you keep any number of models and load each one uniformly by
-its folder URL. `RWKVModel(directory:)` reads all three and validates geometry.
+### Tokenizers
 
-A minimal `config.json` for a base (untrained) backbone:
+- **World models** use the RWKV trie tokenizer: `WorldTokenizer(vocabURL:)`.
+- **Custom models** (e.g. trained via FLA) ship their own HF `tokenizer.json`.
+  The framework does not bundle an HF BPE tokenizer — encode/decode with your own
+  pipeline (e.g. `swift-transformers`, or tokenize offline and feed token ids).
 
-```json
-{
-  "arch": "rwkv7",
-  "nLayer": 18,
-  "nEmbd": 256,
-  "headSize": 64,
-  "vocab": 16000,
-  "contextSize": 128,
-  "language": "ru",
-  "tokenizer": "ru16k"
+---
+
+## Converting FLA checkpoints → x070
+
+If you pretrain with **flash-linear-attention**, the checkpoint uses FLA's module
+names (`model.layers.N.attn.*`, `lm_head`, `model.norm`, …) and stores the
+per-head vectors `k_k` / `k_a` flat as `[D]`. `X070Backbone` expects official
+RWKV names and `k_k` / `k_a` shaped `[H,S]`. Convert with the bundled utility in
+the `rwkv-metal` repo:
+
+```bash
+python tools/convert_fla_to_x070.py model.pt -o model_x070.safetensors
+```
+
+It auto-detects config from tensor shapes, remaps every key, reshapes `k_k`/`k_a`
+to `[H,S]`, and verifies the produced key set exactly matches what the backbone
+reads. Works for `.pt` (incl. `{'model':..,'step':..}` wrappers) and
+`.safetensors` inputs, at any model size.
+
+> Architectural note: FLA RWKV-7 and x070 are the **same** architecture — only
+> naming and the `k_k`/`k_a` layout differ. After conversion, the formulas
+> (decay, iclr, gate, head GroupNorm) match; verified by next-token loss on real
+> text matching the trained model (not random).
+
+---
+
+## Inference & generation
+
+### One-shot logits
+
+```swift
+let ids = MLXArray(tokenIds.map { Int32($0) }).reshaped([1, tokenIds.count])
+let logits = bb(ids)               // [1, T, vocab]
+```
+
+### Streaming generation (recurrent, O(1) memory per step)
+
+```swift
+var state = RWKVState(cfg: cfg)
+_ = bb.prefill(promptIds, state: &state)     // consume the prompt
+state.eval()
+
+var next = argmax(lastLogits)                // your sampling
+for _ in 0 ..< maxNewTokens {
+    let logits = bb.step(next, state: &state)
+    next = sample(logits)                    // greedy / top-p / temperature
+    state.eval()                             // fix state between steps
+    // append `next`, decode incrementally
 }
 ```
 
-After training, `Trainer.save(_:to:)` writes a richer `config.json` that also
-carries `task`, `pooling`, `numClasses`, `classes`, `freeze`, `valAcc`, etc.
+`prefill` / `step` use the recurrent WKV form (no full-sequence kernel), so
+memory is constant in sequence length. `RWKVState` holds per-layer `wkv` (fp32),
+token-shift previous tokens, and `vFirst`.
 
 ---
 
-## Quick start
+## LoRA / QLoRA fine-tune
 
-End-to-end: load a base model, fine-tune a 3-class classifier, save it, run it.
+Best for **larger models (≈600M+)** where adapting 0.1–3% of parameters is
+enough. LM objective (next-token).
 
 ```swift
-import RWKVTrain
-import Foundation
-
-// 1. Load the pretrained base model (folder with config/weights/tokenizer).
-let baseURL = URL(fileURLWithPath: "/path/to/base-model")
-let base = try RWKVModel(directory: baseURL)
-
-// 2. Build a dataset. Here we tokenize with the model's own tokenizer.
-func ex(_ text: String, _ label: Int) -> Example {
-    Example(ids: base.tokenizer.encode(text), label: label)
-}
-let data = InMemoryDataProvider(
-    train: [
-        ex("Отличный сервис, очень доволен!", 2),
-        ex("Ужасно, никому не советую.",       0),
-        ex("Нормально, ничего особенного.",    1),
-        // … hundreds–thousands more …
-    ],
-    validation: [
-        ex("Прекрасная работа, спасибо!", 2),
-        ex("Полное разочарование.",       0),
-    ],
-    classes: ["negative", "neutral", "positive"]
+// 1. Attach adapters (optionally quantize the frozen base → QLoRA).
+let spec = LoRASpec(
+    rank: 16, alpha: 16,
+    tmixTargets: LoRATargets.tmix,     // ["r_proj","k_proj","v_proj","o_proj"]
+    cmixTargets: [],                    // add ["key","value"] for more capacity
+    layers: nil,                        // nil = all blocks
+    quantizeBits: 0,                    // 0 = bf16 base; 4 or 8 = QLoRA
+    quantGroupSize: 64
 )
+let info = LoRA.add(to: bb, spec: spec)
+print(info.trainablePct, info.numAdapters)
 
-// 3. Train (blocking — run off the main thread).
-let trainer = Trainer(model: base, classes: data.classes, logger: OSLogLogger())
-let result = try trainer.train(
-    data: data,
-    config: TrainingConfig(freeze: 14, contextSize: 128, epochs: 5)
-)
-print("val accuracy:", result.validationAccuracy)
+// 2. Train. You supply batches; x = ids [B,T] i32, y = next-token targets [B,T].
+let cfg2 = LoRAConfig(lr: 1e-4, maxSteps: 1000, gradAccum: 1,
+                      useBlockCheckpoint: true)   // checkpoint: −~45% peak / +~22% time
+let res = LoRAFinetune.run(bb, nextBatch: { myLoader.next() }, config: cfg2,
+    onStep: { step, loss, gnorm, peakMB in
+        if step % 10 == 0 { print(step, loss, gnorm, peakMB) }
+    })
+print("final loss:", res.finalLoss)
 
-// 4. Save as a new self-contained model package.
-let outURL = URL(fileURLWithPath: "/path/to/my-trained-model")
-try trainer.save(result, to: outURL)
-
-// 5. Inference.
-let model = try RWKVModel(directory: outURL)
-let clf = try Classifier(model: model)
-let p = clf.classify("Сделано на отлично!")
-print(p.label, p.probabilities)   // "positive", [(positive, 0.91), (neutral, 0.07), …]
+// 3. Persist / apply adapters.
+try LoRA.save(bb, to: adaptersURL)     // adapters only (small)
+// LoRA.merge(bb)                       // fold adapters into base for plain inference
 ```
 
-Run training on a background queue and marshal progress back to the UI:
+For QLoRA on a big model, also quantize the heavy frozen matrices:
 
 ```swift
-let token = CancellationToken()
-DispatchQueue.global(qos: .userInitiated).async {
-    do {
-        let result = try trainer.train(data: data,
-                                       config: TrainingConfig(freeze: 14),
-                                       cancellation: token)
-        DispatchQueue.main.async { /* update UI, save, … */ }
-    } catch {
-        DispatchQueue.main.async { /* show error */ }
-    }
-}
-// later, to abort:
-token.cancel()
+LoRA.quantizeBaseModel(bb, bits: 4)    // affects bigQuantTargets: cmix.key/value, head, emb
 ```
 
 ---
 
-## Providing data
+## N-layer partial fine-tune
 
-Data flows in through the `DataProvider` protocol — **no `Bundle.main`
-assumptions, no fixed languages or class counts**. Your provider is responsible
-for tokenization and returns ready-to-use `Example` values.
-
-```swift
-public struct Example: Sendable {
-    public let ids: [Int]   // token ids, no padding (the pipeline pads/truncates)
-    public let label: Int   // class index 0 ..< numClasses
-}
-
-public protocol DataProvider: Sendable {
-    func trainExamples() throws -> [Example]
-    func validationExamples() throws -> [Example]   // may be empty
-    var classes: [String] { get }                    // class names in label order
-}
-```
-
-Two ready-made providers ship with the module.
-
-### In-memory
-
-When you already have texts/labels (or tokenized them yourself):
+Best for **smaller models (≤400M)**, where LoRA's 0.1–3% is too little. Trains
+the **full weights of the top N layers + a fresh head** on a frozen lower stack.
+Classification head with pooling.
 
 ```swift
-let data = InMemoryDataProvider(
-    train: trainExamples,
-    validation: valExamples,         // optional
-    classes: ["spam", "ham"]
+let examples = texts.map { X070Example(ids: tokenize($0.text), label: $0.label) }
+
+let res = X070PartialFinetune.run(
+    backbone: bb, cfg: cfg, numClasses: 3,
+    trainSet: examples, valSet: valExamples,
+    freeze: 12,            // freeze layers [0,12); train [12, nLayer) + head
+    ctxLen: 64,            // MUST be a multiple of WKV7_CHUNK (32)
+    epochs: 5, batchSize: 8, lr: 1e-3,
+    onStep:  { step, loss, peakMB in if step % 20 == 0 { print(step, loss) } },
+    onEpoch: { epoch, valAcc in print("epoch", epoch, "valAcc", valAcc) }
 )
+print("val accuracy:", res.valAcc)
+let trainedParams = res.params      // top-layer weights + head, for saving
 ```
 
-### JSONL files
+### Choosing `freeze` (18-layer model)
 
-For `*.jsonl` files with one `{"text": "...", "label": 0}` object per line:
-
-```swift
-let data = JSONLDataProvider(
-    trainURL: URL(fileURLWithPath: "train.jsonl"),
-    validationURL: URL(fileURLWithPath: "val.jsonl"),   // optional
-    tokenizer: base.tokenizer,
-    maxLen: 128,                       // truncate token sequences
-    classes: ["negative", "neutral", "positive"]
-)
-```
-
-Notes:
-- Labels are **0-based** and must match the order of `classes`.
-- Empty texts are encoded as `[0]` to avoid empty inputs.
-- Rows longer than `maxLen` tokens are truncated.
-
-### Custom provider
-
-Implement the protocol to read from Core Data, a server, etc.:
-
-```swift
-struct MyProvider: DataProvider {
-    let classes = ["a", "b", "c"]
-    func trainExamples() throws -> [Example] { /* … */ }
-    func validationExamples() throws -> [Example] { [] }
-}
-```
-
----
-
-## `ModelConfig`
-
-Describes a model package; serialized to `config.json`.
-
-```swift
-public struct ModelConfig: Codable, Sendable {
-    // Architecture (required)
-    public var arch: String          // "rwkv7"
-    public var nLayer: Int
-    public var nEmbd: Int
-    public var headSize: Int          // must equal the kernel HEAD_SIZE (64)
-    public var vocab: Int
-    public var contextSize: Int       // must be divisible by the kernel CHUNK (32)
-
-    // Metadata (optional)
-    public var language: String?
-    public var tokenizer: String?
-
-    // Task / training (filled in after fine-tuning)
-    public var task: RWKVTask?              // .classification | .featureExtraction
-    public var pooling: RWKVPooling?        // .mean | .last
-    public var numClasses: Int?
-    public var classes: [String]?
-    public var freeze: Int?
-    public var parent: String?
-    public var valAcc: Float?
-    public var createdAt: Double?
-}
-```
-
-`ModelConfig.validate()` (called automatically on load and before training)
-enforces:
-
-- `nEmbd % headSize == 0`
-- `headSize == 64` (the kernel's `HEAD_SIZE`)
-- `contextSize % 32 == 0` (the kernel's `CHUNK`)
-
-A mismatch throws `RWKVError.invalidGeometry`.
-
----
-
-## `TrainingConfig`
-
-```swift
-public struct TrainingConfig: Sendable {
-    public var freeze: Int            // number of frozen bottom layers
-    public var contextSize: Int = 128 // padded/truncated length; multiple of 32
-    public var epochs: Int = 5
-    public var batchSize: Int = 8
-    public var learningRate: Float = 1e-4
-    public var featureBatch: Int = 5  // texts per forward during feature extraction
-    public var pooling: RWKVPooling = .mean
-}
-```
-
-### Choosing `freeze`
-
-`freeze` is the number of **frozen bottom layers**; the remaining
-`nLayer - freeze` layers are trained together with the head.
-
-| `freeze` (for an 18-layer model) | Trained layers | Trade-off |
+| `freeze` | Trains | Trade-off |
 |---|---|---|
-| `nLayer - 1` (e.g. 17) | head + 1 layer | fastest, lowest memory, least capacity |
-| `~0.75 · nLayer` (e.g. 14) | head + 4 layers | good default |
-| small (e.g. 6) | many layers | most capacity, slowest, most memory |
+| 17 | head + 1 layer | fastest, least memory, least capacity |
+| ~12–14 | head + 4–6 layers | good default |
+| small | many layers | most capacity, slowest, most memory |
 
-Must satisfy `0 <= freeze < nLayer`, otherwise `RWKVError.invalidGeometry`.
+Constraint: `0 <= freeze < nLayer`; `ctxLen % 32 == 0`.
 
-### Pooling
+### How the split works
 
-How the `[B, T, D]` sequence is reduced to a `[B, D]` vector for the head:
+Partial fine-tune relies on cutting the network at layer `freeze`:
 
-- `.mean` — masked mean over real (non-padding) tokens. **Default, robust.**
-- `.last` — vector of the last real token (classic RWKV).
+1. **Boundary pass (frozen).** `boundaryState(ids, upTo: freeze)` runs
+   `emb → ln0 → blocks[0..<freeze]` and returns `(x, vFirst)`. Because x070's
+   token-shift is **within-block** (zero-pad at t=0, no cross-block carry), the
+   only state crossing the boundary is `x` and `vFirst` — there is no `xPrev`.
+   `x` is cached to a memory-mapped bf16 file on disk; `vFirst` is recomputed
+   cheaply from ids (`vFirstFrom`, layer 0) at train time, so it is not stored.
+2. **Trainable tail.** `forwardFrom(x, vFirst, from: freeze)` runs
+   `blocks[freeze..<nLayer] → ln_out`. Trainable fp32 weights are injected via
+   `wOverride`; trainable layers run the differentiable `wkv7Train` kernel
+   (selected by `trainLayers`), optionally gradient-checkpointed
+   (`useBlockCheckpoint`).
 
-Use `.mean` unless you have a reason not to: it is stable against right-padding.
-
-### Suggested presets
-
-```swift
-// Fast / phone-friendly
-TrainingConfig(freeze: 16, contextSize: 128, epochs: 4,
-               batchSize: 8, learningRate: 1e-4, featureBatch: 5)
-
-// Balanced (default-ish)
-TrainingConfig(freeze: 14, contextSize: 128, epochs: 5,
-               batchSize: 8, learningRate: 1e-4, featureBatch: 8)
-
-// Higher capacity (Mac / iPad Pro)
-TrainingConfig(freeze: 10, contextSize: 256, epochs: 6,
-               batchSize: 16, learningRate: 8e-5, featureBatch: 12)
-```
-
----
-
-## Logging & metrics
-
-All output goes through the `RWKVLogger` protocol — no scattered `print`s.
-Implementations must be `Sendable` (training runs on a background thread).
-
-```swift
-public protocol RWKVLogger: Sendable {
-    func log(_ level: RWKVLogLevel, _ message: @autoclosure () -> String)
-    func metric(_ metric: RWKVMetric, value: Double, step: Int)
-}
-```
-
-Built-in loggers:
-
-- `NoopLogger()` — discards everything (default).
-- `OSLogLogger(subsystem:category:minLevel:)` — routes to `os.Logger`
-  (visible in Console.app / Instruments).
-
-Metrics emitted during training (`RWKVMetric`):
-
-| Metric | When | Meaning |
-|---|---|---|
-| `.extractionProgress` | feature extraction | fraction 0…1 |
-| `.tokensPerSecond` | extraction | throughput |
-| `.peakMemoryMB` | extraction + training | resident footprint (MB) |
-| `.loss` | each training step | cross-entropy |
-| `.epoch` | end of epoch | epoch index |
-| `.valAccuracy` | end of epoch | validation accuracy 0…1 |
-
-A custom logger that drives a SwiftUI chart:
-
-```swift
-final class ChartLogger: RWKVLogger, @unchecked Sendable {
-    let onMetric: @Sendable (RWKVMetric, Double, Int) -> Void
-    init(_ onMetric: @escaping @Sendable (RWKVMetric, Double, Int) -> Void) {
-        self.onMetric = onMetric
-    }
-    func log(_ level: RWKVLogLevel, _ message: @autoclosure () -> String) {}
-    func metric(_ metric: RWKVMetric, value: Double, step: Int) {
-        onMetric(metric, value, step)
-    }
-}
-
-let logger = ChartLogger { metric, value, step in
-    DispatchQueue.main.async {
-        if metric == .loss { lossHistory.append(value) }
-        if metric == .valAccuracy { valAcc = value }
-    }
-}
-```
-
----
-
-## Cancellation
-
-`train(...)` is a long, blocking call. Pass a `CancellationToken` and call
-`cancel()` from any thread. The pipeline checks the flag between batches/epochs
-and throws `RWKVError.cancelled`.
-
-```swift
-let token = CancellationToken()
-// background: try trainer.train(data: data, config: cfg, cancellation: token)
-// UI button:  token.cancel()
-```
-
-On cancellation (or any error) the on-disk feature cache and the Metal buffer
-cache are cleaned up automatically.
-
----
-
-## Saving & loading trained models
-
-`Trainer.save(_:to:)` writes a **new, self-contained model package**:
-
-```swift
-try trainer.save(result, to: outURL)
-// outURL/
-//   config.json          ← trained ModelConfig (task, classes, freeze, valAcc, …)
-//   model.safetensors     ← base weights + trained layers + head (bf16)
-//   tokenizer.json         ← copied from the base model
-```
-
-Load it back like any model:
-
-```swift
-let model = try RWKVModel(directory: outURL)
-print(model.config.classes ?? [])
-print(model.hasClassifierHead)   // true
-```
-
-Trained tensors are stored in **bf16** to match the base weights (smaller on
-disk). Training itself runs in fp32 internally for stability.
-
----
-
-## Inference
-
-### Classification
-
-```swift
-let model = try RWKVModel(directory: outURL)
-let clf = try Classifier(model: model)          // throws if no head/classes
-
-let pred = clf.classify("some text")
-pred.label                                       // winning class name
-pred.probabilities                               // [(label, probability)], sorted desc
-```
-
-`Classifier.init` throws `RWKVError.missingWeight("head.weight")` if the model
-has no trained head, or `RWKVError.invalidConfig` if it has no `classes`.
-
-### Feature extraction (no head)
-
-Get a sentence/document embedding (`[nEmbd]`) from any backbone:
-
-```swift
-let extractor = FeatureExtractor(model: model)
-let vector: [Float] = extractor.features("some text")   // length == nEmbd
-```
-
-Useful for similarity search, clustering, or training your own head elsewhere.
-
----
-
-## How it works
-
-Partial fine-tuning in two phases:
-
-1. **Boundary feature extraction.** The frozen bottom layers `[0, freeze)` are
-   run once over every example. The boundary activation `x` at the input of
-   layer `freeze` is written to a memory-mapped file on disk in bf16. Only `x`
-   is stored; `vFirst` is recomputed from token ids (layer 0) and `xPrev` is the
-   last time-step of `x`. This is the slow, GPU-bound phase.
-
-2. **Top-layer training.** The trainable layers `[freeze, nLayer)` plus the head
-   are trained over the cached features with a manual Adam optimizer and a
-   gradient-checkpointed, differentiable WKV-7 kernel. Because the frozen part
-   is never re-run, this phase is fast and memory-light.
-
-The WKV-7 recurrence (the part that does not map onto standard ops) is a custom
-Metal kernel:
-
-- `wkv7Forward` — full-sequence forward, no autodiff (used for the frozen pass).
-- `wkv7Train` — full-sequence forward + a hand-written checkpointed backward,
-  wrapped in an MLX `CustomFunction` so autodiff picks it up (used for the
-  trainable layers).
-
-Constants: `HEAD_SIZE = 64`, `CHUNK = 32`. The hidden state is checkpointed
-every 32 tokens so the backward pass reconstructs each chunk stably.
+`boundaryState + forwardFrom` is **bit-exact** equal to `body` (Δ = 0), so the
+cache scheme never changes the math.
 
 ---
 
 ## Memory & performance
 
-- **Peak memory** is dominated by activations during feature extraction, scaling
-  with `featureBatch × contextSize`. Lower `featureBatch` if you hit memory
-  pressure on a phone; raise it on a Mac to keep the GPU busy.
-- `featureBatch = 1` underutilizes the GPU (slow, and the device runs hot).
-  Values of `5–12` are typically much faster.
-- The module caps the MLX Metal buffer cache (`GPU.cacheLimit = 64 MB`) during
-  training and clears it on exit to avoid a 2× footprint on a second run.
-- Feature extraction is GPU-bound; top-layer training is fast because it works on
-  the small cached features.
-- Track `RWKVMetric.peakMemoryMB` and `.tokensPerSecond` via your logger to tune
-  `featureBatch` / `batchSize` for a given device.
+- **Block gradient checkpoint** (`useBlockCheckpoint = true`): ≈ −45% peak memory
+  for ≈ +22% step time. Recommended on phones.
+- **MLX buffer cache**: `LoRAConfig.cacheLimitGB` caps `GPU.cacheLimit` during
+  LoRA training (default 1.5 GB); set ≤ 0 to disable the cap.
+- **fp32 training**: trainable params + optimizer state are fp32 (bf16 Adam
+  updates lose precision); frozen base stays bf16. This matches how RWKV-7 World
+  was trained with the fp32 kernel.
+- **Fused cross-entropy** was evaluated and **dropped**: in MLX-Swift (no
+  Triton-level allocation control) it raised peak memory rather than lowering it,
+  and at vocab ≤ 32k the `[N,V]` logits are not the dominant term.
 
 ---
 
-## Error handling
+## Validation status
 
-All recoverable failures throw `RWKVError` (instead of `precondition`/`fatalError`
-in the public path):
+Everything below is covered by tests (local `Tests/`, gitignored):
 
-```swift
-public enum RWKVError: Error {
-    case missingFile(file: String, directory: String)
-    case invalidConfig(reason: String)
-    case weightsLoadFailed(reason: String)
-    case missingWeight(key: String)
-    case tokenizerLoadFailed(reason: String)
-    case invalidGeometry(reason: String)
-    case invalidDataset(reason: String)
-    case cancelled
-}
-```
-
-```swift
-do {
-    let result = try trainer.train(data: data, config: cfg, cancellation: token)
-    try trainer.save(result, to: outURL)
-} catch RWKVError.cancelled {
-    // user aborted
-} catch let RWKVError.invalidGeometry(reason) {
-    // e.g. contextSize not divisible by 32
-    print("geometry:", reason)
-} catch {
-    print("training failed:", error)
-}
-```
+| Check | Result |
+|---|---|
+| WKV-7 kernel forward vs Python reference (1 chunk) | Δ = 0 (bit-exact) |
+| WKV-7 custom backward vs autograd reference (`wkv7Reference`) | rel-L2 ≈ 5e-7 (dk,dv,db); ≈ 5–9e-4 (dr,dw,da, recompute-by-`/w`) |
+| x070 logits/ln_out vs Python World reference | parity (existing fixtures) |
+| Split `boundaryState+forwardFrom` vs `body` (real ru60m weights) | Δ = 0 at f = 0,6,12,17 |
+| ru60m next-token loss on real Russian text | ≈ 2.46 (ppl ≈ 11.7; random ≈ 9.68) |
+| Partial fine-tune end-to-end (top layers + head, ru60m) | loss 0.84 → 0.0001, valAcc 1.0 |
 
 ---
 
-## Kernel parity
+## Constants & gotchas
 
-The WKV-7 Metal kernel is verified **bit-for-bit** against the Python reference
-from [`rwkv-metal`](https://github.com/RafaelUI/SwiftRWKV). The test loads a
-fixture (`r,w,k,v,a,b,h_in` inputs + reference `out,h_out,sa_out` outputs for one
-chunk) and checks the three outputs:
-
-```
-$ swift test
-[parity] chunk forward:        out Δ=0.00e+00  h_out Δ=0.00e+00  sa_out Δ=0.00e+00
-[parity] full vs chunk:        Δ=0.00e+00
-[parity] train-forward:        Δ=0.00e+00
-Executed 3 tests, with 0 failures
-```
-
-This guarantees the kernel was ported into the framework without regression.
-
----
-
-## FAQ / gotchas
-
-**Does it run on the iOS Simulator?**
-The kernel needs a real Metal GPU. Use a physical device or macOS.
-
-**`contextSize` / `headSize` constraints?**
-`contextSize` must be a multiple of `32` (CHUNK); `headSize` must be `64`
-(HEAD_SIZE). Otherwise you get `RWKVError.invalidGeometry`.
-
-**Why bf16 on disk but fp32 in training?**
-bf16 keeps model files small and matches the base weights. Training keeps
-trainable params/optimizer state in fp32, because bf16 Adam updates lose
-precision on rounding.
-
-**Can I train without a validation set?**
-Yes — return `[]` from `validationExamples()`. Then `validationAccuracy`
-reflects whatever the pipeline computes on an empty set (treat it as undefined);
-prefer providing at least a small val split.
-
-**Is `Trainer.train` async?**
-No, it's synchronous and blocking. Call it from a background queue and report
-progress through your `RWKVLogger`. MLX is not thread-safe, so do not run two
-trainings concurrently — serialize them on one queue.
-
-**How do classes map to labels?**
-`classes[i]` is the name for label `i`. Keep the order consistent between your
-`DataProvider.classes` and the `classes` you pass to `Trainer`.
+- **`headSize` must be 64**, **`ctxLen` / context must be a multiple of 32**
+  (the kernel's `WKV7_HEAD_SIZE` and `WKV7_CHUNK`). The trainable path uses
+  `wkv7Train`, which requires `T % 32 == 0`.
+- **Simulator**: needs a real Metal GPU; run on device or macOS.
+- **FLA checkpoints** must be converted (naming + `k_k`/`k_a` reshape) before
+  loading — see [Converting FLA → x070](#converting-fla-checkpoints--x070).
+- **World vs HF tokenizer**: `WorldTokenizer` is only for RWKV World vocab;
+  custom models use their own `tokenizer.json`.
+- **MLX is not thread-safe**: never run two trainings concurrently; serialize on
+  one queue and report progress via the `onStep` / `onEpoch` callbacks.
+- **Which fine-tune?** LoRA/QLoRA for ≈600M+; N-layer partial for ≤400M. Both run
+  on the same `X070Backbone`, just different entry points
+  (`LoRAFinetune` vs `X070PartialFinetune`).
 
 ---
 
