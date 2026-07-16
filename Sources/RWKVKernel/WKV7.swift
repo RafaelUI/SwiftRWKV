@@ -5,7 +5,7 @@ import MLXFast
 // ───────────────────────────── Константы ─────────────────────────────
 // Должны совпадать с model/wkv7.py
 public let WKV7_HEAD_SIZE = 64
-public let WKV7_CHUNK     = 32
+public let WKV7_CHUNK     = 16  // 32 расходился на 1.5B (см. chunk × lr матрицу), 16 численно эквивалентен
 
 // Кэш скомпилированных ядер по числу голов H (как _fwd_cache в Python)
 private var fwdKernelCache: [Int: MLXFastKernel] = [:]

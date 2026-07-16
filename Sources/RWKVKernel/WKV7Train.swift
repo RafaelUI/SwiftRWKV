@@ -157,6 +157,7 @@ private func ckptBwdKernel(H: Int, T: Int) -> MLXFastKernel {
 
                 for (uint dk=0; dk<HEAD_SIZE_C; dk++)
                     C_row[dk] = C_row[dk]*w_sh[dk] + dsa_dv*a_sh[dk];
+        threadgroup_barrier(mem_flags::mem_threadgroup); // fix: race — next timestep overwrites w_sh/a_sh
             }
         }
         for (uint dk=0; dk<HEAD_SIZE_C; dk++) dh_in_out[hb+dk] = C_row[dk];

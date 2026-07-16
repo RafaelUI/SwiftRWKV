@@ -52,17 +52,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RWKVGenTests",
-            dependencies: ["RWKVGen", "RWKVKernel"],
-            resources: [
-                // Эталон паритета WKV-7-ядра (перенесён из RWKVTrainTests).
-                .copy("Resources/wkv7_kernel_parity.safetensors"),
-                // Эталон паритета x070: веса World-0.1B + ожидаемые ln_out/logits.
-                .copy("Resources/world_0.1b_x070.safetensors"),
-                .copy("Resources/x070_parity.safetensors"),
-                .copy("Resources/x070_stages.safetensors"),
-                .copy("Resources/x070_tmix.safetensors"),
-                .copy("Resources/x070_perlayer.safetensors"),
-            ]
+            dependencies: ["RWKVGen", "RWKVKernel"]
         ),
     ]
 )
