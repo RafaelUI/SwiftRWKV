@@ -143,11 +143,16 @@ public final class X070Backbone {
         return wv("emb.weight").take(ids, axis: 0)
     }
 
-    // token-shift: prev[t]=x[t-1], prev[0]=0 (нулевой паддинг). xx = prev - x.
-    private func tokenShift(_ x: MLXArray) -> MLXArray {
+    // token-shift: prev[t]=x[t-1]. Возвращает xx = prev - x.
+    //
+    // prev0 — вход на позиции −1, то есть последний токен ПРЕДЫДУЩЕГО куска
+    // той же последовательности [B,1,D]. nil ⇒ нули (начало последовательности,
+    // прежнее поведение). Без этого продолжение расходится со сплошным проходом
+    // ровно на первом токене каждого слоя.
+    private func tokenShift(_ x: MLXArray, _ prev0: MLXArray? = nil) -> MLXArray {
         let B = x.shape[0], T = x.shape[1], D = x.shape[2]
-        let zero = MLXArray.zeros([B, 1, D], dtype: x.dtype)
-        let shifted = concatenated([zero, x[0..., 0 ..< (T - 1)]], axis: 1)
+        let head = prev0?.asType(x.dtype) ?? MLXArray.zeros([B, 1, D], dtype: x.dtype)
+        let shifted = concatenated([head, x[0..., 0 ..< (T - 1)]], axis: 1)
         return shifted - x
     }
 
@@ -166,13 +171,21 @@ public final class X070Backbone {
     }
 
     // time-mix блока layer. Возвращает (выход, обновлённый v_first).
-    private func tmix(_ x: MLXArray, _ vFirst: MLXArray?, _ layer: Int)
-        -> (MLXArray, MLXArray) {
+    //
+    // Состояние и паддинг (оба опциональны, nil ⇒ прежнее поведение):
+    //   shiftPrev — вход на позиции −1 для token-shift, [B,1,D];
+    //   hIn       — начальная матрица WKV [B,H,S,S];
+    //   mask      — [B,T], 1 у реального токена, 0 у right-паддинга;
+    //   wantState — вернуть конечную матрицу WKV третьим элементом.
+    private func tmix(_ x: MLXArray, _ vFirst: MLXArray?, _ layer: Int,
+                      shiftPrev: MLXArray? = nil, hIn: MLXArray? = nil,
+                      mask: MLXArray? = nil, wantState: Bool = false)
+        -> (MLXArray, MLXArray, MLXArray?) {
         let p = "blocks.\(layer).tmix."
         let B = x.shape[0], T = x.shape[1], D = cfg.nEmbd
         let H = cfg.nHead, S = cfg.headSize
 
-        let xx = tokenShift(x)
+        let xx = tokenShift(x, shiftPrev)
         let xr = x + xx * g(p + "x_r")
         let xw = x + xx * g(p + "x_w")
         let xk = x + xx * g(p + "x_k")
@@ -216,24 +229,59 @@ public final class X070Backbone {
         k = k * (1.0 + (a - 1.0) * g(p + "k_a"))
 
         // WKV-7: a_kernel = -kk, b_kernel = kk * a
-        var out = trainLayers.contains(layer)
-            ? wkv7Train(r, ww, k, v, -kk, kk * a)
-            : wkv7Forward(r, ww, k, v, -kk, kk * a)         // [B,T,H,S]
+        var kWkv = k
+        var bWkv = kk * a
+
+        // Right-padding: делаем пад-позиции НЕЙТРАЛЬНЫМИ для рекуррентности.
+        //   w←1, k←0, b←0  ⇒  h' = 1·h + v·0ᵀ + sa·0ᵀ = h
+        // Состояние строки замирает на её последнем реальном токене и не
+        // зависит ни от числа пад-токенов, ни от соседей по батчу.
+        //
+        // a (=-kk) и v НЕ маскируются намеренно: k=0 уже убивает член v·kᵀ,
+        // b=0 — член sa·bᵀ, поэтому их значения на паддинге ни на что не
+        // влияют. Лишняя маскировка была бы просто лишней арифметикой.
+        //
+        // Выход на пад-позициях остаётся мусорным — это нормально: модель
+        // каузальна, мусор может попасть только на пад-позиции следующих
+        // слоёв и до реальных токенов не доходит.
+        if let mask {
+            let m = mask.reshaped([B, T, 1, 1]).asType(ww.dtype)
+            ww = ww * m + (1.0 - m)
+            kWkv = kWkv * m
+            bWkv = bWkv * m
+        }
+
+        var hOut: MLXArray? = nil
+        var out: MLXArray
+        if wantState || hIn != nil {
+            let (o, h) = trainLayers.contains(layer)
+                ? wkv7TrainWithState(r, ww, kWkv, v, -kk, bWkv, hIn)
+                : wkv7ForwardWithState(r, ww, kWkv, v, -kk, bWkv, hIn)
+            out = o
+            hOut = h
+        } else {
+            out = trainLayers.contains(layer)
+                ? wkv7Train(r, ww, kWkv, v, -kk, bWkv)
+                : wkv7Forward(r, ww, kWkv, v, -kk, bWkv)    // [B,T,H,S]
+        }
 
         // Порядок официала: ln_x (GroupNorm) ДО bonus.
         out = lnX(out.reshaped([B, T, D]), g(p + "ln_x.weight"), g(p + "ln_x.bias"))
               .reshaped([B, T, H, S])
+        // bonus считается по НЕмаскированному k — так же, как в Python: маска
+        // существует только ради рекуррентности, а bonus живёт на позиции и на
+        // состояние не влияет.
         let bonus = (r * k * g(p + "r_k")).sum(axis: -1, keepDims: true) * v
         out = (out + bonus).reshaped([B, T, D])
 
         let res = proj(out * gate, p + "o_proj.weight", lora: p + "o_proj")
-        return (res, vFirstOut)
+        return (res, vFirstOut, hOut)
     }
 
     // channel-mix: value(relu(key(xk))^2). token-shift свой, нулевой паддинг.
-    private func cmix(_ x: MLXArray, _ layer: Int) -> MLXArray {
+    private func cmix(_ x: MLXArray, _ layer: Int, shiftPrev: MLXArray? = nil) -> MLXArray {
         let p = "blocks.\(layer).cmix."
-        let xx = tokenShift(x)
+        let xx = tokenShift(x, shiftPrev)
         let xk = x + xx * g(p + "x_k")
         let h = relu(proj(xk, p + "key.weight", lora: p + "key"))
         return proj(h * h, p + "value.weight", lora: p + "value")
@@ -241,12 +289,34 @@ public final class X070Backbone {
 
     /// Один блок: ln1+tmix+resid+ln2+cmix+resid. (x0, vFirst?) -> (x', vFirstOut).
     func blockForward(_ x0: MLXArray, _ vFirst: MLXArray?, _ layer: Int) -> (MLXArray, MLXArray) {
-        let (h, vf) = tmix(layerNorm(x0, g("blocks.\(layer).ln1.weight"),
-                                     g("blocks.\(layer).ln1.bias")), vFirst, layer)
+        let (h, vf, _) = tmix(layerNorm(x0, g("blocks.\(layer).ln1.weight"),
+                                        g("blocks.\(layer).ln1.bias")), vFirst, layer)
         var x = x0 + h
         x = x + cmix(layerNorm(x, g("blocks.\(layer).ln2.weight"),
                                g("blocks.\(layer).ln2.bias")), layer)
         return (x, vf)
+    }
+
+    /// Тот же блок, но с граничным состоянием. Возвращает
+    /// (x', vFirstOut, hOut, tmixShiftOut, cmixShiftOut).
+    ///
+    /// Сдвиги снимаются с позиции endIdx (последний РЕАЛЬНЫЙ токен строки), а
+    /// не с конца паддинга — иначе продолжение стартовало бы со сдвига,
+    /// снятого с пад-позиции.
+    func blockForwardWithState(
+        _ x0: MLXArray, _ vFirst: MLXArray?, _ layer: Int,
+        hIn: MLXArray?, mask: MLXArray?, tmixPrev: MLXArray?,
+        cmixPrev: MLXArray?, endIdx: MLXArray?
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
+        let x1 = layerNorm(x0, g("blocks.\(layer).ln1.weight"),
+                           g("blocks.\(layer).ln1.bias"))
+        let (h, vf, hOut) = tmix(x1, vFirst, layer, shiftPrev: tmixPrev,
+                                 hIn: hIn, mask: mask, wantState: true)
+        var x = x0 + h
+        let x2 = layerNorm(x, g("blocks.\(layer).ln2.weight"),
+                           g("blocks.\(layer).ln2.bias"))
+        x = x + cmix(x2, layer, shiftPrev: cmixPrev)
+        return (x, vf, hOut!, gatherLast(x1, endIdx), gatherLast(x2, endIdx))
     }
 
     /// Отсортированные ключи LoRA-таргетов слоя (детерминированный порядок упаковки).
@@ -300,6 +370,68 @@ public final class X070Backbone {
         proj(body(ids), "head.weight", lora: nil)
     }
 
+    /// body с граничным состоянием: продолжить с `state` и вернуть состояние
+    /// на конце. ids [B,T] → (ln_out [B,T,D], состояние после последнего
+    /// РЕАЛЬНОГО токена каждой строки).
+    ///
+    /// Это то, на чём стоит префикс-кэш: длинный документ сворачивается один
+    /// раз, а каждый запрос продолжает с готового состояния и стоит O(своей
+    /// длины) вместо O(документ + запрос).
+    ///
+    /// - state:  продолжить с него; nil ⇒ начало последовательности.
+    /// - mask:   [B,T], 1 у реального токена, 0 у right-паддинга. Без неё
+    ///           пад-токены пройдут через рекуррентность и испортят КОНЕЧНОЕ
+    ///           состояние (на скрытые состояния реальных токенов они не
+    ///           влияют — модель каузальна).
+    /// - endIdx: где снимать token-shift; обычно `lastRealIndex(lengths:)`.
+    ///           nil ⇒ последняя позиция, что верно только без паддинга.
+    ///
+    /// Путь с состоянием намеренно НЕ оборачивается в блочный gradient
+    /// checkpoint: он существует ради инференса и обучения НАД замороженной
+    /// базой, где пересчитывать активации нечего и незачем.
+    public func bodyWithState(
+        _ ids: MLXArray, state: RWKVBatchState? = nil,
+        mask: MLXArray? = nil, endIdx: MLXArray? = nil
+    ) -> (MLXArray, RWKVBatchState) {
+        if let state {
+            precondition(state.nLayer == cfg.nLayer,
+                         "состояние на \(state.nLayer) слоёв, модель на \(cfg.nLayer)")
+            precondition(state.batch == ids.shape[0],
+                         "batch состояния \(state.batch) != batch ids \(ids.shape[0])")
+        }
+        let emb = embed(ids)
+        var x = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
+        var vFirst: MLXArray? = nil
+
+        var wkvs: [MLXArray] = [], tshifts: [MLXArray] = [], cshifts: [MLXArray] = []
+        wkvs.reserveCapacity(cfg.nLayer)
+        tshifts.reserveCapacity(cfg.nLayer)
+        cshifts.reserveCapacity(cfg.nLayer)
+
+        for layer in 0 ..< cfg.nLayer {
+            let (xo, vf, hOut, ts, cs) = blockForwardWithState(
+                x, vFirst, layer,
+                hIn: state?.layerWKV(layer),
+                mask: mask,
+                tmixPrev: state?.layerTmixShift(layer),
+                cmixPrev: state?.layerCmixShift(layer),
+                endIdx: endIdx)
+            x = xo
+            vFirst = vf
+            wkvs.append(hOut); tshifts.append(ts); cshifts.append(cs)
+        }
+
+        let lnOut = layerNorm(x, g("ln_out.weight"), g("ln_out.bias"))
+        return (lnOut, RWKVBatchState.stacked(wkv: wkvs, tmix: tshifts, cmix: cshifts))
+    }
+
+    /// Только состояние на конце последовательности, без скрытых состояний.
+    /// Обёртка над bodyWithState для случая, когда нужен лишь кэш префикса.
+    public func states(_ ids: MLXArray, state: RWKVBatchState? = nil,
+                       mask: MLXArray? = nil, endIdx: MLXArray? = nil) -> RWKVBatchState {
+        bodyWithState(ids, state: state, mask: mask, endIdx: endIdx).1
+    }
+
     // ─────────── Partial-finetune: разрез сети на слое f ───────────
     // token-shift внутриблочный ⇒ между блоками течёт только (x, vFirst),
     // межблочного xPrev НЕТ. Поэтому граница = (x после блока f-1, vFirst).
@@ -347,8 +479,8 @@ public final class X070Backbone {
         var vFirst: MLXArray? = nil
         var out: [String: MLXArray] = [:]
         for layer in 0 ..< cfg.nLayer {
-            let (h, vf) = tmix(layerNorm(x, g("blocks.\(layer).ln1.weight"),
-                                         g("blocks.\(layer).ln1.bias")), vFirst, layer)
+            let (h, vf, _) = tmix(layerNorm(x, g("blocks.\(layer).ln1.weight"),
+                                            g("blocks.\(layer).ln1.bias")), vFirst, layer)
             vFirst = vf
             x = x + h
             x = x + cmix(layerNorm(x, g("blocks.\(layer).ln2.weight"),
@@ -390,8 +522,8 @@ public final class X070Backbone {
     func debugStages(_ ids: MLXArray) -> [String: MLXArray] {
         let emb = embed(ids)
         let afterLn0 = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
-        let (h, _) = tmix(layerNorm(afterLn0, g("blocks.0.ln1.weight"),
-                                    g("blocks.0.ln1.bias")), nil, 0)
+        let (h, _, _) = tmix(layerNorm(afterLn0, g("blocks.0.ln1.weight"),
+                                       g("blocks.0.ln1.bias")), nil, 0)
         var x2 = afterLn0 + h
         x2 = x2 + cmix(layerNorm(x2, g("blocks.0.ln2.weight"),
                                  g("blocks.0.ln2.bias")), 0)
