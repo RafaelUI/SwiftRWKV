@@ -14,8 +14,8 @@ import MLXFast
 //   • Swift-овский VJP { primals, cotangents } НЕ получает outputs forward'а,
 //     поэтому sa_out и h_checkpoints ПЕРЕСЧИТЫВАЕМ внутри VJP (один лишний
 //     forward — это и есть gradient checkpointing, экономит память).
-//   • Функция возвращает ТОЛЬКО out (h_out/sa/ckpts — внутренние),
-//     значит cotangents = [d_out], а grad по финальному состоянию = 0.
+//   • Возвращаются два выхода — out и h_out (sa/ckpts остаются внутренними),
+//     значит cotangents = [d_out, d_h_out].
 //
 //  Требования: T % WKV7_CHUNK == 0, D == WKV7_HEAD_SIZE. Всё в fp32.
 // ───────────────────────────────────────────────────────────────────────
@@ -172,32 +172,59 @@ private func ckptBwdKernel(H: Int, T: Int) -> MLXFastKernel {
     return kern
 }
 
-// Дифференцируемый WKV-7 на весь T. Входы [B,T,H,D]. Возвращает out [B,T,H,D].
-// Использовать ТОЛЬКО в обучаемых слоях (frozen — через wkv7Forward).
-public func wkv7Train(_ r: MLXArray, _ w: MLXArray, _ k: MLXArray,
-               _ v: MLXArray, _ a: MLXArray, _ b: MLXArray) -> MLXArray {
+// Дифференцируемый WKV-7 на весь T с ЯВНЫМ граничным состоянием.
+// Входы [B,T,H,D], hIn [B,H,D,D] (nil ⇒ нули). Возвращает (out, hOut).
+//
+// Дифференцируемо и по hIn: backward-ядро уже считает dh_in_out, здесь он
+// доходит до вызывающего, а не отбрасывается. Это то, что позволяет учить
+// голову ПОВЕРХ кэшированного состояния (реранкер) и тюнить само состояние.
+//
+// hOut — второй выход, поэтому котангентов два: [d_out, d_h_out]. Если
+// вызывающий не использует hOut, MLX подаёт нулевой d_h_out, и результат
+// совпадает с прежним поведением.
+//
+// ВАЖНО: T обязана делиться на WKV7_CHUNK. Ядро считает N = T/CHUNK целочисленно,
+// поэтому некратный T молча обработал бы меньше токенов — precondition делает
+// это громким. (Python добивает T паддингом в _pad_to_chunk; здесь паддинг
+// остаётся на стороне вызывающего, как и было.)
+public func wkv7TrainWithState(
+    _ r: MLXArray, _ w: MLXArray, _ k: MLXArray, _ v: MLXArray,
+    _ a: MLXArray, _ b: MLXArray, _ hIn: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = r.shape[0], T = r.shape[1], H = r.shape[2], D = r.shape[3]
+    precondition(T % WKV7_CHUNK == 0,
+                 "T (\(T)) должна делиться на CHUNK \(WKV7_CHUNK)")
+    precondition(D == WKV7_HEAD_SIZE,
+                 "D (\(D)) должен равняться HEAD_SIZE \(WKV7_HEAD_SIZE)")
+    let h0 = hIn ?? MLXArray.zeros([B, H, D, D], dtype: .float32)
+    precondition(h0.shape == [B, H, D, D],
+                 "hIn \(h0.shape) должен быть [B,H,D,D] = [\(B),\(H),\(D),\(D)]")
+
     let fn = CustomFunction {
         Forward { inp in
             let r = inp[0], w = inp[1], k = inp[2], v = inp[3], a = inp[4], b = inp[5]
+            let hIn = inp[6]
             let B = r.shape[0], T = r.shape[1], H = r.shape[2], D = r.shape[3]
             let N = T / WKV7_CHUNK
-            let hIn = MLXArray.zeros([B, H, D, D], dtype: .float32)
             let ins = [r,w,k,v,a,b,hIn].map { $0.asType(.float32) }
             let o = ckptFwdKernel(H: H, T: T)(
                 ins, grid: (B*H, D, 1), threadGroup: (1,1,1),
                 outputShapes: [[B,T,H,D],[B,H,D,D],[B,T,H,D],[B,H,N,D,D]],
                 outputDTypes: [.float32,.float32,.float32,.float32]
             )
-            return [o[0]]                 // только out; остальное — внутреннее
+            return [o[0], o[1]]           // out, h_out; sa/ckpts — внутренние
         }
         VJP { primals, cotangents in
             let r = primals[0], w = primals[1], k = primals[2]
             let v = primals[3], a = primals[4], b = primals[5]
-            let dOut = cotangents[0]
+            let hIn = primals[6]
             let B = r.shape[0], T = r.shape[1], H = r.shape[2], D = r.shape[3]
             let N = T / WKV7_CHUNK
-            let hIn = MLXArray.zeros([B, H, D, D], dtype: .float32)
-            // 1) пересчёт forward → sa_fwd, h_checkpoints (out отбрасываем)
+            let dOut  = cotangents[0]
+            // Swift-овский VJP не получает outputs forward'а (третий аргумент
+            // C-замыкания — argnums — отбрасывается), поэтому sa_fwd и
+            // h_checkpoints пересчитываем: один лишний forward и есть
+            // gradient checkpointing.
             let f = ckptFwdKernel(H: H, T: T)(
                 [r,w,k,v,a,b,hIn].map { $0.asType(.float32) },
                 grid: (B*H, D, 1), threadGroup: (1,1,1),
@@ -205,17 +232,27 @@ public func wkv7Train(_ r: MLXArray, _ w: MLXArray, _ k: MLXArray,
                 outputDTypes: [.float32,.float32,.float32,.float32]
             )
             let saFwd = f[2], hCkpts = f[3]
-            let dHOut = MLXArray.zeros([B, H, D, D], dtype: .float32)
-            // 2) backward
+            let dHOut = cotangents.count > 1
+                ? cotangents[1].asType(.float32)
+                : MLXArray.zeros([B, H, D, D], dtype: .float32)
             let g = ckptBwdKernel(H: H, T: T)(
                 [r,w,k,v,a,b,hCkpts,saFwd,dOut.asType(.float32),dHOut],
                 grid: (B*H*D, 1, 1), threadGroup: (D, 1, 1),
                 outputShapes: Array(repeating: [B,T,H,D], count: 6) + [[B,H,D,D]],
                 outputDTypes: Array(repeating: DType.float32, count: 7)
             )
-            // grad по r,w,k,v,a,b к dtype примала; dh_in (g[6]) отбрасываем
-            return zip([g[0],g[1],g[2],g[3],g[4],g[5]], primals).map { $0.asType($1.dtype) }
+            // argnums Swift игнорирует ⇒ возвращаем градиенты по ВСЕМ семи
+            // примелам по порядку, включая dh_in (g[6]).
+            return zip(g, primals).map { $0.asType($1.dtype) }
         }
     }
-    return fn([r, w, k, v, a, b])[0]
+    let out = fn([r, w, k, v, a, b, h0])
+    return (out[0], out[1])
+}
+
+// Совместимая обёртка: нулевое начальное состояние, конечное отбрасывается.
+// Использовать ТОЛЬКО в обучаемых слоях (frozen — через wkv7Forward).
+public func wkv7Train(_ r: MLXArray, _ w: MLXArray, _ k: MLXArray,
+               _ v: MLXArray, _ a: MLXArray, _ b: MLXArray) -> MLXArray {
+    wkv7TrainWithState(r, w, k, v, a, b, nil).0
 }

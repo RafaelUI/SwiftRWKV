@@ -81,14 +81,26 @@ public func wkv7ChunkForward(
     return (outputs[0], outputs[1], outputs[2])
 }
 
-// Полный forward по всей длине T (frozen backbone): чанкуем по CHUNK,
-// переносим h_out → h_in. Backward НЕ нужен. Эквивалент wkv7_train без autodiff.
-public func wkv7Forward(
+// Полный forward по всей длине T с ЯВНЫМ граничным состоянием (frozen backbone):
+// чанкуем по CHUNK, переносим h_out → h_in. Backward НЕ нужен.
+//
+// hIn == nil ⇒ нулевое состояние (начало последовательности).
+// Возвращает (out [B,T,H,D], hOut [B,H,D,D]) — hOut годится как hIn следующего
+// куска той же последовательности. Это то, на чём стоит префикс-кэш реранкера:
+// документ сворачивается один раз, запрос продолжает с готового состояния.
+//
+// Хвост длиной < CHUNK добивается no-op шагами (w=1, r=k=v=a=b=0):
+//   h' = 1*h + 0*kᵀ + 0*bᵀ = h
+// поэтому hOut с паддингом равен hOut без него — добитые шаги состояние не
+// трогают (ср. _pad_to_chunk в kernel/wkv7.py).
+public func wkv7ForwardWithState(
     _ r: MLXArray, _ w: MLXArray, _ k: MLXArray, _ v: MLXArray,
-    _ a: MLXArray, _ b: MLXArray
-) -> MLXArray {
+    _ a: MLXArray, _ b: MLXArray, _ hIn: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
     let B = r.shape[0], T = r.shape[1], H = r.shape[2], D = r.shape[3]
-    var h = MLXArray.zeros([B, H, D, D], dtype: .float32)
+    var h = hIn?.asType(.float32) ?? MLXArray.zeros([B, H, D, D], dtype: .float32)
+    precondition(h.shape == [B, H, D, D],
+                 "hIn \(h.shape) должен быть [B,H,D,D] = [\(B),\(H),\(D),\(D)]")
     var outs: [MLXArray] = []
 
     var start = 0
@@ -113,5 +125,13 @@ public func wkv7Forward(
         outs.append(oc[0..., 0 ..< cl])
         start += WKV7_CHUNK
     }
-    return concatenated(outs, axis: 1)
+    return (concatenated(outs, axis: 1), h)
+}
+
+// Совместимая обёртка: нулевое начальное состояние, конечное отбрасывается.
+public func wkv7Forward(
+    _ r: MLXArray, _ w: MLXArray, _ k: MLXArray, _ v: MLXArray,
+    _ a: MLXArray, _ b: MLXArray
+) -> MLXArray {
+    wkv7ForwardWithState(r, w, k, v, a, b, nil).0
 }

@@ -24,16 +24,18 @@ import MLX
 //  для продакшен-обучения — wkv7Train.
 // ───────────────────────────────────────────────────────────────────────
 
-/// Наивная рекуррентная WKV-7, дифференцируемая автоградом MLX.
-/// Входы [B,T,H,D]. h_in = 0. Возвращает out [B,T,H,D].
-public func wkv7Reference(
+/// Наивная рекуррентная WKV-7 с явным граничным состоянием, дифференцируемая
+/// автоградом MLX — в том числе ПО hIn. Это ground-truth для dh_in, который
+/// backward-ядро считает само: сверять его больше не с чем.
+/// Входы [B,T,H,D], hIn [B,H,D,D] (nil ⇒ нули). Возвращает (out, hOut).
+public func wkv7ReferenceWithState(
     _ r: MLXArray, _ w: MLXArray, _ k: MLXArray, _ v: MLXArray,
-    _ a: MLXArray, _ b: MLXArray
-) -> MLXArray {
+    _ a: MLXArray, _ b: MLXArray, _ hIn: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
     let B = r.shape[0], T = r.shape[1], H = r.shape[2], D = r.shape[3]
 
-    // S[b,h,dv,dk]; старт с нуля (h_in = 0, как в wkv7Train).
-    var s = MLXArray.zeros([B, H, D, D], dtype: .float32)
+    // S[b,h,dv,dk]
+    var s = hIn?.asType(.float32) ?? MLXArray.zeros([B, H, D, D], dtype: .float32)
     var outs: [MLXArray] = []
     outs.reserveCapacity(T)
 
@@ -70,5 +72,13 @@ public func wkv7Reference(
         let y = (s * rCol).sum(axis: -1)             // [B,H,D] индекс dv
         outs.append(y.expandedDimensions(axis: 1))   // [B,1,H,D]
     }
-    return concatenated(outs, axis: 1)               // [B,T,H,D]
+    return (concatenated(outs, axis: 1), s)          // ([B,T,H,D], [B,H,D,D])
+}
+
+/// Совместимая обёртка: h_in = 0, конечное состояние отбрасывается.
+public func wkv7Reference(
+    _ r: MLXArray, _ w: MLXArray, _ k: MLXArray, _ v: MLXArray,
+    _ a: MLXArray, _ b: MLXArray
+) -> MLXArray {
+    wkv7ReferenceWithState(r, w, k, v, a, b, nil).0
 }
