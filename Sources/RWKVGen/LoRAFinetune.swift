@@ -44,17 +44,31 @@ public struct LoRAConfig: Sendable {
     public var logEvery: Int
     /// true ⇒ блочный gradient checkpoint (−~45% пик памяти / +~22% времени).
     public var useBlockCheckpoint: Bool
+    /// Спад LR после warmup. Исторический дефолт — .constant (плоско).
+    public var schedule: LRSchedule
+    public var lrMin: Float
 
     public init(lr: Float = 1e-4, gradClip: Float = 1.0, weightDecay: Float = 0.0,
                 beta1: Float = 0.9, beta2: Float = 0.95, adamEps: Float = 1e-8,
                 maxSteps: Int = 1000, gradAccum: Int = 1, warmupSteps: Int = 0,
                 cacheLimitGB: Double = 1.5, logEvery: Int = 10,
-                useBlockCheckpoint: Bool = false) {
+                useBlockCheckpoint: Bool = false,
+                schedule: LRSchedule = .constant, lrMin: Float = 0) {
         self.lr = lr; self.gradClip = gradClip; self.weightDecay = weightDecay
         self.beta1 = beta1; self.beta2 = beta2; self.adamEps = adamEps
         self.maxSteps = maxSteps; self.gradAccum = gradAccum; self.warmupSteps = warmupSteps
         self.cacheLimitGB = cacheLimitGB; self.logEvery = logEvery
         self.useBlockCheckpoint = useBlockCheckpoint
+        self.schedule = schedule; self.lrMin = lrMin
+    }
+
+    /// Проекция в общий TrainingConfig.
+    var training: TrainingConfig {
+        TrainingConfig(lr: lr, lrMin: lrMin, schedule: schedule,
+                       warmupSteps: warmupSteps, gradClip: gradClip,
+                       weightDecay: weightDecay, beta1: beta1, beta2: beta2,
+                       adamEps: adamEps, maxSteps: maxSteps, gradAccum: gradAccum,
+                       cacheLimitGB: cacheLimitGB, logEvery: logEvery)
     }
 }
 
@@ -78,8 +92,22 @@ func residentMemoryMB() -> Double {
 
 public enum LoRAFinetune {
 
+    /// LM-лосс: cross-entropy по next-token на всём [B,T,vocab].
+    static func languageModelLoss(_ bb: X070Backbone, _ batch: LoRABatch) -> MLXArray {
+        let logits = bb(batch.x)                            // [B,T,V]
+        let B = logits.shape[0], T = logits.shape[1], V = logits.shape[2]
+        return crossEntropy(logits: logits.reshaped([B * T, V]),
+                            targets: batch.y.reshaped([B * T]).asType(.int32),
+                            reduction: .mean)
+    }
+
     /// Обучить навешенные LoRA-адаптеры. `nextBatch` отдаёт следующий (x,y);
     /// циклирование маленького датасета — на стороне вызывающего.
+    ///
+    /// Тонкая обёртка над общим Trainer: здесь остаётся только специфика
+    /// LoRA — какое множество обучается (LoRATrainableSet), какой лосс (LM CE)
+    /// и проверка кратности T размеру чанка. Оптимизатор, расписание,
+    /// накопление и клип — общие.
     @discardableResult
     public static func run(
         _ bb: X070Backbone,
@@ -89,126 +117,32 @@ public enum LoRAFinetune {
         onStep: (_ step: Int, _ loss: Float, _ gradNorm: Float, _ peakMB: Double) -> Void = { _,_,_,_ in }
     ) -> LoRATrainResult {
 
-        if cfg.cacheLimitGB > 0 {
-            MLX.GPU.set(cacheLimit: Int(cfg.cacheLimitGB * 1e9))
-        }
         bb.useBlockCheckpoint = cfg.useBlockCheckpoint
         precondition(!bb.loraA.isEmpty, "нет адаптеров — сначала LoRA.add(...)")
 
-        // Упорядоченные мастер-параметры (fp32): по таргетам [A, B].
-        let targets = bb.loraA.keys.sorted()
-        var params: [MLXArray] = []
-        var slot: [(target: String, isA: Bool)] = []
-        for t in targets {
-            params.append(bb.loraA[t]!.asType(.float32)); slot.append((t, true))
-            params.append(bb.loraB[t]!.asType(.float32)); slot.append((t, false))
-        }
-        eval(params)
-
-        // Инжект ps (fp32) → bb.lora* (bf16, каст внутри ⇒ grad течёт в fp32-мастер).
-        func inject(_ ps: [MLXArray]) {
-            for (i, s) in slot.enumerated() {
-                if s.isA { bb.loraA[s.target] = ps[i].asType(.bfloat16) }
-                else      { bb.loraB[s.target] = ps[i].asType(.bfloat16) }
-            }
-        }
-
-        func lossOf(_ ps: [MLXArray], _ x: MLXArray, _ y: MLXArray) -> [MLXArray] {
-            inject(ps)
-            let logits = bb(x)                                  // [B,T,V]
-            let B = logits.shape[0], T = logits.shape[1], V = logits.shape[2]
-            let ce = crossEntropy(logits: logits.reshaped([B * T, V]),
-                                  targets: y.reshaped([B * T]).asType(.int32),
-                                  reduction: .mean)
-            return [ce.asType(.float32)]
-        }
-        let vg = valueAndGrad({ (ps: [MLXArray]) in lossOf(ps, _xCur, _yCur) },
-                              argumentNumbers: Array(params.indices))
-
-        // ── ручной AdamW (decoupled WD) ──
-        var m = params.map { MLXArray.zeros($0.shape, dtype: .float32) }
-        var v = params.map { MLXArray.zeros($0.shape, dtype: .float32) }
-        var t = 0
-        var lastLoss: Float = .nan
-
-        func lrAt(_ step: Int) -> Float {
-            (cfg.warmupSteps > 0 && step < cfg.warmupSteps)
-                ? cfg.lr * Float(step + 1) / Float(cfg.warmupSteps) : cfg.lr
-        }
-
-        // global-norm grad clip; возвращает (clippedGrads, norm).
-        func clip(_ grads: [MLXArray]) -> ([MLXArray], MLXArray) {
-            var sq = MLXArray(Float(0))
-            for g in grads { sq = sq + (g * g).sum() }
-            let norm = sqrt(sq)
-            let s = minimum(MLXArray(Float(1)), MLXArray(cfg.gradClip) / (norm + 1e-6))
-            return (grads.map { $0 * s }, norm)
-        }
-
-        var step = 0
-        var firstChecked = false
-        while step < cfg.maxSteps {
-            if isCancelled() { break }
-            let lr = lrAt(step)
-
-            // grad-accumulation
-            var grads: [MLXArray]
-            var lossVal: MLXArray
-            do {
-                let batch = nextBatch()
-                if !firstChecked {
-                    precondition(batch.x.shape[1] % WKV7_CHUNK == 0,
-                        "T (\(batch.x.shape[1])) должна делиться на CHUNK \(WKV7_CHUNK)")
-                    firstChecked = true
+        // withoutActuallyEscaping, а не @escaping в сигнатуре: публичный API
+        // обязан остаться прежним (в этом весь смысл рефакторинга), а время
+        // жизни тренера заведомо ограничено этим вызовом.
+        var checked = false
+        let res = withoutActuallyEscaping(nextBatch) { escapingNext -> TrainingResult in
+            let source: () -> LoRABatch = {
+                let b = escapingNext()
+                if !checked {
+                    precondition(b.x.shape[1] % WKV7_CHUNK == 0,
+                        "T (\(b.x.shape[1])) должна делиться на CHUNK \(WKV7_CHUNK)")
+                    checked = true
                 }
-                _xCur = batch.x; _yCur = batch.y
-                let (vals, gs) = vg(params)
-                eval(vals + gs)
-                lossVal = vals[0]; grads = gs
+                return b
             }
-            for _ in 1 ..< cfg.gradAccum {
-                let batch = nextBatch()
-                _xCur = batch.x; _yCur = batch.y
-                let (vals, gs) = vg(params)
-                eval(vals + gs)
-                lossVal = lossVal + vals[0]
-                for i in grads.indices { grads[i] = grads[i] + gs[i] }
-                eval(grads)
-            }
-            if cfg.gradAccum > 1 {
-                let inv = 1.0 / Float(cfg.gradAccum)
-                grads = grads.map { $0 * inv }
-                lossVal = lossVal * inv
-            }
-
-            let (cg, norm) = clip(grads)
-
-            t += 1
-            let c1 = 1 - Float(pow(Double(cfg.beta1), Double(t)))
-            let c2 = 1 - Float(pow(Double(cfg.beta2), Double(t)))
-            for i in params.indices {
-                m[i] = cfg.beta1 * m[i] + (1 - cfg.beta1) * cg[i]
-                v[i] = cfg.beta2 * v[i] + (1 - cfg.beta2) * (cg[i] * cg[i])
-                let mhat = m[i] / c1, vhat = v[i] / c2
-                var upd = mhat / (sqrt(vhat) + cfg.adamEps)
-                if cfg.weightDecay > 0 { upd = upd + cfg.weightDecay * params[i] }   // decoupled
-                params[i] = params[i] - lr * upd
-            }
-            eval(params + m + v)
-
-            lastLoss = lossVal.item(Float.self)
-            step += 1
-            if cfg.logEvery > 0 && (step % cfg.logEvery == 0 || step == cfg.maxSteps) {
-                onStep(step, lastLoss, norm.item(Float.self), residentMemoryMB())
+            let trainer = Trainer<LoRABatch>(
+                trainable: LoRATrainableSet(bb),
+                objective: { languageModelLoss(bb, $0) },
+                nextBatch: source,
+                config: cfg.training)
+            return trainer.run(isCancelled: isCancelled) { s in
+                onStep(s.step, s.loss, s.gradNorm, s.peakMemoryMB)
             }
         }
-
-        // финальный инжект обученных весов (bf16) в backbone для инференса
-        inject(params); eval(Array(bb.loraA.values) + Array(bb.loraB.values))
-        return LoRATrainResult(finalLoss: lastLoss, steps: step)
+        return LoRATrainResult(finalLoss: res.finalLoss, steps: res.steps)
     }
 }
-
-// Текущий батч для замыкания valueAndGrad (без захвата inout).
-private var _xCur = MLXArray.zeros([1, 1])
-private var _yCur = MLXArray.zeros([1, 1])
