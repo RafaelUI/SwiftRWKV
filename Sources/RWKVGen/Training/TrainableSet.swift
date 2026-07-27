@@ -42,6 +42,72 @@ public extension TrainableSet {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+//  Композиция
+// ───────────────────────────────────────────────────────────────────────
+
+/// Несколько независимых множеств как одно: параметры склеиваются встык в
+/// порядке перечисления, inject/commit расходятся обратно по своим срезам.
+///
+/// Ради этого и введено: «база + голова» — не одна сущность, а две, и они
+/// живут в РАЗНЫХ местах (веса backbone или адаптеры внутри модели, голова —
+/// снаружи). Складывать их в одну реализацию через словарь `extra` можно
+/// ровно один раз, для одной пары; композиция же покрывает все четыре судьбы
+/// базы (full-FT, верхние N, LoRA, QLoRA, а также замороженную — тогда
+/// в композиции просто одна голова) без единой новой ветки.
+///
+/// Порядок частей значим: от него зависит соответствие имён, моментов Adam и
+/// чекпоинтов. Он фиксируется массивом, а не сортировкой имён — сортировка
+/// перемешала бы «голову» и «базу» между собой при переименовании.
+public final class CompositeTrainableSet: TrainableSet {
+
+    private let parts: [TrainableSet]
+    private var counts: [Int] = []
+
+    public init(_ parts: [TrainableSet]) {
+        precondition(!parts.isEmpty, "композиция без частей не имеет смысла")
+        self.parts = parts
+    }
+
+    public convenience init(_ parts: TrainableSet...) {
+        self.init(parts)
+    }
+
+    public var parameterNames: [String] { parts.flatMap { $0.parameterNames } }
+
+    public func initialParameters() -> [MLXArray] {
+        var out: [MLXArray] = []
+        counts = []
+        for p in parts {
+            let ps = p.initialParameters()
+            counts.append(ps.count)
+            out.append(contentsOf: ps)
+        }
+        return out
+    }
+
+    /// Границы срезов. Считаются из `parameterNames`, а НЕ кэшируются из
+    /// initialParameters: после `loadCheckpoint` тренер вызывает inject, ни
+    /// разу не позвав initialParameters, и кэш был бы пуст.
+    private var slices: [Int] {
+        counts.isEmpty ? parts.map { $0.parameterNames.count } : counts
+    }
+
+    public func inject(_ ps: [MLXArray]) { distribute(ps) { $0.inject($1) } }
+    public func commit(_ ps: [MLXArray]) { distribute(ps) { $0.commit($1) } }
+
+    private func distribute(_ ps: [MLXArray], _ body: (TrainableSet, [MLXArray]) -> Void) {
+        let sizes = slices
+        precondition(ps.count == sizes.reduce(0, +),
+                     "композиции передано \(ps.count) параметров, ожидалось \(sizes.reduce(0, +))")
+        var offset = 0
+        for (part, n) in zip(parts, sizes) {
+            body(part, Array(ps[offset ..< offset + n]))
+            offset += n
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
 //  Адаптеры LoRA / QLoRA
 // ───────────────────────────────────────────────────────────────────────
 

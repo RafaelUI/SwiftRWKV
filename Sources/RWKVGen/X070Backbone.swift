@@ -122,6 +122,31 @@ public final class X070Backbone {
                                    eps: 64e-5, affine: false, pytorchCompatible: true)
     }
 
+    // ── Публичная интроспекция для сборки обучаемых множеств ─────────
+    //
+    // Словарь весов остаётся internal (наружу его отдавать незачем и опасно),
+    // но соседним модулям нужно уметь спросить «какие веса тут есть» —
+    // иначе они вынуждены угадывать имена строками.
+
+    /// Все имена весов модели.
+    public var weightKeys: [String] { Array(w.keys).sorted() }
+
+    /// Веса ТЕЛА модели: всё, кроме таблицы эмбеддингов и LM-головы.
+    ///
+    /// Это множество имеет смысл там, где логиты не используются вовсе
+    /// (эмбеддинги, реранкер): `head.weight` при словаре 65536 — примерно
+    /// треть параметров 0.1B-модели, и держать под неё моменты Adam ради
+    /// тензора, который не участвует в лоссе, — чистая потеря памяти.
+    public var bodyWeightKeys: [String] {
+        weightKeys.filter { $0 != "emb.weight" && $0 != "head.weight" }
+    }
+
+    /// Навешены ли LoRA-адаптеры.
+    public var hasLoRAAdapters: Bool { !loraA.isEmpty }
+
+    /// Имена таргетов с адаптерами.
+    public var loraTargets: [String] { loraA.keys.sorted() }
+
     // Чтение веса с учётом wOverride (обучаемая подмена) → frozen.
     private func wv(_ key: String) -> MLXArray { wOverride?[key] ?? w[key]! }
     private func g(_ key: String) -> MLXArray { wv(key) }

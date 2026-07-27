@@ -21,12 +21,27 @@ import MLX
 //  приведённая копия (см. TrainableSet.inject).
 // ───────────────────────────────────────────────────────────────────────
 
+/// Чем считается пара (лосс, градиенты) на одном микробатче.
+///
+/// Существует, потому что не всякая задача укладывается в один
+/// `valueAndGrad`: GradCache считает лосс на ПОЛНОМ батче векторов, а
+/// градиенты — тремя фазами по чанкам, и снаружи это по-прежнему просто
+/// «лосс и градиенты в порядке параметров».
+///
+/// Контракт: реализация ОБЯЗАНА вызвать `TrainableSet.inject` внутри своего
+/// grad-замыкания. Подстановка снаружи разорвала бы цепь к fp32-мастеру —
+/// градиенты пришли бы нулевыми, и притом молча.
+public typealias GradientProvider<Batch> =
+    (_ parameters: [MLXArray], _ batch: Batch) -> (loss: MLXArray, gradients: [MLXArray])
+
 public final class Trainer<Batch> {
 
     private let trainable: TrainableSet
     private let objective: (Batch) -> MLXArray
     private let nextBatch: () -> Batch
     private let cfg: TrainingConfig
+    /// nil ⇒ встроенный valueAndGrad поверх `objective` (обычный путь).
+    private let gradient: GradientProvider<Batch>?
 
     /// Текущий микробатч для grad-замыкания.
     ///
@@ -42,14 +57,21 @@ public final class Trainer<Batch> {
     private var t = 0
     private var startStep = 0
 
+    /// - gradient: подмена способа получить градиент (см. GradientProvider).
+    ///   По умолчанию nil — тогда `objective` дифференцируется обычным
+    ///   `valueAndGrad`, и путь остаётся ровно тем, что был до появления
+    ///   этого параметра (проверяется характеризационными тестами).
+    ///   Когда провайдер задан, `objective` не вызывается вообще.
     public init(trainable: TrainableSet,
                 objective: @escaping (Batch) -> MLXArray,
                 nextBatch: @escaping () -> Batch,
-                config: TrainingConfig) {
+                config: TrainingConfig,
+                gradient: GradientProvider<Batch>? = nil) {
         self.trainable = trainable
         self.objective = objective
         self.nextBatch = nextBatch
         self.cfg = config
+        self.gradient = gradient
     }
 
     // ── Цикл ─────────────────────────────────────────────────────────
@@ -68,10 +90,20 @@ public final class Trainer<Batch> {
             v = params.map { MLXArray.zeros($0.shape, dtype: .float32) }
         }
 
-        let vg = valueAndGrad({ [unowned self] (ps: [MLXArray]) -> [MLXArray] in
+        let builtIn = valueAndGrad({ [unowned self] (ps: [MLXArray]) -> [MLXArray] in
             self.trainable.inject(ps)
             return [self.objective(self.current!).asType(.float32)]
         }, argumentNumbers: Array(params.indices))
+
+        // Единая точка вызова: дальше цикл не знает, откуда взялся градиент.
+        // Форма ([лосс], градиенты) сохранена ради того, чтобы порядок
+        // операций ниже (eval → накопление → усреднение → клип → AdamW)
+        // остался буква в букву прежним.
+        let vg: ([MLXArray]) -> ([MLXArray], [MLXArray]) = { [unowned self] ps in
+            guard let provider = self.gradient else { return builtIn(ps) }
+            let r = provider(ps, self.current!)
+            return ([r.loss.asType(.float32)], r.gradients)
+        }
 
         var lastLoss: Float = .nan
         var step = startStep

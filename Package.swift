@@ -64,11 +64,15 @@ let package = Package(
             ]
         ),
         // Текстовые векторы: пулинг, обучаемая голова, контрастные лоссы,
-        // GradCache. Стоит поверх RWKVGen, потому что нужен body() бэкбона.
+        // GradCache, дообучение и метрики. Стоит поверх RWKVGen, потому что
+        // нужен body() бэкбона. RWKVKernel — ради одной константы WKV7_CHUNK:
+        // батчи для обучения обязаны быть кратны ей по длине, и знать это
+        // число здесь честнее, чем продублировать его литералом.
         .target(
             name: "RWKVEmbedding",
             dependencies: [
                 "RWKVGen",
+                "RWKVKernel",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
