@@ -39,10 +39,23 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
             ]
         ),
+        // Бэкенд квантованной базы .rwkvq (gw_mode="sb6"): формат + fused
+        // Metal-деквантизация. Намеренно НЕ знает про X070Backbone — это
+        // нижний слой, который RWKVGen подключает сверху. Отдельный таргет
+        // потому, что владеет форматом файла и своим ядром: сборке, которая
+        // не трогает квантованные веса, всё это не нужно.
+        .target(
+            name: "RWKVQuant",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+            ]
+        ),
         .target(
             name: "RWKVGen",
             dependencies: [
                 "RWKVKernel",
+                "RWKVQuant",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
@@ -50,9 +63,20 @@ let package = Package(
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
             ]
         ),
+        // Текстовые векторы: пулинг, обучаемая голова, контрастные лоссы,
+        // GradCache. Стоит поверх RWKVGen, потому что нужен body() бэкбона.
+        .target(
+            name: "RWKVEmbedding",
+            dependencies: [
+                "RWKVGen",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ]
+        ),
         .testTarget(
             name: "RWKVGenTests",
-            dependencies: ["RWKVGen", "RWKVKernel"]
+            dependencies: ["RWKVGen", "RWKVKernel", "RWKVQuant", "RWKVEmbedding"]
         ),
     ]
 )

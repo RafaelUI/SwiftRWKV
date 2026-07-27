@@ -12,3 +12,7 @@ Tests/RWKVGenTests/Resources/world_0.1b_x070.safetensors
 
 # Тесты и тест-фикстуры держим локально.
 /Tests/
+
+# Фикстуры кросс-языкового паритета (см. Scripts/dump_reference.py) —
+# десятки мегабайт, генерируются локально.
+.testdata/

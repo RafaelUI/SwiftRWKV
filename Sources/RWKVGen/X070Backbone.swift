@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXNN
 import RWKVKernel
+import RWKVQuant      // база .rwkvq (sb6)
 
 // ───────────────────────────────────────────────────────────────────────
 //  RWKV-7 "Goose" x070 — точный порт rwkv_metal/model/rwkv7_x070.py для
@@ -91,6 +92,19 @@ public final class X070Backbone {
     /// Квантованная замороженная база по имени веса (напр. "...r_proj.weight", "head.weight", "emb.weight").
     var quant: [String: QuantBase] = [:]
 
+    /// Второй бэкенд квантованной базы: родной формат .rwkvq (sb6).
+    ///
+    /// Отличие от `quant` (стоковый mlx.nn.quantize) — не в интерфейсе, а в
+    /// происхождении чисел: .rwkvq приходит из откалиброванного пайплайна
+    /// rwkv-quant с известной деградацией ppl, тогда как стоковый квант
+    /// пересчитывает scale/bias по min/max блока и этой калибровке не
+    /// соответствует. Поэтому это отдельный путь, а не «другие параметры» того же.
+    ///
+    /// Ключи — x070-имена (blocks.N.tmix.k_proj.weight); в сайдкар они
+    /// переводятся таблицей RwkvqNaming.
+    var rwkvqSidecar: RwkvqSidecar? = nil
+    var rwkvqKeys: [String: String] = [:]     // x070-имя → world-имя в сайдкаре
+
     // GroupNorm с pytorch_compatible-семантикой (eps=64e-5). Применяется
     // per-token к [N, D] (каждый токен нормализуется независимо по головам).
     private let groupNorm: GroupNorm
@@ -112,12 +126,26 @@ public final class X070Backbone {
     private func wv(_ key: String) -> MLXArray { wOverride?[key] ?? w[key]! }
     private func g(_ key: String) -> MLXArray { wv(key) }
 
+    // Восстановленный вес из .rwkvq, если он оттуда. ТРАНЗИЕНТНЫЙ: не
+    // кэшируется намеренно — база обязана жить в памяти сжатой, иначе смысл
+    // квантованной базы теряется (кэш плотных весов превращает QLoRA в LoRA
+    // с лишними шагами).
+    private func rwkvqWeight(_ wKey: String) -> MLXArray? {
+        guard let worldKey = rwkvqKeys[wKey], let sc = rwkvqSidecar else { return nil }
+        return try? sc.dequantize(worldKey)
+    }
+
     // База проекции: если есть quant — x·Wᵀ с деквантизацией на лету
     // (веса [out,in] ⇒ transpose: true), иначе обычный linear.
     private func baseProj(_ x: MLXArray, _ wKey: String) -> MLXArray {
         if let q = quant[wKey] {
             return quantizedMM(x, q.wq, scales: q.scales, biases: q.biases,
                                transpose: true, groupSize: q.groupSize, bits: q.bits)
+        }
+        if let dense = rwkvqWeight(wKey) {
+            // Деквант в fp32; приводим к типу вычислений, чтобы matmul не
+            // тянул всю цепочку в fp32 и не ломал bf16-профиль памяти.
+            return matmul(x, dense.asType(x.dtype).transposed())
         }
         return matmul(x, wv(wKey).transposed())
     }
@@ -139,6 +167,14 @@ public final class X070Backbone {
             return dequantized(rows, scales: sc, biases: bi,
                                groupSize: q.groupSize, bits: q.bits,
                                dtype: w["emb.weight"]?.dtype ?? .bfloat16)
+        }
+        if let dense = rwkvqWeight("emb.weight") {
+            // ВНИМАНИЕ: sb6-ядро разворачивает таблицу целиком, а для словаря
+            // 65536×768 это ~200 МБ транзиента на КАЖДЫЙ проход. Строчной
+            // выборки формат не поддерживает: коды упакованы по блокам вдоль
+            // входной оси, и достать одну строку дешевле, чем блок, нельзя.
+            // Поэтому emb в сайдкар обычно и не отдают — см. attachRwkvq.
+            return dense.asType(w["ln0.weight"]?.dtype ?? .bfloat16).take(ids, axis: 0)
         }
         return wv("emb.weight").take(ids, axis: 0)
     }
