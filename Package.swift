@@ -78,9 +78,25 @@ let package = Package(
                 .product(name: "MLXRandom", package: "mlx-swift"),
             ]
         ),
+        // Cross-encoder реранкер: голова из RWKV-блоков поверх состояния
+        // базы, кэш состояний, listwise-обучение. Отдельный таргет от
+        // RWKVEmbedding, потому что это ВТОРАЯ стадия поиска и живёт она без
+        // первой: реранкер не считает и не сравнивает векторы вовсе, он
+        // читает состояние. Общее у них — только бэкбон.
+        .target(
+            name: "RWKVRerank",
+            dependencies: [
+                "RWKVGen",
+                "RWKVKernel",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ]
+        ),
         .testTarget(
             name: "RWKVGenTests",
-            dependencies: ["RWKVGen", "RWKVKernel", "RWKVQuant", "RWKVEmbedding"]
+            dependencies: ["RWKVGen", "RWKVKernel", "RWKVQuant",
+                           "RWKVEmbedding", "RWKVRerank"]
         ),
     ]
 )

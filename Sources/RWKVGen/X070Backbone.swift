@@ -37,12 +37,15 @@ public struct X070Config: Sendable {
 
 // ─────────────────── Утилиты ───────────────────
 
-private func l2norm(_ x: MLXArray) -> MLXArray {
+// internal, а не private: ровно эти же три помощника нужны блоку, вынесенному
+// в RWKVBlock.swift. Дублировать их там значило бы завести вторую копию
+// арифметики, которая обязана совпадать побитово.
+func l2norm(_ x: MLXArray) -> MLXArray {
     x / sqrt((x * x).sum(axis: -1, keepDims: true) + 1e-12)
 }
 
-private func layerNorm(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
-                       eps: Float = 1e-5) -> MLXArray {
+func layerNorm(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
+               eps: Float = 1e-5) -> MLXArray {
     let mean = x.mean(axis: -1, keepDims: true)
     let varc = (x - mean).square().mean(axis: -1, keepDims: true)
     let normed = (x - mean) / sqrt(varc + eps)
@@ -50,10 +53,10 @@ private func layerNorm(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
 }
 
 // Linear без bias: x[...,in] @ Wᵀ, W хранится [out, in].
-private func linear(_ x: MLXArray, _ w: MLXArray) -> MLXArray {
+func linear(_ x: MLXArray, _ w: MLXArray) -> MLXArray {
     matmul(x, w.transposed())
 }
-private func linear(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray) -> MLXArray {
+func linear(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray) -> MLXArray {
     matmul(x, w.transposed()) + b
 }
 
@@ -211,10 +214,7 @@ public final class X070Backbone {
     // прежнее поведение). Без этого продолжение расходится со сплошным проходом
     // ровно на первом токене каждого слоя.
     private func tokenShift(_ x: MLXArray, _ prev0: MLXArray? = nil) -> MLXArray {
-        let B = x.shape[0], T = x.shape[1], D = x.shape[2]
-        let head = prev0?.asType(x.dtype) ?? MLXArray.zeros([B, 1, D], dtype: x.dtype)
-        let shifted = concatenated([head, x[0..., 0 ..< (T - 1)]], axis: 1)
-        return shifted - x
+        rwkvTokenShift(x, prev0)
     }
 
     // GroupNorm ln_x (per-token). Канон RWKV: ln_x(x.view(B*T, C)) — каждый
@@ -231,153 +231,67 @@ public final class X070Backbone {
         return normed * weight + bias
     }
 
-    // time-mix блока layer. Возвращает (выход, обновлённый v_first).
+    // ─────────── Блок: арифметика вынесена в RWKVBlock.swift ───────────
     //
-    // Состояние и паддинг (оба опциональны, nil ⇒ прежнее поведение):
-    //   shiftPrev — вход на позиции −1 для token-shift, [B,1,D];
-    //   hIn       — начальная матрица WKV [B,H,S,S];
-    //   mask      — [B,T], 1 у реального токена, 0 у right-паддинга;
-    //   wantState — вернуть конечную матрицу WKV третьим элементом.
+    // Тело tmix/cmix здесь больше не живёт. Оно ОДНО на весь пакет
+    // (rwkvTmixForward / rwkvCmixForward), а бэкбон приносит только контекст:
+    // откуда брать веса (плоский словарь с префиксом слоя, с учётом
+    // wOverride), как считать проекции (плотно / из .rwkvq / с LoRA) и каким
+    // ядром считать WKV (trainLayers).
+    //
+    // Так голова реранкера получает ТЕ ЖЕ блоки, что и база, не копируя ни
+    // строки арифметики. Что поведение бэкбона при этом не изменилось —
+    // проверяется характеризационными тестами, а не заявляется.
+
+    /// Контекст блока слоя `layer`. Кэшируется: объект создаётся один раз на
+    /// слой, а не на каждый проход.
+    private var blockContexts: [Int: BackboneBlockContext] = [:]
+    private func context(_ layer: Int) -> BackboneBlockContext {
+        if let c = blockContexts[layer] { return c }
+        let c = BackboneBlockContext(self, layer)
+        blockContexts[layer] = c
+        return c
+    }
+
+    // Доступ для контекста (он живёт вне класса, но внутри модуля).
+    func weightForBlock(_ key: String) -> MLXArray { wv(key) }
+    func projectForBlock(_ x: MLXArray, _ key: String, lora: String?) -> MLXArray {
+        proj(x, key, lora: lora)
+    }
+    func groupNormRaw(_ x: MLXArray) -> MLXArray { groupNorm(x) }
+
+    /// Значение веса по имени, БЕЗ учёта wOverride: нужно тем, кто копирует
+    /// веса наружу (инициализация блоков головы), — там интересен frozen-вес,
+    /// а не временная обучаемая подмена.
+    public func weight(_ key: String) -> MLXArray { w[key]! }
+    public func hasWeight(_ key: String) -> Bool { w[key] != nil }
+
     private func tmix(_ x: MLXArray, _ vFirst: MLXArray?, _ layer: Int,
                       shiftPrev: MLXArray? = nil, hIn: MLXArray? = nil,
                       mask: MLXArray? = nil, wantState: Bool = false)
         -> (MLXArray, MLXArray, MLXArray?) {
-        let p = "blocks.\(layer).tmix."
-        let B = x.shape[0], T = x.shape[1], D = cfg.nEmbd
-        let H = cfg.nHead, S = cfg.headSize
-
-        let xx = tokenShift(x, shiftPrev)
-        let xr = x + xx * g(p + "x_r")
-        let xw = x + xx * g(p + "x_w")
-        let xk = x + xx * g(p + "x_k")
-        let xv = x + xx * g(p + "x_v")
-        let xa = x + xx * g(p + "x_a")
-        let xg = x + xx * g(p + "x_g")
-
-        var r = proj(xr, p + "r_proj.weight", lora: p + "r_proj").reshaped([B, T, H, S])
-        var k = proj(xk, p + "k_proj.weight", lora: p + "k_proj").reshaped([B, T, H, S])
-        var v = proj(xv, p + "v_proj.weight", lora: p + "v_proj").reshaped([B, T, H, S])
-
-        // gate: B(sigmoid(A(xg))) — sigmoid ВНУТРИ, линейно наружу, без bias.
-        let gate = linear(sigmoid(linear(xg, g(p + "g_lora_A.weight"))),
-                          g(p + "g_lora_B.weight"))
-
-        // value-residual (слои > 0): v0 = bias v_lora_B
-        var vFirstOut: MLXArray
-        if layer == 0 {
-            vFirstOut = v
-        } else {
-            let vv = sigmoid(linear(linear(xv, g(p + "v_lora_A.weight")),
-                                    g(p + "v_lora_B.weight"), g(p + "v_lora_B.bias")))
-                        .reshaped([B, T, H, S])
-            v = v + (vFirst! - v) * vv
-            vFirstOut = vFirst!
-        }
-
-        // iclr a: sigmoid(a0 + B(A(xa))) — БЕЗ tanh.
-        let a = sigmoid(linear(linear(xa, g(p + "a_lora_A.weight")),
-                               g(p + "a_lora_B.weight"), g(p + "a_lora_B.bias")))
-                    .reshaped([B, T, H, S])
-
-        // decay w: exp(-0.606531 * sigmoid(w0 + B(tanh(A(xw))))), reductions в fp32.
-        var ww = linear(tanh(linear(xw, g(p + "w_lora_A.weight"))),
-                        g(p + "w_lora_B.weight"), g(p + "w_lora_B.bias"))
-        ww = exp(-0.606531 * sigmoid(ww.asType(.float32))).asType(x.dtype)
-        ww = ww.reshaped([B, T, H, S])
-
-        // kk = l2norm(k * k_k);  k = k*(1+(a-1)*k_a)
-        let kk = l2norm(k * g(p + "k_k"))
-        k = k * (1.0 + (a - 1.0) * g(p + "k_a"))
-
-        // WKV-7: a_kernel = -kk, b_kernel = kk * a
-        var kWkv = k
-        var bWkv = kk * a
-
-        // Right-padding: делаем пад-позиции НЕЙТРАЛЬНЫМИ для рекуррентности.
-        //   w←1, k←0, b←0  ⇒  h' = 1·h + v·0ᵀ + sa·0ᵀ = h
-        // Состояние строки замирает на её последнем реальном токене и не
-        // зависит ни от числа пад-токенов, ни от соседей по батчу.
-        //
-        // a (=-kk) и v НЕ маскируются намеренно: k=0 уже убивает член v·kᵀ,
-        // b=0 — член sa·bᵀ, поэтому их значения на паддинге ни на что не
-        // влияют. Лишняя маскировка была бы просто лишней арифметикой.
-        //
-        // Выход на пад-позициях остаётся мусорным — это нормально: модель
-        // каузальна, мусор может попасть только на пад-позиции следующих
-        // слоёв и до реальных токенов не доходит.
-        if let mask {
-            let m = mask.reshaped([B, T, 1, 1]).asType(ww.dtype)
-            ww = ww * m + (1.0 - m)
-            kWkv = kWkv * m
-            bWkv = bWkv * m
-        }
-
-        var hOut: MLXArray? = nil
-        var out: MLXArray
-        if wantState || hIn != nil {
-            let (o, h) = trainLayers.contains(layer)
-                ? wkv7TrainWithState(r, ww, kWkv, v, -kk, bWkv, hIn)
-                : wkv7ForwardWithState(r, ww, kWkv, v, -kk, bWkv, hIn)
-            out = o
-            hOut = h
-        } else {
-            out = trainLayers.contains(layer)
-                ? wkv7Train(r, ww, kWkv, v, -kk, bWkv)
-                : wkv7Forward(r, ww, kWkv, v, -kk, bWkv)    // [B,T,H,S]
-        }
-
-        // Порядок официала: ln_x (GroupNorm) ДО bonus.
-        out = lnX(out.reshaped([B, T, D]), g(p + "ln_x.weight"), g(p + "ln_x.bias"))
-              .reshaped([B, T, H, S])
-        // bonus считается по НЕмаскированному k — так же, как в Python: маска
-        // существует только ради рекуррентности, а bonus живёт на позиции и на
-        // состояние не влияет.
-        let bonus = (r * k * g(p + "r_k")).sum(axis: -1, keepDims: true) * v
-        out = (out + bonus).reshaped([B, T, D])
-
-        let res = proj(out * gate, p + "o_proj.weight", lora: p + "o_proj")
-        return (res, vFirstOut, hOut)
+        rwkvTmixForward(x, vFirst, context(layer), shiftPrev: shiftPrev,
+                        hIn: hIn, mask: mask, wantState: wantState)
     }
 
-    // channel-mix: value(relu(key(xk))^2). token-shift свой, нулевой паддинг.
     private func cmix(_ x: MLXArray, _ layer: Int, shiftPrev: MLXArray? = nil) -> MLXArray {
-        let p = "blocks.\(layer).cmix."
-        let xx = tokenShift(x, shiftPrev)
-        let xk = x + xx * g(p + "x_k")
-        let h = relu(proj(xk, p + "key.weight", lora: p + "key"))
-        return proj(h * h, p + "value.weight", lora: p + "value")
+        rwkvCmixForward(x, context(layer), shiftPrev: shiftPrev)
     }
 
     /// Один блок: ln1+tmix+resid+ln2+cmix+resid. (x0, vFirst?) -> (x', vFirstOut).
     func blockForward(_ x0: MLXArray, _ vFirst: MLXArray?, _ layer: Int) -> (MLXArray, MLXArray) {
-        let (h, vf, _) = tmix(layerNorm(x0, g("blocks.\(layer).ln1.weight"),
-                                        g("blocks.\(layer).ln1.bias")), vFirst, layer)
-        var x = x0 + h
-        x = x + cmix(layerNorm(x, g("blocks.\(layer).ln2.weight"),
-                               g("blocks.\(layer).ln2.bias")), layer)
-        return (x, vf)
+        rwkvBlockForward(x0, vFirst, context(layer))
     }
 
     /// Тот же блок, но с граничным состоянием. Возвращает
     /// (x', vFirstOut, hOut, tmixShiftOut, cmixShiftOut).
-    ///
-    /// Сдвиги снимаются с позиции endIdx (последний РЕАЛЬНЫЙ токен строки), а
-    /// не с конца паддинга — иначе продолжение стартовало бы со сдвига,
-    /// снятого с пад-позиции.
     func blockForwardWithState(
         _ x0: MLXArray, _ vFirst: MLXArray?, _ layer: Int,
         hIn: MLXArray?, mask: MLXArray?, tmixPrev: MLXArray?,
         cmixPrev: MLXArray?, endIdx: MLXArray?
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
-        let x1 = layerNorm(x0, g("blocks.\(layer).ln1.weight"),
-                           g("blocks.\(layer).ln1.bias"))
-        let (h, vf, hOut) = tmix(x1, vFirst, layer, shiftPrev: tmixPrev,
-                                 hIn: hIn, mask: mask, wantState: true)
-        var x = x0 + h
-        let x2 = layerNorm(x, g("blocks.\(layer).ln2.weight"),
-                           g("blocks.\(layer).ln2.bias"))
-        x = x + cmix(x2, layer, shiftPrev: cmixPrev)
-        return (x, vf, hOut!, gatherLast(x1, endIdx), gatherLast(x2, endIdx))
+        rwkvBlockForwardWithState(x0, vFirst, context(layer), hIn: hIn, mask: mask,
+                                  tmixPrev: tmixPrev, cmixPrev: cmixPrev, endIdx: endIdx)
     }
 
     /// Отсортированные ключи LoRA-таргетов слоя (детерминированный порядок упаковки).
