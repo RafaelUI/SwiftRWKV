@@ -44,6 +44,7 @@ public enum StateCacheError: Error, CustomStringConvertible {
     case fp16Overflow(Float)
     case fileNotFound(String)
     case corrupt(String)
+    case layersMissing(want: [Int], have: [Int])
 
     public var description: String {
         switch self {
@@ -55,6 +56,13 @@ public enum StateCacheError: Error, CustomStringConvertible {
                 """
         case .fileNotFound(let p): return "нет файла кэша: \(p)"
         case .corrupt(let s): return "кэш повреждён: \(s)"
+        case .layersMissing(let want, let have):
+            return """
+                голова читает слои \(want), в кэше лежат \(have). \
+                Состояние одного слоя от состояния другого ничем не \
+                отличается по форме, поэтому подстановка прошла бы молча \
+                и голова обучилась бы на чужом слое.
+                """
         }
     }
 }
@@ -63,6 +71,15 @@ public enum StateCacheError: Error, CustomStringConvertible {
 struct StateCacheIndex: Codable {
     var shape: [Int]                 // [nPairs, nSrc, H, S, S]
     var dtype: StateCacheDType
+    /// Какие слои базы лежат в слотах, по возрастанию: слот i — слой
+    /// `sources[i]`. Опционально ТОЛЬКО ради кэшей, собранных до появления
+    /// этого поля; у них состав слоёв неизвестен и судить о совместимости
+    /// можно лишь по их числу — см. `slots(for:)`.
+    ///
+    /// Без этого поля кэш, собранный для слоя 5, и голова над слоем 11
+    /// одинаково дают nSrc = 1, проходят проверку и дают правдоподобные,
+    /// но чужие числа.
+    var sources: [Int]?
     var pairIndex: [[Int]]           // [nSamples][nCand] → строка в states
     var labels: [Int]                // [nSamples]
     var hardNegs: [[Int]]            // [nSamples] позиции майненных негативов
@@ -88,6 +105,10 @@ public final class StateCache {
     public var hardNegs: [[Int]] { index.hardNegs }
     public var pairIndex: [[Int]] { index.pairIndex }
     public var contract: [String: String] { index.contract }
+    /// Слои базы по слотам. nil — кэш собран до появления поля.
+    public var sources: [Int]? { index.sources }
+    /// Число слотов состояния в строке.
+    public var nSources: Int { index.shape[1] }
 
     /// Байт на одну пару.
     public var rowBytes: Int {
@@ -102,39 +123,69 @@ public final class StateCache {
 
     // ── Чтение ──
 
-    /// Строки кэша → MLXArray `[rows.count, nSrc, H, S, S]`.
+    /// Байт на один слот состояния (один слой одной пары).
+    var slotBytes: Int {
+        index.shape.dropFirst(2).reduce(1, *) * index.dtype.itemSize
+    }
+
+    /// Строки кэша → MLXArray `[rows.count, slots.count, H, S, S]`.
     ///
     /// Единственное место, где данные попадают в MLX, и попадают ровно в
     /// размере батча. Копирование здесь неизбежно и желательно: строки
     /// разбросаны по файлу, а MLX нужен непрерывный буфер.
-    public func gather(_ rows: [Int]) -> MLXArray {
+    ///
+    /// `slots` — какие слоты состояния взять из строки; nil ⇒ вся строка.
+    /// Именно здесь окупается кэш надмножества: из строки на четыре слоя
+    /// голове, читающей один, копируется четверть байтов, а не всё с
+    /// последующим срезом в MLX.
+    public func gather(_ rows: [Int], slots: [Int]? = nil) -> MLXArray {
         let rb = rowBytes
-        var buf = Data(count: rows.count * rb)
+        let sb = slotBytes
+        // Непрерывный случай (весь ряд подряд) — одна memcpy на строку
+        // вместо nSrc. Не оптимизация ради оптимизации: это ровно путь,
+        // которым кэш читался до появления срезов, и он обязан остаться
+        // побитово тем же.
+        let whole = slots == nil || slots! == Array(0 ..< nSources)
+        let take = slots ?? Array(0 ..< nSources)
+        for sl in take {
+            precondition(sl >= 0 && sl < nSources,
+                         "слот \(sl) вне кэша из \(nSources) слоёв")
+        }
+        let outRow = whole ? rb : take.count * sb
+        var buf = Data(count: rows.count * outRow)
         buf.withUnsafeMutableBytes { dst in
             storage.withUnsafeBytes { src in
                 for (i, r) in rows.enumerated() {
                     precondition(r >= 0 && r < nPairs,
                                  "строка \(r) вне кэша из \(nPairs) пар")
-                    let from = src.baseAddress!.advanced(by: r * rb)
-                    let to = dst.baseAddress!.advanced(by: i * rb)
-                    memcpy(to, from, rb)
+                    let to = dst.baseAddress!.advanced(by: i * outRow)
+                    if whole {
+                        memcpy(to, src.baseAddress!.advanced(by: r * rb), rb)
+                    } else {
+                        for (j, sl) in take.enumerated() {
+                            memcpy(to.advanced(by: j * sb),
+                                   src.baseAddress!.advanced(by: r * rb + sl * sb),
+                                   sb)
+                        }
+                    }
                 }
             }
         }
-        let outShape = [rows.count] + Array(index.shape.dropFirst())
+        let outShape = [rows.count, take.count] + Array(index.shape.dropFirst(2))
         return dtype == .float16
             ? MLXArray(buf, outShape, type: Float16.self)
             : MLXArray(buf, outShape, type: Float.self)
     }
 
-    /// Батч примеров → (состояния `[b·nCand, nSrc, H, S, S]`, метки `[b]`).
+    /// Батч примеров → (состояния `[b·nCand, slots, H, S, S]`, метки `[b]`).
     ///
     /// Кандидаты уложены подряд по примерам: голова считает их одним
     /// проходом, а лосс потом смотрит на `[b, nCand]`.
-    public func batch(_ samples: [Int]) -> (states: MLXArray, labels: MLXArray) {
+    public func batch(_ samples: [Int], slots: [Int]? = nil)
+        -> (states: MLXArray, labels: MLXArray) {
         let rows = samples.flatMap { index.pairIndex[$0] }
         let lbl = samples.map { Int32(index.labels[$0]) }
-        return (gather(rows), MLXArray(lbl))
+        return (gather(rows, slots: slots), MLXArray(lbl))
     }
 
     // ── Диск ──
@@ -164,11 +215,147 @@ public final class StateCache {
         return StateCache(storage: storage, index: index)
     }
 
+    // ── Слияние ──
+
+    /// Дособрать недостающие слои: два кэша по ОДНИМ парам → один кэш с
+    /// объединением слоёв.
+    ///
+    /// Смысл в том, чтобы не гонять базу заново. Кодирование стоит минуты и
+    /// упирается в GPU; слияние — это перекладывание байтов, и на тех же
+    /// данных оно на порядок дешевле. Понадобился слой, которого в готовом
+    /// кэше нет, — кодируется ТОЛЬКО он, и сливается.
+    ///
+    /// Что проверяется и почему именно это:
+    ///
+    /// - **пары те же** (`pairIndex`, `labels`, `hardNegs`, число строк).
+    ///   Иначе строка 17 одного кэша и строка 17 другого — разные пары, а
+    ///   форма сойдётся;
+    /// - **контракты не противоречат друг другу**. Кэш, собранный с другой
+    ///   обрезкой, содержит состояния от другого текста;
+    /// - **совпадающие слои совпадают ЧИСЛЕННО**, на выборке строк. Это
+    ///   единственная проверка, ловящая слияние кэшей от РАЗНЫХ БАЗ: модель
+    ///   в контракте не записана, а состояния двух моделей неотличимы ни по
+    ///   форме, ни по контракту. Если общих слоёв нет, проверить нечем — и
+    ///   об этом сказано вслух, а не замолчано.
+    public func merged(with other: StateCache, to base: URL? = nil,
+                       rowBatch: Int = 64, tolerance: Float = 1e-3)
+        throws -> StateCache {
+
+        guard let mine = index.sources, let theirs = other.index.sources else {
+            throw StateCacheError.shapeMismatch(
+                "слить можно только кэши с известным составом слоёв; "
+                + "пересобери тот, где его нет")
+        }
+        guard nPairs == other.nPairs, index.pairIndex == other.index.pairIndex,
+              index.labels == other.index.labels,
+              index.hardNegs == other.index.hardNegs else {
+            throw StateCacheError.shapeMismatch(
+                "кэши описывают разные пары — сливать нечего")
+        }
+        guard dtype == other.dtype else {
+            throw StateCacheError.shapeMismatch(
+                "разный тип: \(dtype.rawValue) и \(other.dtype.rawValue)")
+        }
+        guard Array(shape.dropFirst(2)) == Array(other.shape.dropFirst(2)) else {
+            throw StateCacheError.shapeMismatch(
+                "разная форма состояния: \(shape) и \(other.shape)")
+        }
+        for (k, v) in index.contract {
+            if let w = other.index.contract[k], w != v {
+                throw StateCacheError.shapeMismatch(
+                    "\(k): один кэш собран с '\(v)', другой с '\(w)'")
+            }
+        }
+
+        let union = Array(Set(mine).union(theirs)).sorted()
+        // Откуда брать каждый слой. При пересечении берём из СВОЕГО — но
+        // только после того, как убедились, что чужой даёт то же самое.
+        let overlap = Set(mine).intersection(theirs).sorted()
+        if !overlap.isEmpty {
+            let probe = Array(stride(from: 0, to: nPairs,
+                                     by: Swift.max(1, nPairs / 8)).prefix(8))
+            let a = gather(probe, slots: overlap.map { mine.firstIndex(of: $0)! })
+            let b = other.gather(probe,
+                                 slots: overlap.map { theirs.firstIndex(of: $0)! })
+            let d = MLX.abs(a.asType(.float32) - b.asType(.float32))
+                .max().item(Float.self)
+            let scale = MLX.abs(a.asType(.float32)).max().item(Float.self) + 1e-9
+            guard d / scale <= tolerance else {
+                throw StateCacheError.shapeMismatch(
+                    "общие слои \(overlap) расходятся на \(d / scale) — "
+                    + "кэши сняты с разных баз или разным текстом")
+            }
+        }
+
+        var newContract = index.contract
+        for (k, v) in other.index.contract where newContract[k] == nil {
+            newContract[k] = v
+        }
+
+        let writer = try StateCacheWriter(
+            shape: [nPairs, union.count] + Array(shape.dropFirst(2)),
+            dtype: dtype, path: base)
+        var start = 0
+        while start < nPairs {
+            let end = Swift.min(start + rowBatch, nPairs)
+            let rows = Array(start ..< end)
+            var parts: [MLXArray] = []
+            for layer in union {
+                if let slot = mine.firstIndex(of: layer) {
+                    parts.append(gather(rows, slots: [slot]))
+                } else {
+                    parts.append(other.gather(rows,
+                                              slots: [theirs.firstIndex(of: layer)!]))
+                }
+            }
+            let merged = concatenated(parts, axis: 1)
+            eval(merged)
+            try writer.write(rows: rows, merged)
+            start = end
+        }
+        return try writer.finish(pairIndex: index.pairIndex,
+                                 labels: index.labels,
+                                 hardNegs: index.hardNegs,
+                                 contract: newContract, sources: union)
+    }
+
     static func statesURL(_ base: URL) -> URL {
         base.appendingPathExtension("states")
     }
     static func indexURL(_ base: URL) -> URL {
         base.appendingPathExtension("idx.json")
+    }
+
+    /// В каких слотах кэша лежат слои, которые читает голова.
+    ///
+    /// Это и есть механизм «одно кодирование — много конфигураций»: кэш
+    /// может держать НАДМНОЖЕСТВО слоёв, а голова берёт из него свой срез.
+    /// Порядок результата совпадает с `head.uniqueSources`, то есть с тем,
+    /// как голова адресует слоты через `sourceSlot`.
+    ///
+    /// Кэш без `sources` (собранный до появления поля) проверить нельзя:
+    /// остаётся сверить число слотов, как и раньше. Совпадение числа НЕ
+    /// означает совпадения слоёв — это признанная слепая зона, а не
+    /// проверка. Пересобранный кэш её закрывает.
+    public func slots(for head: RerankerHead) throws -> [Int] {
+        guard let have = index.sources else {
+            guard nSources == head.uniqueSources.count else {
+                throw StateCacheError.shapeMismatch(
+                    "в кэше \(nSources) слоёв состояния, "
+                    + "голова читает \(head.uniqueSources.count)")
+            }
+            return Array(0 ..< nSources)
+        }
+        var out: [Int] = []
+        out.reserveCapacity(head.uniqueSources.count)
+        for src in head.uniqueSources {
+            guard let slot = have.firstIndex(of: src) else {
+                throw StateCacheError.layersMissing(want: head.uniqueSources,
+                                                    have: have)
+            }
+            out.append(slot)
+        }
+        return out
     }
 
     /// Совместим ли кэш с этой головой и этим контрактом подачи текста.
@@ -179,11 +366,7 @@ public final class StateCache {
     /// Единственное, чего проверка не увидит, — подменённый чекпоинт базы.
     public func checkCompatible(head: RerankerHead,
                                 contract: [String: String]) throws {
-        let wantSrc = head.uniqueSources.count
-        guard shape[1] == wantSrc else {
-            throw StateCacheError.shapeMismatch(
-                "в кэше \(shape[1]) слоёв состояния, голова читает \(wantSrc)")
-        }
+        _ = try slots(for: head)
         for (key, want) in contract {
             if let have = index.contract[key], have != want {
                 throw StateCacheError.shapeMismatch(
@@ -275,11 +458,15 @@ public final class StateCacheWriter {
     /// узнать «состояния не влезли» лучше один раз в конце, чем на середине
     /// многоминутного кодирования.
     public func finish(pairIndex: [[Int]], labels: [Int], hardNegs: [[Int]],
-                       contract: [String: String]) throws -> StateCache {
+                       contract: [String: String],
+                       sources: [Int]? = nil) throws -> StateCache {
         if dtype == .float16 && maxAbs > 60000 {
             throw StateCacheError.fp16Overflow(maxAbs)
         }
+        precondition(sources == nil || sources!.count == shape[1],
+                     "слоёв \(sources!.count), слотов в форме \(shape[1])")
         let index = StateCacheIndex(shape: shape, dtype: dtype,
+                                    sources: sources,
                                     pairIndex: pairIndex, labels: labels,
                                     hardNegs: hardNegs, contract: contract)
         if let handle {

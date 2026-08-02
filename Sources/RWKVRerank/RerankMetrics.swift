@@ -142,15 +142,23 @@ public enum RerankMetrics {
     }
 
     /// Скоры головы по всему кэшу, `[nSamples, nCand]`.
+    ///
+    /// `slots` — срез кэша под эту голову; nil ⇒ вычислить самому. Передавать
+    /// готовый стоит там, где он уже посчитан (цикл обучения зовёт оценку
+    /// после каждой эпохи), но НЕ ради скорости: разрешение слотов — это и
+    /// есть проверка «кэш от этой ли головы», и подсунуть сюда чужой срез
+    /// молча нельзя ровно потому, что параметр явный.
     public static func scoreAll(_ head: RerankerHead, cache: StateCache,
-                                batchSize: Int = 64) -> [[Float]] {
+                                batchSize: Int = 64,
+                                slots: [Int]? = nil) throws -> [[Float]] {
+        let sl = try slots ?? cache.slots(for: head)
         var out: [[Float]] = []
         out.reserveCapacity(cache.nSamples)
         var start = 0
         while start < cache.nSamples {
             let end = Swift.min(start + batchSize, cache.nSamples)
             let rows = Array(start ..< end)
-            let (states, _) = cache.batch(rows)
+            let (states, _) = cache.batch(rows, slots: sl)
             let s = head(states).reshaped([rows.count, cache.nCandidates])
                                 .asType(.float32)
             eval(s)
@@ -166,8 +174,10 @@ public enum RerankMetrics {
 
     /// Метрики головы на кэше.
     public static func evaluate(_ head: RerankerHead, cache: StateCache,
-                                batchSize: Int = 64) -> RankingMetrics {
-        compute(scores: scoreAll(head, cache: cache, batchSize: batchSize),
+                                batchSize: Int = 64,
+                                slots: [Int]? = nil) throws -> RankingMetrics {
+        compute(scores: try scoreAll(head, cache: cache, batchSize: batchSize,
+                                     slots: slots),
                 labels: cache.labels, hardNegs: cache.hardNegs)
     }
 }

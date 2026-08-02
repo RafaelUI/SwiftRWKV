@@ -22,6 +22,8 @@ let package = Package(
         // Инференс крупных RWKV-7 World моделей (генерация) + LoRA/QLoRA-файнтюн.
         //   import RWKVGen
         .library(name: "RWKVGen", targets: ["RWKVGen"]),
+        // Прогон реранкера: данные → кэш состояний → обучение головы → отчёт.
+        .executable(name: "rerank-run", targets: ["RerankRun"]),
     ],
     dependencies: [
         .package(
@@ -92,6 +94,15 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
             ]
+        ),
+        // Прогон реранкера от данных до обученной головы. Исполняемая цель,
+        // а не тест: тест обязан быть быстрым и воспроизводимым, а здесь
+        // минуты кодирования на реальной модели и числа, которые сравниваются
+        // с питоновскими замерами вручную.
+        .executableTarget(
+            name: "RerankRun",
+            dependencies: ["RWKVRerank", "RWKVGen",
+                           .product(name: "MLX", package: "mlx-swift")]
         ),
         .testTarget(
             name: "RWKVGenTests",

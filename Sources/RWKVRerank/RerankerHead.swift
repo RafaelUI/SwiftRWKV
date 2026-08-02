@@ -196,7 +196,17 @@ public final class RerankerHead {
     /// (документ, запрос) сворачивается в такой тензор один раз, дальше
     /// обучение головы состояние не пересчитывает.
     public func select(_ state: RWKVBatchState) -> MLXArray {
-        stacked(uniqueSources.map { state.layerWKV($0) }, axis: 1)
+        Self.select(state, sources: uniqueSources)
+    }
+
+    /// Состояние базы → `[B, sources.count, H, S, S]` по ЯВНОМУ списку слоёв.
+    ///
+    /// Отдельно от `select(_:)` ради кэша НАДМНОЖЕСТВА: одно кодирование
+    /// обслуживает несколько конфигураций головы, а какие слои в нём лежат,
+    /// задаётся снаружи и головой не определяется.
+    public static func select(_ state: RWKVBatchState,
+                              sources: [Int]) -> MLXArray {
+        stacked(sources.map { state.layerWKV($0) }, axis: 1)
     }
 
     // ── Проход ──
