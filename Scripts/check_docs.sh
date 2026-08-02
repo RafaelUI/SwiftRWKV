@@ -63,35 +63,37 @@ out = [
     "import Foundation",
     "import MLX",
     "@testable import RWKVGen",
+    "@testable import RWKVEmbedding",
     "@testable import RWKVRerank",
     "",
 ]
 total = skipped = 0
-helpers = []
 for md in mds:
     text = open(md, encoding="utf-8").read()
-    n = 0
+    name = re.sub(r"\W", "_", md.rsplit("/", 1)[-1].rsplit(".", 1)[0])
+    helpers, blocks = [], []
     for m in re.finditer(r"```(swift|swift-skip|swift-helper)\n(.*?)```",
                          text, re.S):
         if m.group(1) == "swift-skip":
             skipped += 1
-            continue
-        if m.group(1) == "swift-helper":
+        elif m.group(1) == "swift-helper":
             helpers.append(m.group(2))
-            continue
-        # Каждый блок — в СВОЮ функцию: примеры из разных разделов не обязаны
-        # сочетаться друг с другом, одинаковые имена в них — норма.
-        name = re.sub(r"\W", "_", md.rsplit("/", 1)[-1].rsplit(".", 1)[0])
-        out.append("func doc_%s_%d() throws {" % (name, n))
-        out.extend("    " + l if l.strip() else "" for l in m.group(2).splitlines())
+        else:
+            blocks.append(m.group(2))
+    for i, b in enumerate(blocks):
+        # Всё — ВНУТРИ функции примера, включая помощников. Так два разных
+        # документа не могут столкнуться именами: `loadBackbone` в
+        # reranker.md и в Embedding.md — разные локальные функции, а не
+        # повторное объявление одной. Ценой дублирования в файле, который
+        # никто не читает.
+        out.append("func doc_%s_%d() throws {" % (name, i))
+        for h in helpers:
+            out.extend("    " + l if l.strip() else "" for l in h.splitlines())
+        out.extend("    " + l if l.strip() else "" for l in b.splitlines())
         out.append("}")
         out.append("")
-        n += 1
         total += 1
-    print("%s: блоков %d" % (md, n))
-# Помощники — на уровень файла, ПЕРЕД примерами.
-body = out[:out.index("")] if "" in out else out
-out = out + sum([h.splitlines() + [""] for h in helpers], [])
+    print("%s: блоков %d, помощников %d" % (md, len(blocks), len(helpers)))
 open(gen, "w", encoding="utf-8").write("\n".join(out))
 print("всего блоков %d, пропущено %d → %s" % (total, skipped, gen))
 PY

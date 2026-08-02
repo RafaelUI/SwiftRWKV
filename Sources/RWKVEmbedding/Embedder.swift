@@ -163,23 +163,62 @@ public struct Embedder {
 
     public let model: EmbeddingModel
     public let tokenizer: WorldTokenizer
+    /// Контракт подачи текста: терминатор и обрезка.
+    ///
+    /// Пулинг живёт в модели и в контракт входит для сверки при загрузке
+    /// чекпоинта — здесь он не дублируется, чтобы не разъехался с моделью.
+    public let contract: EmbeddingContract
+
     /// Токен, дописываемый в конец перед пулингом.
     ///
     /// 0 — зарезервированный id в World-вокабе (ни одной byte-строке не
     /// сопоставлен), поэтому для НЕдообученной базы он естественный
     /// терминатор: модель его не видела в тексте и он не тянет за собой
     /// смысл. nil ⇒ не дописывать.
-    public let terminator: Int?
+    public var terminator: Int? { contract.terminator }
+
+    /// Обрезка входа по токенам.
+    ///
+    /// Умолчание 512 — ТО ЖЕ, что у метрик и у стадий обучения, и это
+    /// главное в нём. Раньше выдача не обрезала вовсе: на длинном тексте
+    /// измеренное качество описывало не то, что делает выдача, и заметить
+    /// это по формам было невозможно — вектор нормирован в обоих случаях.
+    /// Расхождение замерено, а не предположено (см. `EmbeddingSmokeTests`).
+    public var maxTokens: Int? { contract.maxTokens }
 
     public init(model: EmbeddingModel, tokenizer: WorldTokenizer,
-                terminator: Int? = 0) {
+                contract: EmbeddingContract? = nil) {
         self.model = model
         self.tokenizer = tokenizer
-        self.terminator = terminator
+        // Пулинг берётся у МОДЕЛИ: она источник истины, а контракт — то, что
+        // записывается рядом с ней.
+        var c = contract ?? EmbeddingContract()
+        c.pooling = model.pooling
+        self.contract = c
+    }
+
+    /// Собрать по чекпоинту: контракт читается ИЗ ФАЙЛА.
+    ///
+    /// Рекомендуемый способ. Обрезка, терминатор и пулинг — часть того, на
+    /// чём голова обучалась; подать текст иначе не ошибка формы, а тихая
+    /// потеря качества.
+    public static func fromCheckpoint(backbone: X070Backbone,
+                                      tokenizer: WorldTokenizer,
+                                      head url: URL) throws -> Embedder {
+        let (model, contract) = try EmbeddingModel.fromHead(backbone: backbone,
+                                                            url: url)
+        return Embedder(model: model, tokenizer: tokenizer, contract: contract)
     }
 
     public func encode(_ text: String) -> [Int] {
         var ids = tokenizer.encode(text)
+        // Обрезка ДО терминатора: он обязан остаться последним, иначе
+        // позиция пулинга укажет на обычный токен, и вектор снимется не с
+        // того места.
+        if let m = maxTokens {
+            let room = terminator == nil ? m : m - 1
+            if ids.count > room { ids = Array(ids.prefix(Swift.max(0, room))) }
+        }
         if let t = terminator { ids.append(t) }
         return ids
     }
