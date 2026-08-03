@@ -296,7 +296,7 @@ resulting safetensors plus JSON manifest.
 
 **Note on the name.** Not `RWKVTrain`: that name belonged to a module that was
 removed (a from-scratch backbone plus a classification trainer, whose
-capability now lives on `X070Backbone`), and `Train.md` still documents its
+capability now lives on `X070Backbone`), and [docs/Train.md](docs/Train.md) still documents its
 removal. Reusing the name for something structurally different would make the
 repository's own history misleading.
 

@@ -107,12 +107,16 @@ public final class RwkvqSidecar {
 
     public func contains(_ key: String) -> Bool { tensors[key] != nil }
 
-    /// Восстановить плотный вес [OUT, IN] в float32.
+    /// Восстановить плотный вес [OUT, IN].
     ///
     /// Результат ТРАНЗИЕНТНЫЙ и намеренно не кэшируется: смысл квантованной
     /// базы в том, что она живёт в памяти сжатой. Кэш плотных весов молча
     /// превращает QLoRA обратно в LoRA, только с лишними шагами.
-    public func dequantize(_ key: String) throws -> MLXArray {
+    ///
+    /// `dtype` — тип хранения; арифметика деквантизации всегда float.
+    /// Просить `.bfloat16` стоит там, где результат всё равно тут же уйдёт в
+    /// bf16-вычисления: транзиент вдвое меньше, а числа те же до бита.
+    public func dequantize(_ key: String, dtype: DType = .float32) throws -> MLXArray {
         guard let info = tensors[key] else {
             throw RwkvqError.missingBuffer(tensor: key, buffer: "manifest")
         }
@@ -129,7 +133,8 @@ public final class RwkvqSidecar {
                                  outFeatures: info.outFeatures,
                                  inFeatures: info.inFeatures,
                                  superBlock: info.superBlock,
-                                 xbits: info.xbits)
+                                 xbits: info.xbits,
+                                 dtype: dtype)
     }
 
     /// Суммарный размер сжатых буферов в байтах — чтобы можно было честно

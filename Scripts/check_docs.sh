@@ -63,6 +63,7 @@ out = [
     "import Foundation",
     "import MLX",
     "@testable import RWKVGen",
+    "@testable import RWKVQuant",
     "@testable import RWKVEmbedding",
     "@testable import RWKVRerank",
     "",

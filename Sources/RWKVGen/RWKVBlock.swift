@@ -65,6 +65,30 @@ public protocol RWKVBlockContext: AnyObject {
 
     /// Каким ядром считать WKV при данной длине.
     func wkvPath(_ T: Int) -> WKVKernelPath
+
+    /// Приводить ли выход WKV обратно к типу входа блока.
+    ///
+    /// Рекуррентность WKV считается в fp32 и обязана — это условие
+    /// согласия с параллельным путём. Но ВОЗВРАЩАЕТ ядро тоже fp32, и
+    /// дальше fp32 едет в остаточный поток, в следующий слой и до самой
+    /// головы. Веса при этом bf16, так что каждый матмул поднимает ВЕСЬ
+    /// вес до fp32: замерено на 0.1B, голова 65536×768 идёт 5.503 мс
+    /// против 1.283 мс на bf16-активации (×4.29), и это раз на токен.
+    ///
+    /// Референсные реализации RWKV-7 держат состояние в fp32, а активации
+    /// в типе модели, то есть приводят. Здесь это ЗА ФЛАГОМ и по умолчанию
+    /// ВЫКЛЮЧЕНО: включение сдвигает числа во всём стеке, и все эталоны
+    /// паритета с Python придётся перемерить. Флаг существует, чтобы обе
+    /// ветки можно было сравнить в одном процессе — иначе замер «до и
+    /// после» пришлось бы делать разными сборками, а это нарушение
+    /// дисциплины A/B.
+    var castWKVOutput: Bool { get }
+}
+
+public extension RWKVBlockContext {
+    /// Умолчание для всех реализаций, кроме бэкбона: не приводить.
+    /// Голова реранкера живёт своей жизнью и в этот эксперимент не входит.
+    var castWKVOutput: Bool { false }
 }
 
 // ─────────────────── Арифметика блока (единственная копия) ───────────────────
@@ -192,6 +216,12 @@ func rwkvTmixForward(
         }
     }
 
+    // ЕДИНСТВЕННАЯ точка, где fp32 входит в остаточный поток. Ядро считает
+    // рекуррентность в fp32 и возвращает fp32; всё, что ниже, — ln_x, bonus,
+    // o_proj, следующий слой, голова — наследует этот тип по умолчанию.
+    // См. `castWKVOutput`.
+    if ctx.castWKVOutput { out = out.asType(x.dtype) }
+
     // Порядок официала: ln_x (GroupNorm) ДО bonus.
     //
     // ln_x per-token: канон RWKV-7 — F.group_norm(x.view(B*T, C), H). Подача
@@ -289,6 +319,8 @@ final class BackboneBlockContext: RWKVBlockContext {
 
     func groupNormHeads(_ x: MLXArray) -> MLXArray { backbone.groupNormRaw(x) }
 
+    var castWKVOutput: Bool { backbone.castWKVOutputToComputeDType }
+
     func wkvPath(_ T: Int) -> WKVKernelPath {
         // Намеренно БЕЗ ветки .step на T == 1: одношаговый путь численно
         // эквивалентен ядру, но не равен ему побитово, а через T == 1 идёт
@@ -304,9 +336,12 @@ final class BackboneBlockContext: RWKVBlockContext {
 public enum RWKVBlockError: Error, CustomStringConvertible {
     case missingWeight(String)
     case noValueResidualSource(Int)
+    case noLayer(Int)
 
     public var description: String {
         switch self {
+        case .noLayer(let l):
+            return "в базе нет ни одного веса слоя \(l) — блок нечем инициализировать"
         case .missingWeight(let k):
             return "в базе нет веса \(k) — блок нечем инициализировать"
         case .noValueResidualSource(let l):
@@ -456,9 +491,17 @@ public final class RWKVBlock: RWKVBlockContext {
                                 dtype: DType = .float32) throws -> RWKVBlock {
         let prefix = "blocks.\(layer)."
         var weights: [String: MLXArray] = [:]
-        for key in base.weightKeys where key.hasPrefix(prefix) {
-            weights[String(key.dropFirst(prefix.count))] = base.weight(key)
+        // ПО allWeightKeys, а не по weightKeys. Второй перечисляет только
+        // плотные веса, и на квантованной базе обход по нему собирал блок
+        // БЕЗ ЕДИНОЙ ПРОЕКЦИИ — 27 весов вместо 33, без ошибки. Падало это
+        // потом, в `param()` посреди прохода, где причину уже не видно.
+        for key in base.allWeightKeys where key.hasPrefix(prefix) {
+            guard let v = base.denseWeight(key) else {
+                throw RWKVBlockError.missingWeight(key)
+            }
+            weights[String(key.dropFirst(prefix.count))] = v
         }
+        guard !weights.isEmpty else { throw RWKVBlockError.noLayer(layer) }
 
         let needsV = index > 0
         let hasV = weights["tmix.v_lora_B.weight"] != nil

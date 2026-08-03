@@ -12,6 +12,21 @@ import MLXFast
 //  на этом шаге даёт ~18% расхождений на одном бите мантиссы bf16, и
 //  калибровка, которая этого не предполагает, начинает мерить не то.
 //
+//  ТИП АРИФМЕТИКИ И ТИП ХРАНЕНИЯ — РАЗНЫЕ ВЕЩИ, и путать их дорого.
+//  Комбайн `code·s + m` считается в float ВСЕГДА, независимо от `dtype`;
+//  меняется только то, чем результат записывается в память. Округление при
+//  этом ровно одно и ровно там же, где оно происходило раньше: вызывающий
+//  всё равно немедленно приводил fp32-транзиент к bf16 (`baseProj`,
+//  `embed`), потому что вся модель считает в bf16. То есть `dtype: .bfloat16`
+//  даёт БИТ-В-БИТ тот же результат, что старый путь, — и это утверждение
+//  проверяется тестом, а не предполагается.
+//
+//  Зачем: транзиент fp32 вдвое больше нужного, и на векторной проекции всё
+//  упирается в пропускную способность памяти. Замерено на 2.9B — деквантизация
+//  занимает 57–62% времени проекции, а один только матмул по bf16-весам
+//  против fp32 идёт 0.608 против 0.965 мс (2560×2560) и 3.613 против 6.918 мс
+//  (65536×2560).
+//
 //  Раскладка (источник истины — rwkv_quant/formats/schema.py):
 //    qblk[row, blk] = 16Б кодов (block-local split-ниббл, gs=32)
 //                     [+ 4Б qh (бит 4) [+ 4Б qh2 (бит 5)]]
@@ -24,20 +39,37 @@ import MLXFast
 //  launch против ~8 отдельных операций, при бит-в-бит совпадении.
 // ───────────────────────────────────────────────────────────────────────
 
-/// Ключ кэша скомпилированных ядер: геометрия входит в исходник константами.
+/// Типы, которыми ядро умеет записывать результат.
+///
+/// Список закрытый намеренно: имя типа уходит в ИСХОДНИК Metal, и опечатка
+/// проявится ошибкой компиляции ядра в рантайме, а не при сборке.
+private func metalTypeName(_ d: DType) -> String {
+    switch d {
+    case .float32: return "float"
+    case .bfloat16: return "bfloat16_t"
+    case .float16: return "float16_t"
+    default: preconditionFailure("деквантизация в \(d) не поддержана")
+    }
+}
+
+/// Ключ кэша скомпилированных ядер: геометрия и тип выхода входят в исходник
+/// константами, значит на каждое сочетание нужно своё ядро.
 private struct DequantKey: Hashable {
     let inFeatures: Int
     let outFeatures: Int
     let xbits: Int
     let superBlock: Int
+    let dtype: String
 }
 
 private var dequantKernelCache: [DequantKey: MLXFastKernel] = [:]
 
 private func dequantKernel(inFeatures IN: Int, outFeatures OUT: Int,
-                           xbits: Int, superBlock gwSb: Int) -> MLXFastKernel {
+                           xbits: Int, superBlock gwSb: Int,
+                           dtype: DType) -> MLXFastKernel {
+    let outType = metalTypeName(dtype)
     let key = DequantKey(inFeatures: IN, outFeatures: OUT,
-                         xbits: xbits, superBlock: gwSb)
+                         xbits: xbits, superBlock: gwSb, dtype: outType)
     if let k = dequantKernelCache[key] { return k }
 
     precondition((0 ... 2).contains(xbits), "xbits \(xbits) вне {0,1,2}")
@@ -100,14 +132,16 @@ private func dequantKernel(inFeatures IN: Int, outFeatures OUT: Int,
         float sf = float(s);
         float mf = float(mn);
 
-        device float* orow = out + row * IN_C + blk * 32;
+        device \(outType)* orow = out + row * IN_C + blk * 32;
         for (uint c = 0; c < 32; c++) {
-            orow[c] = float(nib[c]) * sf + mf;
+            // Комбайн В FLOAT при любом типе хранения: приведение стоит
+            // одним округлением на записи, а не на каждом слагаемом.
+            orow[c] = (\(outType))(float(nib[c]) * sf + mf);
         }
     """
 
     let kern = MLXFast.metalKernel(
-        name: "rwkvq_dequant\(4 + xbits)_\(IN)_\(OUT)",
+        name: "rwkvq_dequant\(4 + xbits)_\(IN)_\(OUT)_\(outType)",
         inputNames: ["qblk", "qsqm", "ddm"],
         outputNames: ["out"],
         source: source,
@@ -117,13 +151,19 @@ private func dequantKernel(inFeatures IN: Int, outFeatures OUT: Int,
     return kern
 }
 
-/// packed sb6 → dense [OUT, IN] float32 за один launch.
+/// packed sb6 → dense [OUT, IN] за один launch.
+///
+/// `dtype` — тип ХРАНЕНИЯ результата; арифметика комбайна всегда float.
+/// Умолчание fp32 оставлено, чтобы эталоны бит-в-бит и все существующие
+/// вызовы не сдвинулись: менять умолчание там, где на нём стоят проверки, —
+/// самый дешёвый способ выродить их молча.
 public func rwkvqDequantDense(qblk: MLXArray, qsqm: MLXArray, ddm: MLXArray,
                               outFeatures OUT: Int, inFeatures IN: Int,
-                              superBlock gwSb: Int, xbits: Int) -> MLXArray {
+                              superBlock gwSb: Int, xbits: Int,
+                              dtype: DType = .float32) -> MLXArray {
     let NB = IN / 32
     let kern = dequantKernel(inFeatures: IN, outFeatures: OUT,
-                             xbits: xbits, superBlock: gwSb)
+                             xbits: xbits, superBlock: gwSb, dtype: dtype)
     let threadgroup = 256
     let total = OUT * NB
     let groups = (total + threadgroup - 1) / threadgroup
@@ -131,5 +171,5 @@ public func rwkvqDequantDense(qblk: MLXArray, qsqm: MLXArray, ddm: MLXArray,
                 grid: (groups * threadgroup, 1, 1),
                 threadGroup: (threadgroup, 1, 1),
                 outputShapes: [[OUT, IN]],
-                outputDTypes: [.float32])[0]
+                outputDTypes: [dtype])[0]
 }

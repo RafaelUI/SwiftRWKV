@@ -88,6 +88,27 @@ public final class X070Backbone {
     /// gradient checkpoint (recompute в backward). Дифф-входы (x, v_first, LoRA)
     /// протягиваются явными аргументами чекпоинта; frozen-веса захватываются.
     public var useBlockCheckpoint = false
+
+    /// ЭКСПЕРИМЕНТ, по умолчанию ВЫКЛЮЧЕН: приводить выход WKV обратно к типу
+    /// вычислений вместо того, чтобы пускать fp32 в остаточный поток.
+    ///
+    /// Зачем. Ядро WKV считает рекуррентность в fp32 (иначе нельзя) и
+    /// возвращает fp32. Дальше этот тип едет через ln_x, bonus, o_proj, все
+    /// следующие слои и голову; веса при этом bf16, поэтому каждый матмул
+    /// поднимает ВЕСЬ вес до fp32. На 0.1B голова 65536×768 стоит 5.503 мс
+    /// против 1.283 на bf16-активации — ×4.29, раз на токен. Течь начинается
+    /// в tmix СЛОЯ 0: `tmixPrev[0]` ещё bfloat16, `cmixPrev[0]` уже float32.
+    ///
+    /// Почему за флагом, а не просто исправлено. Включение сдвигает числа во
+    /// ВСЁМ стеке, и каждый эталон паритета с Python придётся перемерить.
+    /// Плюс rwkv-metal устроен так же (после `wkv7` приведения тоже нет), то
+    /// есть Swift сейчас ВЕРЕН источнику, а с флагом станет от него отличаться
+    /// — это решение о расхождении с референсом, и принимать его надо с
+    /// числами на руках, а не мимоходом.
+    ///
+    /// Флаг переключается на живом объекте, так что обе ветки сравниваются в
+    /// ОДНОМ процессе — замер «до и после» разными сборками недействителен.
+    public var castWKVOutputToComputeDType = false
     /// LoRA-адаптеры по таргету: "blocks.L.tmix.r_proj" и т.п.
     var loraA: [String: MLXArray] = [:]      // [rank, in]
     var loraB: [String: MLXArray] = [:]      // [out, rank]
@@ -158,9 +179,16 @@ public final class X070Backbone {
     // кэшируется намеренно — база обязана жить в памяти сжатой, иначе смысл
     // квантованной базы теряется (кэш плотных весов превращает QLoRA в LoRA
     // с лишними шагами).
-    private func rwkvqWeight(_ wKey: String) -> MLXArray? {
+    ///
+    /// Разворачивается СРАЗУ в тип вычислений, а не в fp32 с приведением
+    /// после. Числа от этого не меняются ни на бит — приведение к bf16
+    /// происходило и раньше, просто на шаг позже, — а транзиента вдвое
+    /// меньше и лишнего прохода по памяти нет вовсе. На векторной проекции
+    /// всё упирается именно в память: замерено на 2.9B, деквантизация это
+    /// 57–62% времени проекции.
+    private func rwkvqWeight(_ wKey: String, _ dtype: DType) -> MLXArray? {
         guard let worldKey = rwkvqKeys[wKey], let sc = rwkvqSidecar else { return nil }
-        return try? sc.dequantize(worldKey)
+        return try? sc.dequantize(worldKey, dtype: dtype)
     }
 
     // База проекции: если есть quant — x·Wᵀ с деквантизацией на лету
@@ -170,10 +198,8 @@ public final class X070Backbone {
             return quantizedMM(x, q.wq, scales: q.scales, biases: q.biases,
                                transpose: true, groupSize: q.groupSize, bits: q.bits)
         }
-        if let dense = rwkvqWeight(wKey) {
-            // Деквант в fp32; приводим к типу вычислений, чтобы matmul не
-            // тянул всю цепочку в fp32 и не ломал bf16-профиль памяти.
-            return matmul(x, dense.asType(x.dtype).transposed())
+        if let dense = rwkvqWeight(wKey, x.dtype) {
+            return matmul(x, dense.transposed())
         }
         return matmul(x, wv(wKey).transposed())
     }
@@ -196,13 +222,14 @@ public final class X070Backbone {
                                groupSize: q.groupSize, bits: q.bits,
                                dtype: w["emb.weight"]?.dtype ?? .bfloat16)
         }
-        if let dense = rwkvqWeight("emb.weight") {
+        if let dense = rwkvqWeight("emb.weight", w["ln0.weight"]?.dtype ?? .bfloat16) {
             // ВНИМАНИЕ: sb6-ядро разворачивает таблицу целиком, а для словаря
-            // 65536×768 это ~200 МБ транзиента на КАЖДЫЙ проход. Строчной
-            // выборки формат не поддерживает: коды упакованы по блокам вдоль
-            // входной оси, и достать одну строку дешевле, чем блок, нельзя.
-            // Поэтому emb в сайдкар обычно и не отдают — см. attachRwkvq.
-            return dense.asType(w["ln0.weight"]?.dtype ?? .bfloat16).take(ids, axis: 0)
+            // 65536×768 это ~100 МБ транзиента bf16 на КАЖДЫЙ проход (и 335 МБ
+            // на 2.9B). Строчной выборки формат не поддерживает: коды упакованы
+            // по блокам вдоль входной оси, и достать одну строку дешевле, чем
+            // блок, нельзя. Поэтому emb в сайдкар обычно и не отдают —
+            // см. attachRwkvq.
+            return dense.take(ids, axis: 0)
         }
         return wv("emb.weight").take(ids, axis: 0)
     }
@@ -255,6 +282,10 @@ public final class X070Backbone {
 
     // Доступ для контекста (он живёт вне класса, но внутри модуля).
     func weightForBlock(_ key: String) -> MLXArray { wv(key) }
+    /// Строки таблицы эмбеддингов с учётом квантования — для рекуррентного
+    /// декода. Он живёт в отдельном файле и обязан ходить теми же дорогами,
+    /// иначе снова разойдётся с параллельным путём.
+    func embedForBlock(_ ids: MLXArray) -> MLXArray { embed(ids) }
     func projectForBlock(_ x: MLXArray, _ key: String, lora: String?) -> MLXArray {
         proj(x, key, lora: lora)
     }
@@ -263,8 +294,50 @@ public final class X070Backbone {
     /// Значение веса по имени, БЕЗ учёта wOverride: нужно тем, кто копирует
     /// веса наружу (инициализация блоков головы), — там интересен frozen-вес,
     /// а не временная обучаемая подмена.
-    public func weight(_ key: String) -> MLXArray { w[key]! }
+    ///
+    /// На квантованной базе вес РАЗВОРАЧИВАЕТСЯ из сайдкара. Это уместно
+    /// именно здесь и было бы неуместно на горячем пути: копирование весов
+    /// наружу происходит один раз при сборке, а не на каждом токене.
+    ///
+    /// Раньше здесь стоял `w[key]!`, и на квантованной базе это был
+    /// force-unwrap без сообщения: `attachRwkvq` плотные копии выбрасывает.
+    public func weight(_ key: String) -> MLXArray {
+        guard let v = denseWeight(key) else {
+            preconditionFailure(
+                "нет веса \(key). Известные имена — `allWeightKeys`; если база "
+                + "квантована, проверьте `isRwkvqBacked` и что сайдкар подключён.")
+        }
+        return v
+    }
+
+    /// Есть ли ПЛОТНАЯ копия веса. Осторожно: на квантованной базе это `false`
+    /// для всех выброшенных весов, хотя модель их имеет — см. `hasAnyWeight`.
     public func hasWeight(_ key: String) -> Bool { w[key] != nil }
+
+    /// Есть ли вес ВООБЩЕ — плотный или в сайдкаре.
+    public func hasAnyWeight(_ key: String) -> Bool {
+        w[key] != nil || isRwkvqBacked(key)
+    }
+
+    /// Все имена весов модели, включая ушедшие в сайдкар.
+    ///
+    /// `weightKeys` перечисляет только плотные, и на квантованной базе это
+    /// ЛОЖНО МАЛЫЙ список: обход по нему собирает неполный набор молча. Так
+    /// `RWKVBlock.fromBase` строил блок без единой проекции — объект
+    /// создавался успешно и падал потом, в `param()` посреди прохода.
+    public var allWeightKeys: [String] {
+        Array(Set(w.keys).union(rwkvqKeys.keys)).sorted()
+    }
+
+    /// Плотное значение веса: своё, либо развёрнутое из сайдкара, либо nil.
+    ///
+    /// Транзиент НЕ кэшируется — как и везде на квантованной базе. Звать на
+    /// горячем пути не нужно: там `projectForBlock`, который разворачивает
+    /// сразу в тип вычислений и умеет LoRA.
+    public func denseWeight(_ key: String) -> MLXArray? {
+        if let v = w[key] { return v }
+        return rwkvqWeight(key, w["ln0.weight"]?.dtype ?? .bfloat16)
+    }
 
     private func tmix(_ x: MLXArray, _ vFirst: MLXArray?, _ layer: Int,
                       shiftPrev: MLXArray? = nil, hIn: MLXArray? = nil,
