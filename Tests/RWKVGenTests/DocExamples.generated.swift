@@ -459,6 +459,7 @@ func doc_Inference_6() throws {
     opts.quantizeEmbedding = true   // see the caveat below
     opts.layers = 4 ..< 12          // leave the early layers dense
     opts.dropDenseWeights = false   // keep dense copies so detach can restore
+    opts.useNativeKernel = true     // run through MLX's quantised matmul, see below
     print(base.attachRwkvq(try RwkvqSidecar(path: "~/models/q.rwkvq_mlx"),
                            options: opts).attached)
 }

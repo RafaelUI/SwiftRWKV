@@ -285,10 +285,27 @@ with bit-exact verification against a PyTorch reference:
   a quantized base is that it lives compressed in memory; a dense cache silently
   converts QLoRA back into LoRA with extra steps.
 
-**Decision: two-stage conversion stays.** Reading `.rwkvq` natively requires
-torch; both repos are deliberately torch-free at runtime. Export remains a
-one-time step performed in `rwkv-quant`, and this module consumes only the
-resulting safetensors plus JSON manifest.
+**Decision: two-stage conversion stays — but the reason it stood no longer
+holds.** It rested on "reading `.rwkvq` natively requires torch", and that was
+true of the pickle-era container. `.rwkvq` is now a safetensors archive with a
+self-describing manifest, and `rwkv_quant.formats.codec` reads it *and* builds
+either loader layout in pure numpy, with a gate that blocks torch at the import
+machinery to prove it. `rwkv-metal` already consumes `.rwkvq` directly.
+
+What keeps the sidecar here is inertia rather than necessity, plus one concrete
+defect: `RwkvqSidecar`'s manifest parser requires every entry to be a 2-D
+quantised tensor with `xbits`/`gw_gs`/`gw_sb`, so a full-export manifest — which
+also carries 1-D norms and `(1,1,C)` token-shift multipliers — is rejected
+outright. Making that parser kind-aware is the prerequisite for consuming
+`.rwkvq` here, and it has to happen anyway: the sidecar format grew those
+entries too.
+
+**Dequantised weights are transient and must not be cached** remains true *for
+QLoRA*, and false as a general rule — for inference the transient is the whole
+cost. That is what `RwkvqAttachOptions.useNativeKernel` addresses: relayout once
+into MLX's quantised container, never materialise a dense matrix, identical
+numbers. The API has not yet been split along the two uses, which is why the
+option exists rather than the behaviour simply changing.
 
 ---
 

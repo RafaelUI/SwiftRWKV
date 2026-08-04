@@ -393,9 +393,20 @@ opts.quantizeCmix = true        // also cmix key/value
 opts.quantizeEmbedding = true   // see the caveat below
 opts.layers = 4 ..< 12          // leave the early layers dense
 opts.dropDenseWeights = false   // keep dense copies so detach can restore
+opts.useNativeKernel = true     // run through MLX's quantised matmul, see below
 print(base.attachRwkvq(try RwkvqSidecar(path: "~/models/q.rwkvq_mlx"),
                        options: opts).attached)
 ```
+
+`useNativeKernel` is the one option that changes speed rather than what is
+quantised. Off (the default), every projection unpacks the whole matrix into a
+dense transient and then does an ordinary matmul. On, the sb6 data is
+relayouted once at load into the container MLX's own `quantizedMM` expects, and
+no dense matrix is ever materialised. The numbers are identical — it is a
+relayout, not a requantisation, and the parity is asserted rather than assumed
+— while decode on 2.9B goes from 151 to 30 ms/token. It defaults to off because
+the unpack-per-call behaviour is deliberate for QLoRA, where the frozen base
+has to stay compressed in memory; for inference it is simply a cost.
 
 **The embedding table is not quantised by default**, and that is a
 considered choice rather than an omission: the sb6 format packs codes in
@@ -411,11 +422,12 @@ It **does** change the numbers, materially. Measured on this 0.1B with the
 **0.62**, and the top-1 token differs on a short prompt. Do not expect
 identical output from a quantised and a dense model.
 
-It also costs about **2.4× on every projection**, and that cost does not go
-away with scale. Each projection unpacks the whole matrix and then does an
-ordinary matmul; on a `[1, D]` vector both halves are bandwidth-bound over the
-same matrix, so unpacking is roughly a second pass. Measured on the sidecars
-directly, with swap unmoved either side:
+On the default path it also costs about **2.4× on every projection**, and that
+cost does not go away with scale. Each projection unpacks the whole matrix and
+then does an ordinary matmul; on a `[1, D]` vector both halves are
+bandwidth-bound over the same matrix, so unpacking is roughly a second pass.
+(`useNativeKernel` removes this entirely — the table below describes the
+default.) Measured on the sidecars directly, with swap unmoved either side:
 
 | | dequantise | matmul | together | unpack share |
 |---|---|---|---|---|
@@ -576,16 +588,25 @@ moved.
 - **`weight(_:)` force-unwraps.** The public accessor crashes on a quantised
   backbone where the dense copy was dropped. Callers that may see a quantised
   model should go through the projection path instead.
-- **Decode dequantises per projection per token.** Correct, and it is what
-  makes a quantised backbone usable at all, but there is no fused decode-time
-  GEMV here — rwkv-quant has such kernels on its own side and they are not
-  wired into this package. Measured cost: ~2.4× per projection at every scale,
-  13.6× more memory traffic than the packed data alone.
-- **A quantised model still needs the dense weights.** `export_mlx` exports
-  only the sb6 tensors; normalisations, token-shift multipliers and the
-  low-rank lora matrices stay in floating point, and `attachRwkvq` attaches to
-  an already-loaded dense backbone. So a `.rwkvq` file cannot be run on its
-  own, which is half the point of having one.
+- **Decode dequantises per projection per token — unless you ask it not to.**
+  This is the default and it is what makes a quantised backbone usable at all,
+  but it costs 2.21× against dense bf16 at 2.9B, because writing and re-reading
+  a dense transient turns a 1.9 GB read into 13.6 GB of traffic per token.
+  `RwkvqAttachOptions(useNativeKernel: true)` relayouts sb6 into MLX's own
+  quantised container once at load and runs `quantizedMM` instead: same
+  numbers to the last bit, no dense transient, 5.1× faster than the default
+  path and 2.3× faster than dense, at the same memory. It is off by default
+  because the dequantise-per-call path is the right trade for *QLoRA* (the
+  base must stay compressed) and the wrong one for inference; the two uses
+  have not been separated in the API yet.
+- **A quantised model still needs the dense weights.** `attachRwkvq` attaches
+  to an already-loaded dense backbone, and the sidecar this package reads
+  carries only the sb6 tensors. Note this is now a limitation *of this
+  package*, not of the format: `.rwkvq` has held every tensor since the full
+  export landed, and `rwkv-quant`'s `codec` can read it and build either
+  loader layout without torch. Wiring that up here is pending — see
+  `RwkvqSidecar`, whose manifest parser also still assumes every entry is a
+  2-D quantised tensor and will reject a full-export manifest.
 - **The backbone is not recorded in any checkpoint.** A reranker or embedding
   head loaded onto the wrong backbone differs in neither shape nor contract.
 - **Prefill is single-sequence.** It runs the parallel pass, but for one
