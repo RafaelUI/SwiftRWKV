@@ -123,8 +123,20 @@ extension X070Backbone {
         let xx = prev - x                     // token-shift: prev - x
         state.tmixPrev[layer] = x             // обновляем shift-state
 
-        let xr = x + xx * gg(p+"x_r"), xw = x + xx * gg(p+"x_w"), xk = x + xx * gg(p+"x_k")
-        let xv = x + xx * gg(p+"x_v"), xa = x + xx * gg(p+"x_a"), xg = x + xx * gg(p+"x_g")
+        // Шесть лерпов одним broadcast: xs = x + xx*[6,1,D] -> [6,1,D].
+        // Порядок в стеке -- r,w,k,v,a,g (см. xcoefStack), и он же
+        // повторён здесь; перепутать их местами значит посчитать
+        // правдоподобную чушь, поэтому разбор идёт явными индексами, а
+        // не кортежем.
+        let xr, xw, xk, xv, xa, xg: MLXArray
+        if let coef = xcoefStack(layer) {
+            let xs = x + xx * coef
+            xr = xs[0]; xw = xs[1]; xk = xs[2]
+            xv = xs[3]; xa = xs[4]; xg = xs[5]
+        } else {
+            xr = x + xx * gg(p+"x_r"); xw = x + xx * gg(p+"x_w"); xk = x + xx * gg(p+"x_k")
+            xv = x + xx * gg(p+"x_v"); xa = x + xx * gg(p+"x_a"); xg = x + xx * gg(p+"x_g")
+        }
 
         let r = pj(xr, p+"r_proj.weight").reshaped([H, S])
         let k0 = pj(xk, p+"k_proj.weight").reshaped([H, S])

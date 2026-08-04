@@ -139,6 +139,38 @@ public final class X070Backbone {
     /// Заполняется по `RwkvqAttachOptions.useNativeKernel`.
     public internal(set) var rwkvqNative: [String: RwkvqNativeWeight] = [:]
 
+    /// Считать шесть лерпов token-shift одним broadcast вместо шести пар
+    /// «умножить и сложить».
+    ///
+    /// Арифметика поэлементная и от группировки не зависит, так что
+    /// результат обязан быть БИТ-В-БИТ прежним — это проверяется, а не
+    /// предполагается (`decode-bench --fuse-parity`).
+    ///
+    /// Зачем: на декоде 2.9B вне проекций уходит 8.16 мс/ток, и по
+    /// трейсу это не арифметика (ALU 30%) и не CPU (простаивает), а
+    /// число мелких ядер. Шесть лерпов -- двенадцать операций из ~68 на
+    /// слой.
+    public var fuseLerp = true
+
+    /// Стек коэффициентов token-shift на слой, [6,1,D]. Строится лениво
+    /// и кэшируется: сам стек стоит операций, и делать его на каждом
+    /// шаге значило бы менять шило на мыло.
+    private var xcoefCache: [Int: MLXArray] = [:]
+
+    /// nil ⇒ считать по-старому. Это не осторожность: при `wOverride`
+    /// (партиал-файнтюн) веса подменяются на обучаемые, и кэш стал бы
+    /// молча возвращать замороженные.
+    func xcoefStack(_ layer: Int) -> MLXArray? {
+        guard fuseLerp, wOverride == nil else { return nil }
+        if let c = xcoefCache[layer] { return c }
+        let p = "blocks.\(layer).tmix."
+        let names = ["x_r", "x_w", "x_k", "x_v", "x_a", "x_g"]
+        let c = stacked(names.map { w[p + $0]!.reshaped([1, cfg.nEmbd]) }, axis: 0)
+        eval(c)
+        xcoefCache[layer] = c
+        return c
+    }
+
     // GroupNorm с pytorch_compatible-семантикой (eps=64e-5). Применяется
     // per-token к [N, D] (каждый токен нормализуется независимо по головам).
     private let groupNorm: GroupNorm

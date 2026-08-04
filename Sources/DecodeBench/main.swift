@@ -80,6 +80,8 @@ struct Args {
     /// очевидным между двумя провалами в ноль. На сам замер не влияет —
     /// пауза снаружи засекаемого участка.
     var gap = 0
+    var fuseParity = false
+    var noFuseLerp = false
     var nativeRef = "~/Develop/SwiftRWKV/.testdata/mlx_affine_ref.safetensors"
 }
 
@@ -105,6 +107,8 @@ func parseArgs() -> Args {
         case "--native": a.native = true
         case "--profile": a.profile = true
         case "--gap": a.gap = Int(it.next() ?? "") ?? a.gap
+        case "--fuse-parity": a.fuseParity = true
+        case "--no-fuse-lerp": a.noFuseLerp = true
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -433,6 +437,27 @@ func profileStep(_ model: X070Backbone, cfg: X070Config, ids: [Int],
                  nr - p, 100 * (nr - p) / f))
 }
 
+/// Фьюз лерпов обязан быть тождественным: арифметика поэлементная, от
+/// группировки не зависит. Проверяется на ОДНОЙ модели переключением
+/// флага на живом объекте -- две сборки сравнивали бы что угодно.
+func fuseParity(_ model: X070Backbone, cfg: X070Config, ids: [Int]) -> Int {
+    print("── тождественность фьюза лерпов ──")
+    model.fuseLerp = false
+    let (_, offIds, offLogits) = decode(model, cfg: cfg, ids: ids)
+    model.fuseLerp = true
+    let (_, onIds, onLogits) = decode(model, cfg: cfg, ids: ids)
+
+    let sameTop1 = offIds == onIds
+    let d = (offLogits.asType(.float32) - onLogits.asType(.float32))
+    let maxd = abs(d).max()
+    eval(maxd)
+    let bitExact = maxd.item(Float.self) == 0
+    print("  top-1 совпал: \(sameTop1 ? "да" : "НЕТ") (\(offIds.count) позиций)")
+    print("  логиты: max|Δ| = \(maxd.item(Float.self))"
+          + (bitExact ? "  (бит-в-бит)" : "  -- ФЬЮЗ СДВИНУЛ ЧИСЛА"))
+    return (sameTop1 && bitExact) ? 0 : 1
+}
+
 // ── Прогон ──────────────────────────────────────────────────────────────
 
 let args = parseArgs()
@@ -475,6 +500,9 @@ var dense: X070Backbone? = wantDense ? X070Backbone(weights: weights, cfg: cfg) 
 var quantized: X070Backbone? = wantQuant ? X070Backbone(weights: weights, cfg: cfg) : nil
 dense?.castWKVOutputToComputeDType = args.castWKV
 quantized?.castWKVOutputToComputeDType = args.castWKV
+dense?.fuseLerp = !args.noFuseLerp
+quantized?.fuseLerp = !args.noFuseLerp
+print("fuseLerp = \(!args.noFuseLerp)")
 print("castWKVOutputToComputeDType = \(args.castWKV)"
       + (args.castWKV ? "" : "  (в модели это умолчание, но оно стоит ×2.8)"))
 
@@ -511,6 +539,11 @@ if let d = dense { _ = decode(d, cfg: cfg, ids: warm) }
 if let q = quantized { _ = decode(q, cfg: cfg, ids: warm) }
 var lastDenseLogits: MLXArray? = nil
 var lastQuantLogits: MLXArray? = nil
+
+if args.fuseParity, let m = quantized ?? dense {
+    let (w, _) = inputIds(args.steps, vocab: cfg.vocab, vocabPath: args.vocab)
+    exit(Int32(fuseParity(m, cfg: cfg, ids: w)))
+}
 
 if args.gap > 0 {
     print("пауза \(args.gap) мс перед измеряемым окном (маркер для трейса)")
