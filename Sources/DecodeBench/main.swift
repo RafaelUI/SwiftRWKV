@@ -143,7 +143,7 @@ func median(_ xs: [Double]) -> Double {
 /// только с оговорками. Для сверки: teacher-forcing — единственный
 /// способ увидеть, СОГЛАСНЫ ли пути, а не насколько быстро они разошлись.
 func decode(_ model: X070Backbone, cfg: X070Config,
-            ids: [Int]) -> (Double, [Int], MLXArray) {
+            ids: [Int], readback: Bool = true) -> (Double, [Int], MLXArray) {
     var state = RWKVState(cfg: cfg)
     var picked: [Int] = []
     picked.reserveCapacity(ids.count)
@@ -151,10 +151,20 @@ func decode(_ model: X070Backbone, cfg: X070Config,
     let t0 = Date()
     for id in ids {
         let logits = model.step(id, state: &state)
-        let next = argMax(logits, axis: -1)
-        eval(next)
-        state.eval()
-        picked.append(next.item(Int.self))
+        if readback {
+            // argMax + item() -- это ЧТЕНИЕ ОБРАТНО В CPU на каждом
+            // шаге: полная синхронизация конвейера плюс латентность
+            // CPU<->GPU (по трейсу ~2 мс). Сэмплеру токен нужен, так
+            // что расход настоящий, но к скорости МОДЕЛИ он не
+            // относится, и мерить их вместе -- значит приписывать
+            // модели чужое. Отсюда флаг.
+            let next = argMax(logits, axis: -1)
+            eval(next)
+            state.eval()
+            picked.append(next.item(Int.self))
+        } else {
+            state.eval()
+        }
         last = logits
     }
     let dt = Date().timeIntervalSince(t0)
@@ -380,6 +390,13 @@ func profileStep(_ model: X070Backbone, cfg: X070Config, ids: [Int],
     if let h = nat["head.weight"] { chain.append(h) }
     print("проекций в цепочке: \(chain.count)")
 
+    // цена чтения токена обратно в CPU: тот же шаг без argMax/item()
+    var noReadMs: [Double] = []
+    for _ in 0 ..< rounds {
+        let (t, _, _) = decode(model, cfg: cfg, ids: ids, readback: false)
+        noReadMs.append(t * 1e3 / Double(ids.count))
+    }
+
     var projMs: [Double] = []
     for _ in 0 ..< rounds {
         let t0 = Date()
@@ -406,11 +423,14 @@ func profileStep(_ model: X070Backbone, cfg: X070Config, ids: [Int],
         fullMs.append(t * 1e3 / Double(ids.count))
     }
 
-    let p = median(projMs), f = median(fullMs)
-    print(String(format: "только проекции %6.2f мс/ток", p))
-    print(String(format: "полный шаг      %6.2f мс/ток", f))
-    print(String(format: "вне проекций    %6.2f мс/ток (%.0f%% шага)",
-                 f - p, 100 * (f - p) / f))
+    let p = median(projMs), f = median(fullMs), nr = median(noReadMs)
+    print(String(format: "только проекции   %6.2f мс/ток", p))
+    print(String(format: "шаг без readback  %6.2f мс/ток", nr))
+    print(String(format: "полный шаг        %6.2f мс/ток", f))
+    print(String(format: "  из них readback %6.2f мс/ток (%.0f%%)",
+                 f - nr, 100 * (f - nr) / f))
+    print(String(format: "  вне проекций    %6.2f мс/ток (%.0f%% шага)",
+                 nr - p, 100 * (nr - p) / f))
 }
 
 // ── Прогон ──────────────────────────────────────────────────────────────
