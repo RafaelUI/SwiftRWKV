@@ -72,6 +72,7 @@ struct Args {
     var micro = false
     var checkNative = false
     var native = false
+    var profile = false
     var nativeRef = "~/Develop/SwiftRWKV/.testdata/mlx_affine_ref.safetensors"
 }
 
@@ -95,6 +96,7 @@ func parseArgs() -> Args {
         case "--micro": a.micro = true
         case "--check-native": a.checkNative = true
         case "--native": a.native = true
+        case "--profile": a.profile = true
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -329,6 +331,80 @@ func checkNative(sidecar: RwkvqSidecar, refPath: String) -> Int {
     return bad == 0 ? 0 : 1
 }
 
+/// Разложение шага: проекции против всего остального.
+///
+/// Вопрос, на который отвечает: 30.0 мс/ток при поле по памяти 19.4 --
+/// это недобор на проекциях или расход вне их? Гипотеза «упростить
+/// математику» имеет смысл только во втором случае; в первом упрощать
+/// нечего, потому что проекции упираются в чтение весов, а не в счёт
+/// (в rwkv-quant это отдельно закрыто руфлайн-пробой: декодный ALU
+/// бесплатен).
+///
+/// Меряется «только проекции»: те же запуски `quantizedMM` в том же
+/// количестве и порядке, но без WKV, нормировок, LoRA-веток,
+/// token-shift и сэмплера. Разница с полным шагом и есть всё
+/// остальное.
+///
+/// ЧЕСТНАЯ ОГОВОРКА: у проекций здесь фиктивный вход, поэтому
+/// зависимостей между слоями нет и MLX волен ставить их в очередь
+/// свободнее, чем в настоящем шаге. То есть «только проекции» -- это
+/// НИЖНЯЯ оценка их вклада, а «всё остальное» -- ВЕРХНЯЯ. Для ответа
+/// «есть ли вне проекций что оптимизировать» этого достаточно, для
+/// точного бюджета -- нет.
+func profileStep(_ model: X070Backbone, cfg: X070Config, ids: [Int],
+                 rounds: Int) {
+    print("\n── разложение шага ──")
+    let nat = model.rwkvqNative
+    guard !nat.isEmpty else {
+        print("нет родного контейнера (нужен --native)")
+        return
+    }
+    // порядок как в шаге: r/k/v/o на слой, затем cmix key/value, затем голова
+    var chain: [RwkvqNativeWeight] = []
+    for l in 0 ..< cfg.nLayer {
+        for n in ["r_proj", "k_proj", "v_proj", "o_proj"] {
+            if let w = nat["blocks.\(l).tmix.\(n).weight"] { chain.append(w) }
+        }
+        for n in ["key", "value"] {
+            if let w = nat["blocks.\(l).cmix.\(n).weight"] { chain.append(w) }
+        }
+    }
+    if let h = nat["head.weight"] { chain.append(h) }
+    print("проекций в цепочке: \(chain.count)")
+
+    var projMs: [Double] = []
+    for _ in 0 ..< rounds {
+        let t0 = Date()
+        for _ in 0 ..< ids.count {
+            // Накопление ОБЯЗАТЕЛЬНО. MLX ленив, и если результат
+            // проекции никуда не идёт, граф выбрасывает её целиком:
+            // первая версия писала `last = w(x)` в цикле и eval'ила
+            // только последнюю -- получалось 1.73 мс на 193 проекции,
+            // при том что одно чтение 1855 МБ весов стоит 19.4 мс.
+            // Замер измерял ровно одну голову.
+            var acc = MLXArray(Float(0))
+            for w in chain {
+                let x = MLXArray.zeros([1, w.inFeatures], dtype: .float16)
+                acc = acc + w(x).sum().asType(.float32)
+            }
+            eval(acc)
+        }
+        projMs.append(Date().timeIntervalSince(t0) * 1e3 / Double(ids.count))
+    }
+
+    var fullMs: [Double] = []
+    for _ in 0 ..< rounds {
+        let (t, _, _) = decode(model, cfg: cfg, ids: ids)
+        fullMs.append(t * 1e3 / Double(ids.count))
+    }
+
+    let p = median(projMs), f = median(fullMs)
+    print(String(format: "только проекции %6.2f мс/ток", p))
+    print(String(format: "полный шаг      %6.2f мс/ток", f))
+    print(String(format: "вне проекций    %6.2f мс/ток (%.0f%% шага)",
+                 f - p, 100 * (f - p) / f))
+}
+
 // ── Прогон ──────────────────────────────────────────────────────────────
 
 let args = parseArgs()
@@ -432,6 +508,10 @@ for r in 0 ..< args.rounds {
                        msQuant[r], 1e3 / msQuant[r])
     }
     print(line)
+}
+
+if args.profile, let q = quantized {
+    profileStep(q, cfg: cfg, ids: ids, rounds: args.rounds)
 }
 
 print("")
