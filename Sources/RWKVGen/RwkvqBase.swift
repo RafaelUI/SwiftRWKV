@@ -105,8 +105,12 @@ extension X070Backbone {
         var missing: [String] = []
         var freed = 0
         for key in wanted {
+            // sb6 обязателен: полный манифест содержит и asym/rtn/dense,
+            // и подключить их сюда нельзя — этот путь умеет только sb6.
+            // Молча привязаться и упасть потом, при первом forward, было
+            // бы хуже, чем честно назвать ключ ненайденным.
             guard let world = RwkvqNaming.worldKey(forX070: key),
-                  sidecar.contains(world) else {
+                  let info = sidecar.tensors[world], info.isSb6 else {
                 missing.append(key)
                 continue
             }
@@ -114,7 +118,6 @@ extension X070Backbone {
             // подсунутый сайдкар от другой геометрии иначе проявился бы
             // мусором на выходе, а не ошибкой.
             if let dense = w[key] {
-                let info = sidecar.tensors[world]!
                 guard dense.shape == info.shape else {
                     missing.append(key)
                     continue

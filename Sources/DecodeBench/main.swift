@@ -82,6 +82,7 @@ struct Args {
     var gap = 0
     var fuseParity = false
     var noFuseLerp = false
+    var manifest = false
     var nativeRef = "~/Develop/SwiftRWKV/.testdata/mlx_affine_ref.safetensors"
 }
 
@@ -109,6 +110,7 @@ func parseArgs() -> Args {
         case "--gap": a.gap = Int(it.next() ?? "") ?? a.gap
         case "--fuse-parity": a.fuseParity = true
         case "--no-fuse-lerp": a.noFuseLerp = true
+        case "--manifest": a.manifest = true
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -467,6 +469,24 @@ guard fm.fileExists(atPath: expand(args.model)) else {
 }
 guard fm.fileExists(atPath: expand(args.sidecar) + ".safetensors") else {
     print("нет сайдкара: \(args.sidecar).safetensors"); exit(2)
+}
+
+if args.manifest {
+    let sc = try RwkvqSidecar(path: expand(args.sidecar))
+    var byKind: [String: (n: Int, dims: Set<Int>)] = [:]
+    for (_, i) in sc.tensors {
+        var e = byKind[i.kind.rawValue] ?? (0, [])
+        e.n += 1
+        e.dims.insert(i.shape.count)
+        byKind[i.kind.rawValue] = e
+    }
+    print("манифест: \(sc.tensors.count) записей, "
+          + "буферов \(String(format: "%.1f", Double(sc.packedBytes) / 1e6)) МБ")
+    for (k, v) in byKind.sorted(by: { $0.key < $1.key }) {
+        print("  \(k): \(v.n), рангов формы \(v.dims.sorted())")
+    }
+    print("разобран без ошибок — записи не-sb6 больше не роняют загрузку")
+    exit(0)
 }
 
 if args.checkNative {

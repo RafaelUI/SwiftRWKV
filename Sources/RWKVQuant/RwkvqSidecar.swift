@@ -25,6 +25,7 @@ public enum RwkvqError: Error, CustomStringConvertible {
     case malformedManifest(String)
     case missingBuffer(tensor: String, buffer: String)
     case shapeMismatch(tensor: String, expected: [Int], got: [Int])
+    case unsupportedKind(tensor: String, kind: String)
 
     public var description: String {
         switch self {
@@ -36,18 +37,40 @@ public enum RwkvqError: Error, CustomStringConvertible {
             return "в сайдкаре нет буфера \(b) для тензора \(t)"
         case .shapeMismatch(let t, let e, let g):
             return "\(t): ожидалась форма \(e), в сайдкаре \(g)"
+        case .unsupportedKind(let t, let k):
+            return "\(t): раскладка \(k) здесь не разворачивается "
+                 + "(считается только sb6)"
         }
     }
 }
 
-/// Метаданные одного квантованного тензора.
+/// Раскладка тензора. Манифест полного экспорта содержит все четыре;
+/// разворачивать здесь мы умеем только `sb6`, но ОТВЕРГАТЬ файл из-за
+/// присутствия остальных нельзя — они там законно.
+public enum RwkvqKind: String, Sendable {
+    case sb6        // блочная квантизация, единственная, что здесь считается
+    case asym       // low-rank LoRA, fp32 scale/min на блок
+    case rtn        // per-row, коды int8 либо нибблы
+    case dense      // bf16 как есть: нормы, token-shift миксы, bias-термы
+}
+
+/// Метаданные одного тензора манифеста.
+///
+/// Поля `xbits`/`groupSize`/`superBlock` осмысленны только у `sb6`; у
+/// остальных раскладок они нулевые, и трогать их незачем. Форма тоже
+/// не обязана быть двумерной: в полном экспорте есть одномерные нормы
+/// и `(1,1,C)` token-shift миксы.
 public struct RwkvqTensorInfo: Sendable {
-    public let shape: [Int]        // [OUT, IN]
+    public let kind: RwkvqKind
+    public let shape: [Int]
     public let bits: Int
     public let xbits: Int
     public let groupSize: Int      // gw_gs
     public let superBlock: Int     // gw_sb
 
+    public var isSb6: Bool { kind == .sb6 }
+    /// Только для двумерных. У одномерных записей полного экспорта
+    /// обращение к ним — ошибка вызывающего, а не данных.
     public var outFeatures: Int { shape[0] }
     public var inFeatures: Int { shape[1] }
 }
@@ -87,18 +110,44 @@ public final class RwkvqSidecar {
         self.headSize = root["head_size"] as? Int ?? 64
         self.vocabSize = root["vocab_size"] as? Int ?? 0
 
+        // Разбор ПО РАСКЛАДКАМ. Прежняя версия требовала от КАЖДОЙ записи
+        // двумерную форму и поля xbits/gw_gs/gw_sb — то есть предполагала,
+        // что в манифесте бывает только sb6. Это было верно для первых
+        // сайдкаров и перестало быть верным, как только экспорт стал
+        // полным: одномерные нормы и (1,1,C) token-shift миксы роняли
+        // загрузку целиком, ещё до всякого обращения к весам.
         var infos: [String: RwkvqTensorInfo] = [:]
         for (key, value) in tensorDict {
             guard let d = value as? [String: Any],
-                  let shape = d["shape"] as? [Int], shape.count == 2,
-                  let bits = d["bits"] as? Int,
-                  let xbits = d["xbits"] as? Int,
-                  let gs = d["gw_gs"] as? Int,
-                  let sb = d["gw_sb"] as? Int else {
-                throw RwkvqError.malformedManifest("некорректная запись для \(key)")
+                  let shape = d["shape"] as? [Int] else {
+                throw RwkvqError.malformedManifest("нет формы у \(key)")
             }
-            infos[key] = RwkvqTensorInfo(shape: shape, bits: bits, xbits: xbits,
-                                         groupSize: gs, superBlock: sb)
+            // манифесты первых сайдкаров поля kind не имели вовсе и
+            // содержали только sb6 — отсюда умолчание
+            let raw = d["kind"] as? String ?? "sb6"
+            guard let kind = RwkvqKind(rawValue: raw) else {
+                throw RwkvqError.malformedManifest(
+                    "неизвестная раскладка \(raw) у \(key)")
+            }
+            if kind == .sb6 {
+                guard shape.count == 2,
+                      let bits = d["bits"] as? Int,
+                      let xbits = d["xbits"] as? Int,
+                      let gs = d["gw_gs"] as? Int,
+                      let sb = d["gw_sb"] as? Int else {
+                    throw RwkvqError.malformedManifest(
+                        "неполная sb6-запись для \(key)")
+                }
+                infos[key] = RwkvqTensorInfo(kind: kind, shape: shape, bits: bits,
+                                             xbits: xbits, groupSize: gs,
+                                             superBlock: sb)
+            } else {
+                infos[key] = RwkvqTensorInfo(
+                    kind: kind, shape: shape,
+                    bits: d["bits"] as? Int ?? 16, xbits: 0,
+                    groupSize: d["gw_gs"] as? Int ?? 0,
+                    superBlock: d["gw_sb"] as? Int ?? 0)
+            }
         }
         self.tensors = infos
     }
@@ -119,6 +168,12 @@ public final class RwkvqSidecar {
     public func dequantize(_ key: String, dtype: DType = .float32) throws -> MLXArray {
         guard let info = tensors[key] else {
             throw RwkvqError.missingBuffer(tensor: key, buffer: "manifest")
+        }
+        guard info.isSb6 else {
+            // Не «не нашли буфер», а «эта раскладка здесь не считается»:
+            // asym/rtn/dense в файле есть законно, просто разворачивать
+            // их умеет rwkv-quant, а не этот модуль.
+            throw RwkvqError.unsupportedKind(tensor: key, kind: info.kind.rawValue)
         }
         guard let qblk = arrays["\(key)::qblk"] else {
             throw RwkvqError.missingBuffer(tensor: key, buffer: "qblk")

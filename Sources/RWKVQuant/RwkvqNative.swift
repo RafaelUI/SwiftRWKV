@@ -69,6 +69,9 @@ extension RwkvqSidecar {
         guard let info = tensors[key] else {
             throw RwkvqError.missingBuffer(tensor: key, buffer: "manifest")
         }
+        guard info.isSb6 else {
+            throw RwkvqError.unsupportedKind(tensor: key, kind: info.kind.rawValue)
+        }
         guard let qblk = arrays["\(key)::qblk"],
               let qsqm = arrays["\(key)::qsqm"],
               let ddm = arrays["\(key)::ddm"] else {
