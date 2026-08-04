@@ -44,6 +44,9 @@ let package = Package(
         .library(name: "RWKVRerank", targets: ["RWKVRerank"]),
         // Прогон реранкера: данные → кэш состояний → обучение головы → отчёт.
         .executable(name: "rerank-run", targets: ["RerankRun"]),
+        // Замер декодирования: плотная база против .rwkvq, чередованием.
+        //   swift run -c release decode-bench
+        .executable(name: "decode-bench", targets: ["DecodeBench"]),
     ],
     dependencies: [
         .package(
@@ -122,6 +125,17 @@ let package = Package(
         .executableTarget(
             name: "RerankRun",
             dependencies: ["RWKVRerank", "RWKVGen",
+                           .product(name: "MLX", package: "mlx-swift")]
+        ),
+        // Замер декодирования. Исполняемая цель, а не тест, по двум
+        // причинам. Тест обязан быть быстрым и воспроизводимым, а здесь
+        // минуты прогона на реальной модели. И главное: `swift test`
+        // собирает в debug, а замер производительности в debug — это
+        // замер отладочной сборки, не кода. Здесь запуск возможен только
+        // как `swift run -c release decode-bench`.
+        .executableTarget(
+            name: "DecodeBench",
+            dependencies: ["RWKVGen", "RWKVQuant",
                            .product(name: "MLX", package: "mlx-swift")]
         ),
         .testTarget(
