@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXRandom
 import RWKVGen
 import RWKVQuant
 
@@ -68,6 +69,7 @@ struct Args {
     /// замер должен показывать скорость модели, а не цену забытого
     /// флага. Отключается явно, чтобы обе ветки были сравнимы.
     var castWKV = true
+    var micro = false
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -87,6 +89,7 @@ func parseArgs() -> Args {
         case "--only": a.only = it.next() ?? a.only
         case "--vocab": a.vocab = it.next() ?? a.vocab
         case "--no-cast-wkv": a.castWKV = false
+        case "--micro": a.micro = true
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -179,6 +182,78 @@ func fallbackIds(_ n: Int, vocab: Int) -> [Int] {
     }
 }
 
+// ── Микрозамер одной проекции ───────────────────────────────────────────
+//
+// Отвечает ровно на один вопрос: даст ли переход на родной
+// `quantizedMM` то, что обещает арифметика трафика. Прежде чем писать
+// репак sb6 в контейнер MLX (а это выверенная битовая работа), надо
+// знать, что выигрыш есть.
+//
+// Три варианта на форму, чередованием:
+//   deq+mm   — что делает `baseProj` сейчас: развернуть и умножить
+//   dense    — плотный bf16, верхняя граница по скорости сегодня
+//   native   — `quantizedMM` по нативно упакованному весу
+//
+// ВАЖНО про native: вес для него получен `quantized(dense)`, то есть
+// ЧИСЛА в нём пересчитаны по min/max блока и НЕ соответствуют нашей
+// калибровке. Для скорости это неважно — раскладка, размеры и ядро те
+// же самые, — но использовать этот путь как рабочий нельзя, и мерить
+// им качество нельзя тем более. Это проба механизма, а не реализация.
+func micro(sidecar: RwkvqSidecar, rounds: Int, iters: Int) {
+    print("\n── микрозамер проекций (вектор [1, IN], \(rounds)x\(iters)) ──")
+    print("native: числа пересчитаны quantized(dense) — проба СКОРОСТИ, не путь")
+
+    // по одному представителю на форму, крупные первыми
+    var seen = Set<[Int]>()
+    var keys: [String] = []
+    for k in sidecar.keys.sorted() {
+        let sh = sidecar.tensors[k]!.shape
+        if seen.insert(sh).inserted { keys.append(k) }
+    }
+    keys.sort { (sidecar.tensors[$0]!.shape.reduce(1, *))
+                > (sidecar.tensors[$1]!.shape.reduce(1, *)) }
+
+    // без String(format:) с %s: он ждёт C-строку, а Swift-строка туда
+    // приводится мусорным указателем — падение с SIGSEGV, не ошибка формата
+    func pad(_ s: String, _ n: Int) -> String {
+        s.count >= n ? s : s + String(repeating: " ", count: n - s.count)
+    }
+    print(pad("форма", 16) + pad("deq+mm", 10) + pad("dense", 10)
+          + pad("native", 10) + "native даёт")
+    for key in keys.prefix(5) {
+        let info = sidecar.tensors[key]!
+        let (OUT, IN) = (info.outFeatures, info.inFeatures)
+        guard let w = try? sidecar.dequantize(key, dtype: .bfloat16) else { continue }
+        eval(w)
+        // MLX. обязательно: на верхнем уровне main.swift лежит глобальная
+        // `quantized` (модель), и она перекрывает функцию MLX
+        let (wq, sc, bi) = MLX.quantized(w, groupSize: 32, bits: 6)
+        eval(wq, sc)
+        let x = MLXRandom.normal([1, IN]).asType(.bfloat16)
+        eval(x)
+
+        func time(_ body: () -> MLXArray) -> Double {
+            _ = body(); eval(body())                      // прогрев формы
+            let t0 = Date()
+            for _ in 0 ..< iters { eval(body()) }
+            return Date().timeIntervalSince(t0) * 1e3 / Double(iters)
+        }
+
+        var a: [Double] = [], b: [Double] = [], c: [Double] = []
+        for _ in 0 ..< rounds {
+            a.append(time { matmul(x, (try! sidecar.dequantize(key, dtype: .bfloat16))
+                                    .transposed()) })
+            b.append(time { matmul(x, w.transposed()) })
+            c.append(time { quantizedMM(x, wq, scales: sc, biases: bi,
+                                        transpose: true, groupSize: 32, bits: 6) })
+        }
+        let (ma, mb, mc) = (median(a), median(b), median(c))
+        func f(_ v: Double) -> String { String(format: "%9.3f ", v) }
+        print(pad("\(OUT)x\(IN)", 16) + f(ma) + f(mb) + f(mc)
+              + String(format: "  %.2fx к deq+mm, %.2fx к dense", ma / mc, mb / mc))
+    }
+}
+
 // ── Прогон ──────────────────────────────────────────────────────────────
 
 let args = parseArgs()
@@ -188,6 +263,13 @@ guard fm.fileExists(atPath: expand(args.model)) else {
 }
 guard fm.fileExists(atPath: expand(args.sidecar) + ".safetensors") else {
     print("нет сайдкара: \(args.sidecar).safetensors"); exit(2)
+}
+
+if args.micro {
+    // модель не нужна: меряются отдельные проекции по сайдкару
+    micro(sidecar: try RwkvqSidecar(path: expand(args.sidecar)),
+          rounds: args.rounds, iters: 20)
+    exit(0)
 }
 
 print("── модель ──")
