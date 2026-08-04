@@ -61,6 +61,13 @@ struct Args {
     var quantizeCmix = true
     var only = "both"          // both | dense | rwkvq
     var vocab = "~/Develop/SwiftRWKV/.testdata/rwkv_vocab_v20230424.txt"
+    /// Приведение типа выхода WKV. По умолчанию в модели ВЫКЛЮЧЕНО, а
+    /// стоит оно ×2.8 на декоде (docs/Inference.md: 5.58 мс/ток против
+    /// 15.74 на 0.1B): без него fp32 из WKV течёт в остаточный поток и
+    /// удваивает трафик всего, что ниже. Здесь по умолчанию ВКЛЮЧЕНО —
+    /// замер должен показывать скорость модели, а не цену забытого
+    /// флага. Отключается явно, чтобы обе ветки были сравнимы.
+    var castWKV = true
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -79,6 +86,7 @@ func parseArgs() -> Args {
         case "--no-cmix": a.quantizeCmix = false
         case "--only": a.only = it.next() ?? a.only
         case "--vocab": a.vocab = it.next() ?? a.vocab
+        case "--no-cast-wkv": a.castWKV = false
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -199,6 +207,10 @@ let wantQuant = args.only != "dense"
 
 var dense: X070Backbone? = wantDense ? X070Backbone(weights: weights, cfg: cfg) : nil
 var quantized: X070Backbone? = wantQuant ? X070Backbone(weights: weights, cfg: cfg) : nil
+dense?.castWKVOutputToComputeDType = args.castWKV
+quantized?.castWKVOutputToComputeDType = args.castWKV
+print("castWKVOutputToComputeDType = \(args.castWKV)"
+      + (args.castWKV ? "" : "  (в модели это умолчание, но оно стоит ×2.8)"))
 
 if let q = quantized {
     let sidecar = try RwkvqSidecar(path: expand(args.sidecar))
