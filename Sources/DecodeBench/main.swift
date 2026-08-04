@@ -73,6 +73,13 @@ struct Args {
     var checkNative = false
     var native = false
     var profile = false
+    /// Пауза до и после измеряемых раундов, мс.
+    ///
+    /// Для трейса через Instruments: измеряемое окно иначе неотличимо
+    /// от прогрева и загрузки, а в GPU-таймлайне оно становится
+    /// очевидным между двумя провалами в ноль. На сам замер не влияет —
+    /// пауза снаружи засекаемого участка.
+    var gap = 0
     var nativeRef = "~/Develop/SwiftRWKV/.testdata/mlx_affine_ref.safetensors"
 }
 
@@ -97,6 +104,7 @@ func parseArgs() -> Args {
         case "--check-native": a.checkNative = true
         case "--native": a.native = true
         case "--profile": a.profile = true
+        case "--gap": a.gap = Int(it.next() ?? "") ?? a.gap
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -484,6 +492,12 @@ if let q = quantized { _ = decode(q, cfg: cfg, ids: warm) }
 var lastDenseLogits: MLXArray? = nil
 var lastQuantLogits: MLXArray? = nil
 
+if args.gap > 0 {
+    print("пауза \(args.gap) мс перед измеряемым окном (маркер для трейса)")
+    fflush(stdout)
+    Thread.sleep(forTimeInterval: Double(args.gap) / 1000)
+}
+
 print("\n── чередование: \(args.rounds) раундов по \(args.steps) шагов ──")
 var msDense: [Double] = []
 var msQuant: [Double] = []
@@ -508,6 +522,12 @@ for r in 0 ..< args.rounds {
                        msQuant[r], 1e3 / msQuant[r])
     }
     print(line)
+}
+
+if args.gap > 0 {
+    print("пауза \(args.gap) мс после измеряемого окна")
+    fflush(stdout)
+    Thread.sleep(forTimeInterval: Double(args.gap) / 1000)
 }
 
 if args.profile, let q = quantized {
