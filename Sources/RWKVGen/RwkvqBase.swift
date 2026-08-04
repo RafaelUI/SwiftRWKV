@@ -40,13 +40,24 @@ extension X070Backbone {
         /// Выбрасывать ли плотную bf16-копию после подключения. Ради этого
         /// всё и затевается: если её оставить, база займёт и то, и другое.
         public var dropDenseWeights: Bool
+        /// Переложить sb6 в родной контейнер MLX и считать через
+        /// `quantizedMM` вместо «развернуть матрицу и умножить».
+        ///
+        /// Числа от этого не меняются (см. RwkvqNative.swift), меняется
+        /// трафик: нынешний путь читает сжатое, ПИШЕТ плотный транзиент
+        /// и читает его обратно. На 2.9B это 13.6 ГБ на токен против
+        /// 5.9 у плотного bf16 — отсюда и 2.21x проигрыша.
+        /// Перекладка одноразовая, при подключении.
+        public var useNativeKernel: Bool
 
         public init(tmixTargets: [String] = ["r_proj", "k_proj", "v_proj", "o_proj"],
                     quantizeCmix: Bool = true,
                     quantizeHead: Bool = true,
                     quantizeEmbedding: Bool = false,
                     layers: Range<Int>? = nil,
-                    dropDenseWeights: Bool = true) {
+                    dropDenseWeights: Bool = true,
+                    useNativeKernel: Bool = false) {
+            self.useNativeKernel = useNativeKernel
             self.tmixTargets = tmixTargets
             self.quantizeCmix = quantizeCmix
             self.quantizeHead = quantizeHead
@@ -111,9 +122,25 @@ extension X070Backbone {
                 freed += dense.size * dense.dtype.size
             }
             rwkvqKeys[key] = world
+            if options.useNativeKernel,
+               let native = try? sidecar.nativeAffine(world) {
+                rwkvqNative[key] = native
+            }
             if options.dropDenseWeights { w[key] = nil }
         }
-        rwkvqSidecar = sidecar
+
+        // Сайдкар удерживается ТОЛЬКО если он ещё нужен. С родным
+        // контейнером исходные буферы K3 не читает уже никто, но ссылка
+        // на них держала бы память: замерено — 6.97 ГБ против 3.11 на
+        // 2.9B, то есть выигрыш формата съедался целиком тем, что обе
+        // раскладки лежат рядом. Условие строгое: хотя бы один ключ без
+        // родной перекладки — и сайдкар остаётся, иначе `baseProj`
+        // упадёт на ключе, для которого нет ни плотного веса, ни
+        // native, ни сайдкара.
+        let fullyNative = options.useNativeKernel
+            && !rwkvqKeys.isEmpty
+            && rwkvqKeys.keys.allSatisfy { rwkvqNative[$0] != nil }
+        rwkvqSidecar = fullyNative ? nil : sidecar
 
         return RwkvqAttachInfo(attached: rwkvqKeys.count, missing: missing,
                                freedDenseBytes: freed,

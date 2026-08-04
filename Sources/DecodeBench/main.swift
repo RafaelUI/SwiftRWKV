@@ -70,6 +70,9 @@ struct Args {
     /// флага. Отключается явно, чтобы обе ветки были сравнимы.
     var castWKV = true
     var micro = false
+    var checkNative = false
+    var native = false
+    var nativeRef = "~/Develop/SwiftRWKV/.testdata/mlx_affine_ref.safetensors"
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -90,6 +93,8 @@ func parseArgs() -> Args {
         case "--vocab": a.vocab = it.next() ?? a.vocab
         case "--no-cast-wkv": a.castWKV = false
         case "--micro": a.micro = true
+        case "--check-native": a.checkNative = true
+        case "--native": a.native = true
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -254,6 +259,76 @@ func micro(sidecar: RwkvqSidecar, rounds: Int, iters: Int) {
     }
 }
 
+/// Сверка перекладки в родной контейнер с питоновским эталоном.
+///
+/// Эталон снят с КАНОНИЧЕСКОЙ дисковой раскладки (.rwkvq), а здесь
+/// перекладка идёт из K3-интерлива сайдкара. Это два разных источника
+/// одних и тех же чисел, поэтому совпадение бит-в-бит — содержательное
+/// утверждение, а не тавтология.
+func checkNative(sidecar: RwkvqSidecar, refPath: String) -> Int {
+    print("── сверка nativeAffine с эталоном ──")
+    guard let ref = try? loadArrays(url: URL(fileURLWithPath: expand(refPath))) else {
+        print("нет эталона \(refPath) — соберите его:")
+        print("  python rwkv-quant/tests/test_mlx_affine_repack.py "
+              + "<model.rwkvq> --dump \(refPath)")
+        return 2
+    }
+    let keys = Set(ref.keys.compactMap { k -> String? in
+        guard let r = k.range(of: "::wq", options: .backwards) else { return nil }
+        return String(k[k.startIndex ..< r.lowerBound])
+    }).sorted()
+
+    var bad = 0
+    for key in keys {
+        guard sidecar.contains(key), let nat = try? sidecar.nativeAffine(key) else {
+            print("  !! \(key): нет в сайдкаре"); bad += 1; continue
+        }
+        let rows = ref["\(key)::wq"]!.shape[0]
+        func same(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            guard a.shape == b.shape else { return false }
+            let eq = (a .== b).all()
+            eval(eq)
+            return eq.item(Bool.self)
+        }
+        let okW = same(nat.wq[0 ..< rows], ref["\(key)::wq"]!)
+        let okS = same(nat.scales[0 ..< rows], ref["\(key)::scales"]!)
+        let okB = same(nat.biases[0 ..< rows], ref["\(key)::biases"]!)
+        let okBits = nat.bits == ref["\(key)::bits"]!.item(Int32.self)
+
+        // и главное: то, что из этого прочитает само ядро, против
+        // плотного эталона
+        let dense = ref["\(key)::dense"]!.asType(.float32)
+        let got = dequantized(nat.wq[0 ..< rows], scales: nat.scales[0 ..< rows],
+                              biases: nat.biases[0 ..< rows],
+                              groupSize: 32, bits: nat.bits).asType(.float32)
+        // Допуск — ulp BF16, а не fp16: эталон в фикстуре хранится в
+        // bf16 (в нём же считает и модель), а bf16 несёт 8 бит мантиссы,
+        // то есть на весах порядка 0.05 шаг сетки уже 2e-4. Первая
+        // версия сверяла с порогом 6.3e-7 и показывала расхождение
+        // 2.4e-4 на ВСЕХ тензорах при бит-в-бит совпавших wq/scales/
+        // biases — то есть ловила формат хранения эталона, а не ошибку.
+        // Плюс абсолютный пол на вырожденные блоки (scale=0 против
+        // 1e-8, см. RwkvqNative.swift).
+        let tol = maximum(abs(dense) * Float(pow(2.0, -8.0)), 6.3e-7)
+        let over = (abs(got - dense) - tol).max()
+        eval(over)
+        let maxd = abs(got - dense).max()
+        eval(maxd)
+        let okV = over.item(Float.self) <= 0
+
+        let ok = okW && okS && okB && okBits && okV
+        if !ok { bad += 1 }
+        print("  \(ok ? "ok  " : "FAIL") \(key) bits=\(nat.bits) "
+              + "[\(nat.outFeatures)x\(nat.inFeatures)]"
+              + (ok ? "  max|Δ| \(String(format: "%.2e", maxd.item(Float.self)))"
+                    : "  wq/scales/biases/bits/значения = "
+                      + "\(okW)/\(okS)/\(okB)/\(okBits)/\(okV), "
+                      + "max|Δ| \(maxd.item(Float.self))"))
+    }
+    print(bad == 0 ? "\nСВЕРКА ПРОЙДЕНА" : "\nСВЕРКА ПРОВАЛЕНА: \(bad)")
+    return bad == 0 ? 0 : 1
+}
+
 // ── Прогон ──────────────────────────────────────────────────────────────
 
 let args = parseArgs()
@@ -263,6 +338,11 @@ guard fm.fileExists(atPath: expand(args.model)) else {
 }
 guard fm.fileExists(atPath: expand(args.sidecar) + ".safetensors") else {
     print("нет сайдкара: \(args.sidecar).safetensors"); exit(2)
+}
+
+if args.checkNative {
+    exit(Int32(checkNative(sidecar: try RwkvqSidecar(path: expand(args.sidecar)),
+                           refPath: args.nativeRef)))
 }
 
 if args.micro {
@@ -299,7 +379,8 @@ if let q = quantized {
     let info = q.attachRwkvq(
         sidecar,
         options: X070Backbone.RwkvqAttachOptions(quantizeCmix: args.quantizeCmix,
-                                                 quantizeHead: args.quantizeHead))
+                                                 quantizeHead: args.quantizeHead,
+                                                 useNativeKernel: args.native))
     print("сайдкар: подключено \(info.attached) весов, "
           + "не найдено \(info.missing.count), "
           + "сжатых буферов \(String(format: "%.1f", Double(info.packedBytes) / 1e6)) МБ, "
@@ -381,4 +462,16 @@ if !msDense.isEmpty && !msQuant.isEmpty {
                      rel.item(Float.self), agree, top1Dense.count))
     }
 }
-print("footprint в конце \(String(format: "%.2f", processFootprintGB())) ГБ")
+// clearCache обязателен перед замером памяти: MLX не возвращает
+// освобождённые буферы системе, а держит их в своём пуле, и
+// phys_footprint их видит. Без этого «освободили сайдкар» и «не
+// освободили» дают одинаковые 6.9 ГБ.
+let footBefore = processFootprintGB()
+MLX.GPU.clearCache()
+print(String(format: "footprint в конце %.2f ГБ (до clearCache %.2f)",
+             processFootprintGB(), footBefore))
+if let q = quantized, !q.rwkvqNative.isEmpty {
+    let bytes = q.rwkvqNative.values.reduce(0) { $0 + $1.bytes }
+    print(String(format: "родной контейнер: %d весов, %.1f МБ",
+                 q.rwkvqNative.count, Double(bytes) / 1e6))
+}

@@ -129,6 +129,16 @@ public final class X070Backbone {
     var rwkvqSidecar: RwkvqSidecar? = nil
     var rwkvqKeys: [String: String] = [:]     // x070-имя → world-имя в сайдкаре
 
+    /// Тот же `.rwkvq`, переложенный в родной контейнер MLX.
+    ///
+    /// Отличие от `rwkvqSidecar` не в числах — они те же до последнего
+    /// разряда (см. RwkvqNative.swift) — а в том, что плотная матрица не
+    /// материализуется вовсе: `quantizedMM` читает сжатое и считает.
+    /// Путь через `sc.dequantize` пишет и перечитывает плотный
+    /// транзиент, отчего на 2.9B и выходит 2.21x против bf16.
+    /// Заполняется по `RwkvqAttachOptions.useNativeKernel`.
+    public internal(set) var rwkvqNative: [String: RwkvqNativeWeight] = [:]
+
     // GroupNorm с pytorch_compatible-семантикой (eps=64e-5). Применяется
     // per-token к [N, D] (каждый токен нормализуется независимо по головам).
     private let groupNorm: GroupNorm
@@ -197,6 +207,11 @@ public final class X070Backbone {
         if let q = quant[wKey] {
             return quantizedMM(x, q.wq, scales: q.scales, biases: q.biases,
                                transpose: true, groupSize: q.groupSize, bits: q.bits)
+        }
+        // родной контейнер раньше сайдкарного: числа те же, но без
+        // плотного транзиента
+        if let n = rwkvqNative[wKey] {
+            return n(x.asType(.float16)).asType(x.dtype)
         }
         if let dense = rwkvqWeight(wKey, x.dtype) {
             return matmul(x, dense.transposed())
