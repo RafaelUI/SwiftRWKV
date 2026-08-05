@@ -275,9 +275,21 @@ extension X070Backbone {
     /// тест форм. Раньше их было четыре, и они друг друга ПОДМЕНЯЛИ — ни одна
     /// мутация не ловилась, потому что оставшиеся три чинили результат.
     public func step(_ id: Int, state: inout RWKVState) -> MLXArray {
+        step(MLXArray([Int32(id)]), state: &state)
+    }
+
+    /// Тот же шаг, но токен приходит МАССИВОМ, а не числом.
+    ///
+    /// Разница не косметическая. `step(Int)` вынуждает вызывающего
+    /// достать выбранный токен в CPU — то есть синхронизировать
+    /// конвейер на каждом шаге. По трейсу это ~2 мс зазора CPU↔GPU, по
+    /// прямому замеру 2.75 мс/ток на 2.9B из 32.26. С этой перегрузкой
+    /// цикл генерации может держать токен на GPU и читать его назад
+    /// реже, чем считает.
+    public func step(_ id: MLXArray, state: inout RWKVState) -> MLXArray {
         let D = cfg.nEmbd
         // Через общий путь: таблица может быть квантованной.
-        let emb = embedForBlock(MLXArray([Int32(id)])).reshaped([1, D])
+        let emb = embedForBlock(id).reshaped([1, D])
         var x = layerNorm_(emb, gg("ln0.weight"), gg("ln0.bias"))
         for layer in 0 ..< cfg.nLayer {
             let h = tmixStep(layerNorm_(x, gg("blocks.\(layer).ln1.weight"),

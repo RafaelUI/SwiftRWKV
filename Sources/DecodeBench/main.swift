@@ -178,6 +178,39 @@ func decode(_ model: X070Backbone, cfg: X070Config,
     return (dt, picked, last)
 }
 
+/// Жадный декод БЕЗ чтения токена в CPU на каждом шаге.
+///
+/// Выбранный токен остаётся `MLXArray` и уходит в следующий шаг как
+/// есть; в CPU он забирается раз в `readEvery` шагов. Это и есть
+/// конвейеризация: пока CPU разбирает пачку токенов, GPU уже считает
+/// следующие. Синхронизация состояния (`state.eval()`) остаётся --
+/// без неё MLX копил бы граф на всю длину генерации.
+///
+/// Считается ЖАДНО, а не teacher-forced: смысл именно в том, что вход
+/// следующего шага берётся из выхода предыдущего, не покидая GPU. Для
+/// замера времени это неважно (веса читаются те же), а иначе цепочка
+/// зависимостей была бы другой, чем в настоящей генерации.
+func decodePipelined(_ model: X070Backbone, cfg: X070Config,
+                     first: Int, steps: Int, readEvery: Int) -> (Double, [Int]) {
+    var state = RWKVState(cfg: cfg)
+    var id = MLXArray([Int32(first)])
+    var pending: [MLXArray] = []
+    var picked: [Int] = []
+    let t0 = Date()
+    for i in 0 ..< steps {
+        let logits = model.step(id, state: &state)
+        id = argMax(logits, axis: -1).reshaped([1])
+        state.eval()
+        pending.append(id)
+        if pending.count == readEvery || i == steps - 1 {
+            eval(pending)
+            picked.append(contentsOf: pending.map { $0.item(Int.self) })
+            pending.removeAll(keepingCapacity: true)
+        }
+    }
+    return (Date().timeIntervalSince(t0), picked)
+}
+
 /// Вход для замера и сверки.
 ///
 /// На ВРЕМЯ шага значения токенов не влияют вовсе — читаются те же веса.
@@ -396,15 +429,34 @@ func profileStep(_ model: X070Backbone, cfg: X070Config, ids: [Int],
     if let h = nat["head.weight"] { chain.append(h) }
     print("проекций в цепочке: \(chain.count)")
 
-    // цена чтения токена обратно в CPU: тот же шаг без argMax/item()
+    // ЧЕРЕДОВАНИЕ ВАРИАНТОВ ВНУТРИ РАУНДА, а не блоками подряд.
+    //
+    // Первая версия мерила каждый вариант своим циклом: сначала все
+    // раунды «без readback», потом все «полный шаг». Между блоками
+    // машина успевала нагреться, и разница блоков приписывалась коду.
+    // Так родилась цифра «readback стоит 2.75 мс/ток (9%)», которая в
+    // следующем прогоне обернулась −0.17 мс. Это ровно закон 1 из
+    // rwkv-quant, и он про то же самое: сравнивать можно только
+    // чередованием в одном процессе.
     var noReadMs: [Double] = []
-    for _ in 0 ..< rounds {
-        let (t, _, _) = decode(model, cfg: cfg, ids: ids, readback: false)
-        noReadMs.append(t * 1e3 / Double(ids.count))
-    }
-
     var projMs: [Double] = []
+    var fullMs: [Double] = []
+    var pipeMs: [[Double]] = Array(repeating: [], count: 3)
+    let everies = [1, 4, 16]
+
     for _ in 0 ..< rounds {
+        let (tn, _, _) = decode(model, cfg: cfg, ids: ids, readback: false)
+        noReadMs.append(tn * 1e3 / Double(ids.count))
+
+        let (tf, _, _) = decode(model, cfg: cfg, ids: ids)
+        fullMs.append(tf * 1e3 / Double(ids.count))
+
+        for (i, every) in everies.enumerated() {
+            let (t, _) = decodePipelined(model, cfg: cfg, first: ids[0],
+                                         steps: ids.count, readEvery: every)
+            pipeMs[i].append(t * 1e3 / Double(ids.count))
+        }
+
         let t0 = Date()
         for _ in 0 ..< ids.count {
             // Накопление ОБЯЗАТЕЛЬНО. MLX ленив, и если результат
@@ -423,12 +475,6 @@ func profileStep(_ model: X070Backbone, cfg: X070Config, ids: [Int],
         projMs.append(Date().timeIntervalSince(t0) * 1e3 / Double(ids.count))
     }
 
-    var fullMs: [Double] = []
-    for _ in 0 ..< rounds {
-        let (t, _, _) = decode(model, cfg: cfg, ids: ids)
-        fullMs.append(t * 1e3 / Double(ids.count))
-    }
-
     let p = median(projMs), f = median(fullMs), nr = median(noReadMs)
     print(String(format: "только проекции   %6.2f мс/ток", p))
     print(String(format: "шаг без readback  %6.2f мс/ток", nr))
@@ -437,6 +483,15 @@ func profileStep(_ model: X070Backbone, cfg: X070Config, ids: [Int],
                  f - nr, 100 * (f - nr) / f))
     print(String(format: "  вне проекций    %6.2f мс/ток (%.0f%% шага)",
                  nr - p, 100 * (nr - p) / f))
+    print("\nконвейеризация readback (жадный декод, токен не уходит в CPU):")
+    for (i, every) in everies.enumerated() {
+        let m = median(pipeMs[i])
+        print(String(format: "  читать раз в %2d шагов  %6.2f мс/ток "
+                     + "(%.1f ток/с), к полному шагу %+.2f мс",
+                     every, m, 1e3 / m, m - f))
+    }
+    print(String(format: "  для сравнения: без readback вовсе %6.2f мс/ток "
+                 + "-- нижняя граница", nr))
 }
 
 /// Фьюз лерпов обязан быть тождественным: арифметика поэлементная, от
