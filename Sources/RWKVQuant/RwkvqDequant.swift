@@ -173,3 +173,49 @@ public func rwkvqDequantDense(qblk: MLXArray, qsqm: MLXArray, ddm: MLXArray,
                 outputShapes: [[OUT, IN]],
                 outputDTypes: [dtype])[0]
 }
+
+// ───────────────────────────────────────────────────────────────────────
+//  Деквантизация asym/rtn — обычными MLX-операциями, не fused-ядром.
+//
+//  Почему не Metal, как у sb6: это низкоранговые LoRA-матрицы модели
+//  (w1/w2/a1/a2/v1/v2/g1/g2, 2560×96..320) — на 2-3 порядка меньше
+//  sb6-проекций (2560×2560..10240). Разворачиваются ОДИН раз при сборке
+//  бэкбона из сайдкара (RwkvqSidecar.buildDenseWeights), не на каждом
+//  forward — цена одноразовая, писать под неё отдельный кернель незачем.
+// ───────────────────────────────────────────────────────────────────────
+
+/// gw-asym (LoRA @6, gw64): codes[OUT,IN] unsigned-контейнер, scale/min
+/// [OUT, NB] fp32 на блок ширины `groupSize`. Порт reader.py::_dequantize_gw_asym.
+public func rwkvqDequantAsym(codes: MLXArray, scale: MLXArray, min: MLXArray,
+                             groupSize gs: Int, dtype: DType = .float32) -> MLXArray {
+    let inFeatures = codes.shape[1]
+    let nb = inFeatures / gs
+    var idx = [Int32](); idx.reserveCapacity(inFeatures)
+    for b in 0 ..< nb { idx.append(contentsOf: repeatElement(Int32(b), count: gs)) }
+    let idxArr = MLXArray(idx)
+    let scaleC = scale.asType(.float32).take(idxArr, axis: 1)   // [OUT, IN]
+    let minC = min.asType(.float32).take(idxArr, axis: 1)
+    let w = codes.asType(.float32) * scaleC + minC
+    return w.asType(dtype)
+}
+
+/// per-row RTN: codes[OUT,IN] int8 (уже распакован, если источник был
+/// нибблами), scale[OUT,1] fp16 -- один множитель на строку.
+/// Порт reader.py::_dequantize_one (без SpQR-ветки -- см. вызывающий код:
+/// текущие пресеты outlier_fracs не используют).
+public func rwkvqDequantRTN(codes: MLXArray, scale: MLXArray,
+                            dtype: DType = .float32) -> MLXArray {
+    let w = codes.asType(.float32) * scale.asType(.float32)
+    return w.asType(dtype)
+}
+
+/// uint8 [rows, ceil(cols/2)] -> int8 [rows, cols], BIASED SPLIT-раскладка
+/// (см. schema.py: низкий ниббл байта i = колонка i, высокий = колонка
+/// i + ceil(cols/2), код хранится как code+8 без знака).
+/// Порт schema.py::unpack_int4.
+public func rwkvqUnpackInt4(_ packed: MLXArray, columns nCols: Int) -> MLXArray {
+    let lo = (packed & MLXArray(UInt8(0x0F))).asType(.int32) - 8
+    let hi = (packed >> MLXArray(UInt8(4))).asType(.int32) - 8
+    let full = concatenated([lo, hi], axis: 1)     // split-раскладка
+    return full[0..., 0 ..< nCols].asType(.int8)
+}

@@ -12,12 +12,14 @@ import MLX
 //
 //      python -m rwkv_quant.formats.export_mlx model.rwkvq out/model.rwkvq_mlx
 //
-//  и даёт пару файлов: <path>.safetensors с буферами K3-интерлива
-//  (qblk/qsqm/ddm на каждый sb6-тензор) и <path>.json с манифестом.
+//  и даёт пару файлов: <path>.safetensors с буферами всех раскладок
+//  (sb6/asym/rtn/dense) и <path>.json с манифестом.
 //
-//  Экспортируются ТОЛЬКО sb6-тензоры. Низкоранговые w/a/v_lora остаются в
-//  fp по конвенции QLoRA-базы: их ранги не кратны размеру группы, а квант
-//  портит in-context динамику.
+//  С 04.08 экспорт ПОЛНЫЙ: манифест содержит КАЖДЫЙ тензор чекпоинта, не
+//  только sb6-проекции. `dequantize(_:)` разворачивает любую раскладку —
+//  этот файл САМОДОСТАТОЧЕН, второй (dense .pth/.safetensors) не нужен.
+//  См. `RwkvqSidecar.buildDenseWeights` в RWKVGen — сборка x070-словаря
+//  целиком из одного сайдкара (порт rwkv_metal/model/convert.py).
 // ───────────────────────────────────────────────────────────────────────
 
 public enum RwkvqError: Error, CustomStringConvertible {
@@ -38,15 +40,13 @@ public enum RwkvqError: Error, CustomStringConvertible {
         case .shapeMismatch(let t, let e, let g):
             return "\(t): ожидалась форма \(e), в сайдкаре \(g)"
         case .unsupportedKind(let t, let k):
-            return "\(t): раскладка \(k) здесь не разворачивается "
-                 + "(считается только sb6)"
+            return "\(t): \(k)"
         }
     }
 }
 
-/// Раскладка тензора. Манифест полного экспорта содержит все четыре;
-/// разворачивать здесь мы умеем только `sb6`, но ОТВЕРГАТЬ файл из-за
-/// присутствия остальных нельзя — они там законно.
+/// Раскладка тензора. Манифест полного экспорта содержит все четыре, и
+/// `dequantize(_:)` разворачивает любую из них.
 public enum RwkvqKind: String, Sendable {
     case sb6        // блочная квантизация, единственная, что здесь считается
     case asym       // low-rank LoRA, fp32 scale/min на блок
@@ -65,8 +65,10 @@ public struct RwkvqTensorInfo: Sendable {
     public let shape: [Int]
     public let bits: Int
     public let xbits: Int
-    public let groupSize: Int      // gw_gs
-    public let superBlock: Int     // gw_sb
+    public let groupSize: Int      // gw_gs (sb6: блок; asym: блок LoRA)
+    public let superBlock: Int     // gw_sb, только sb6
+    public let packed: Bool        // только rtn: коды нибблами (bits<=4)
+    public let outlierCount: Int   // только rtn: сколько SpQR-выбросов
 
     public var isSb6: Bool { kind == .sb6 }
     /// Только для двумерных. У одномерных записей полного экспорта
@@ -140,13 +142,16 @@ public final class RwkvqSidecar {
                 }
                 infos[key] = RwkvqTensorInfo(kind: kind, shape: shape, bits: bits,
                                              xbits: xbits, groupSize: gs,
-                                             superBlock: sb)
+                                             superBlock: sb, packed: false,
+                                             outlierCount: 0)
             } else {
                 infos[key] = RwkvqTensorInfo(
                     kind: kind, shape: shape,
                     bits: d["bits"] as? Int ?? 16, xbits: 0,
                     groupSize: d["gw_gs"] as? Int ?? 0,
-                    superBlock: d["gw_sb"] as? Int ?? 0)
+                    superBlock: d["gw_sb"] as? Int ?? 0,
+                    packed: d["packed"] as? Bool ?? false,
+                    outlierCount: d["outliers"] as? Int ?? 0)
             }
         }
         self.tensors = infos
@@ -156,11 +161,13 @@ public final class RwkvqSidecar {
 
     public func contains(_ key: String) -> Bool { tensors[key] != nil }
 
-    /// Восстановить плотный вес [OUT, IN].
+    /// Восстановить плотный вес — любая раскладка манифеста (sb6/asym/rtn/dense).
     ///
-    /// Результат ТРАНЗИЕНТНЫЙ и намеренно не кэшируется: смысл квантованной
-    /// базы в том, что она живёт в памяти сжатой. Кэш плотных весов молча
-    /// превращает QLoRA обратно в LoRA, только с лишними шагами.
+    /// Результат ТРАНЗИЕНТНЫЙ и намеренно не кэшируется для sb6/asym/rtn:
+    /// смысл квантованной базы в том, что она живёт в памяти сжатой. Кэш
+    /// плотных весов молча превращает QLoRA обратно в LoRA, только с лишними
+    /// шагами. Для `dense` кэшировать нечего — там и так лежит готовый
+    /// плотный тензор, эта ветка просто меняет тип хранения при надобности.
     ///
     /// `dtype` — тип хранения; арифметика деквантизации всегда float.
     /// Просить `.bfloat16` стоит там, где результат всё равно тут же уйдёт в
@@ -169,27 +176,69 @@ public final class RwkvqSidecar {
         guard let info = tensors[key] else {
             throw RwkvqError.missingBuffer(tensor: key, buffer: "manifest")
         }
-        guard info.isSb6 else {
-            // Не «не нашли буфер», а «эта раскладка здесь не считается»:
-            // asym/rtn/dense в файле есть законно, просто разворачивать
-            // их умеет rwkv-quant, а не этот модуль.
-            throw RwkvqError.unsupportedKind(tensor: key, kind: info.kind.rawValue)
+        switch info.kind {
+        case .dense:
+            guard let v = arrays["\(key)::dense"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "dense")
+            }
+            return v.asType(dtype)
+
+        case .sb6:
+            guard let qblk = arrays["\(key)::qblk"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "qblk")
+            }
+            guard let qsqm = arrays["\(key)::qsqm"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "qsqm")
+            }
+            guard let ddm = arrays["\(key)::ddm"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "ddm")
+            }
+            return rwkvqDequantDense(qblk: qblk, qsqm: qsqm, ddm: ddm,
+                                     outFeatures: info.outFeatures,
+                                     inFeatures: info.inFeatures,
+                                     superBlock: info.superBlock,
+                                     xbits: info.xbits,
+                                     dtype: dtype)
+
+        case .asym:
+            guard let codes = arrays["\(key)::codes"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "codes")
+            }
+            guard let scale = arrays["\(key)::gw_scale"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "gw_scale")
+            }
+            guard let mn = arrays["\(key)::gw_min"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "gw_min")
+            }
+            return rwkvqDequantAsym(codes: codes, scale: scale, min: mn,
+                                    groupSize: info.groupSize, dtype: dtype)
+
+        case .rtn:
+            let codes: MLXArray
+            if info.packed {
+                guard let packed = arrays["\(key)::codes_packed"] else {
+                    throw RwkvqError.missingBuffer(tensor: key, buffer: "codes_packed")
+                }
+                codes = rwkvqUnpackInt4(packed, columns: info.inFeatures)
+            } else {
+                guard let c = arrays["\(key)::codes"] else {
+                    throw RwkvqError.missingBuffer(tensor: key, buffer: "codes")
+                }
+                codes = c
+            }
+            guard let scale = arrays["\(key)::scale"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "scale")
+            }
+            // SpQR-выбросы: ни REDUCTION, ни COMPRESSION их не используют
+            // (outlier_fracs={} в обоих пресетах rwkv-quant/presets.py) --
+            // падаем явно, а не молча теряем точность на непротестированном
+            // пути, если когда-нибудь появится пресет, который их включает.
+            if info.outlierCount > 0 {
+                throw RwkvqError.unsupportedKind(tensor: key,
+                    kind: "rtn+outliers (SpQR scatter не реализован)")
+            }
+            return rwkvqDequantRTN(codes: codes, scale: scale, dtype: dtype)
         }
-        guard let qblk = arrays["\(key)::qblk"] else {
-            throw RwkvqError.missingBuffer(tensor: key, buffer: "qblk")
-        }
-        guard let qsqm = arrays["\(key)::qsqm"] else {
-            throw RwkvqError.missingBuffer(tensor: key, buffer: "qsqm")
-        }
-        guard let ddm = arrays["\(key)::ddm"] else {
-            throw RwkvqError.missingBuffer(tensor: key, buffer: "ddm")
-        }
-        return rwkvqDequantDense(qblk: qblk, qsqm: qsqm, ddm: ddm,
-                                 outFeatures: info.outFeatures,
-                                 inFeatures: info.inFeatures,
-                                 superBlock: info.superBlock,
-                                 xbits: info.xbits,
-                                 dtype: dtype)
     }
 
     /// Суммарный размер сжатых буферов в байтах — чтобы можно было честно
