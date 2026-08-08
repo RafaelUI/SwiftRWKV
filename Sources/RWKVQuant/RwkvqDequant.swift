@@ -189,9 +189,13 @@ public func rwkvqDequantDense(qblk: MLXArray, qsqm: MLXArray, ddm: MLXArray,
 public func rwkvqDequantAsym(codes: MLXArray, scale: MLXArray, min: MLXArray,
                              groupSize gs: Int, dtype: DType = .float32) -> MLXArray {
     let inFeatures = codes.shape[1]
-    let nb = inFeatures / gs
+    // ceil(IN/gs) блоков — IN не обязан делиться на gs нацело (напр. w1/a1:
+    // IN=96, gs=64 -> 2 блока, второй неполный). Индекс строится ПОКОЛОНОЧНО
+    // (c / gs), а не через nb*gs: целочисленное nb=IN/gs при неполном
+    // последнем блоке даёт КОРОТКИЙ индекс и молча берёт scale/min не из
+    // того блока — ровно так проявлялось на w1/a1 (96 % 64 != 0).
     var idx = [Int32](); idx.reserveCapacity(inFeatures)
-    for b in 0 ..< nb { idx.append(contentsOf: repeatElement(Int32(b), count: gs)) }
+    for c in 0 ..< inFeatures { idx.append(Int32(c / gs)) }
     let idxArr = MLXArray(idx)
     let scaleC = scale.asType(.float32).take(idxArr, axis: 1)   // [OUT, IN]
     let minC = min.asType(.float32).take(idxArr, axis: 1)
