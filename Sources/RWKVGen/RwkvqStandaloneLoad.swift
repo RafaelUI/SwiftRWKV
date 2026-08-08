@@ -43,9 +43,25 @@ extension X070Backbone {
 
         // Остальные sb6: 4 tmix-проекции + 2 cmix + head на каждом слое.
         // quantizeEmbedding остаётся false — emb уже плотный (см. выше).
-        bb.attachRwkvq(sidecar, options: RwkvqAttachOptions(
+        let info = bb.attachRwkvq(sidecar, options: RwkvqAttachOptions(
             quantizeCmix: true, quantizeHead: true, quantizeEmbedding: false,
             useNativeKernel: useNativeKernel))
+
+        if useNativeKernel && bb.isRawSidecarRetained {
+            // Хотя бы один ключ не переложился в native — см.
+            // isRawSidecarRetained. Печатаем ИМЕНА непереложенных ключей,
+            // не только count: "что-то не так" бесполезно для диагностики,
+            // "вот эти конкретные ключи" -- да.
+            let notNative = info.attached > 0 ? bb.rwkvqBackedKeys.filter {
+                !bb.hasNativeRepack($0)
+            } : []
+            FileHandle.standardError.write((
+                "[X070Backbone.load] ВНИМАНИЕ: сырой сайдкар не освободился "
+                + "(isRawSidecarRetained=true) -- держится ОДНОВРЕМЕННО с "
+                + "native-буферами. attached=\(info.attached) missing=\(info.missing) "
+                + "не переложились в native: \(notNative)\n"
+            ).data(using: .utf8)!)
+        }
 
         return bb
     }

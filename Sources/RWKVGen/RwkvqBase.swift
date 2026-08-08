@@ -161,6 +161,21 @@ extension X070Backbone {
     /// Читается ли этот вес из квантованной базы.
     public func isRwkvqBacked(_ key: String) -> Bool { rwkvqKeys[key] != nil }
 
+    /// Держится ли ещё сырой сайдкар (K3-буферы) в памяти после attach.
+    ///
+    /// true означает, что ХОТЯ БЫ один ключ не переложился в родной MLX-
+    /// контейнер (см. attachRwkvq: `fullyNative` условие) — тогда сайдкар
+    /// не освобождается и его буферы держатся ОДНОВРЕМЕННО с уже
+    /// переложенными native-буферами. На 2.9B это разница 6.97 ГБ против
+    /// 3.11 (см. RwkvqBase.swift) — стоит проверять после подключения
+    /// квантованной базы, а не удивляться памяти постфактум.
+    public var isRawSidecarRetained: Bool { rwkvqSidecar != nil }
+
+    /// Переложен ли КОНКРЕТНЫЙ ключ в родной MLX-контейнер (в отличие от
+    /// `isRwkvqBacked`, которое верно и для того, что читается через
+    /// `sc.dequantize` -- т.е. ещё не переложено).
+    public func hasNativeRepack(_ key: String) -> Bool { rwkvqNative[key] != nil }
+
     /// Ключи, читаемые из .rwkvq.
     public var rwkvqBackedKeys: [String] { rwkvqKeys.keys.sorted() }
 }
