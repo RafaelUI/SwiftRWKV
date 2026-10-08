@@ -223,9 +223,20 @@ final class RwkvqModelTests: XCTestCase {
                 XCTAssertEqual(RwkvqFileTests.mismatches(rows[i], same), 0,
                                "\(preset), токен \(i): результат зависит от типа пустого состояния")
             }
-            let kl = Self.kl(f.ref["logits_metal"]![0 ..< 8], stacked(rows, axis: 0).reshaped([8, -1]))
-            print(String(format: "ШАГ С НУЛЯ %@: KL(metal‖шаг) %.3e", preset, kl))
-            XCTAssertLessThan(kl, 2 * f.klRefMetal, preset)
+            // Здесь это только проверка здравости, главное свойство — выше.
+            // На REDUCTION шаг идёт ядром GEMV: вес там — точное q·s, тогда
+            // как оба эталона считают с весами, округлёнными до fp16. Это
+            // разные округления одного формата, поэтому шаг стоит от обоих
+            // эталонов на шум округления весов, и граница взята с запасом.
+            let got = stacked(rows, axis: 0).reshaped([8, -1])
+            let kl = Self.kl(f.ref["logits_ref"]![0 ..< 8], got)
+            let klMetal = Self.kl(f.ref["logits_metal"]![0 ..< 8], got)
+            let metalRef = Self.kl(f.ref["logits_ref"]![0 ..< 8], f.ref["logits_metal"]![0 ..< 8])
+            print(String(format: "ШАГ С НУЛЯ %@: KL(ref‖шаг) %.3e, KL(metal‖шаг) %.3e, KL(ref‖metal) на тех же позициях %.3e",
+                         preset, kl, klMetal, metalRef))
+            XCTAssertLessThan(kl, 4 * metalRef, preset)
+            XCTAssertEqual((argMax(got, axis: -1) .== argMax(f.ref["logits_metal"]![0 ..< 8], axis: -1))
+                .asType(.int32).sum().item(Int.self), 8, "\(preset): top-1")
         }
     }
 

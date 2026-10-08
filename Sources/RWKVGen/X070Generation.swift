@@ -88,7 +88,10 @@ extension X070Backbone {
     // хуже: оно не падает.
     private func pj(_ x: MLXArray, _ wKey: String) -> MLXArray {
         precondition(wKey.hasSuffix(".weight"), "проекция \(wKey) не .weight")
-        return projectForBlock(x, wKey, lora: String(wKey.dropLast(7)))
+        // decode: true — рекуррентный шаг есть путь генерации, градиент
+        // через него не идёт; квантованная sym-база считается здесь ядром
+        // GEMV без плотной матрицы (см. rwkvqSymDecodeKernel).
+        return projectForBlock(x, wKey, lora: String(wKey.dropLast(7)), decode: true)
     }
 
     // ─────────────── Один рекуррентный WKV-шаг (вариант A) ───────────────

@@ -168,6 +168,20 @@ public final class X070Backbone {
     /// моделях и стоит точности, см. docs/Inference.md.
     public var rwkvqNativeInputDType: DType? = nil
 
+    /// Декод sym ядром GEMV (без плотной матрицы) вместо «деквант + матмул».
+    ///
+    /// Действует ТОЛЬКО на рекуррентном шаге (`step`, генерация) и только в
+    /// норме (`rwkvqBaseDType != nil`). Параллельный проход и всё, через что
+    /// идёт градиент, считают прежним путём: ядро непрозрачно для автограда,
+    /// и адаптеры ниже слоя молча получили бы нулевые градиенты.
+    /// Числа у ядра другие (точный вес, сумма в fp32), см. RwkvqSymGEMV.swift.
+    /// Переключается на живом объекте — A/B в одном процессе.
+    public var rwkvqSymDecodeKernel = true
+    /// Сколько проекций прошло ядром GEMV. Счётчик для тестов и замеров:
+    /// «правка не применилась» обязана быть видимой, а не читаться как
+    /// «правка ничего не меняет».
+    public internal(set) var rwkvqSymGEMVCalls = 0
+
     /// Цели, которые лежат в файле ПЛОТНЫМИ (нынешние пресеты: o_proj слоя 0,
     /// bits_overrides → 16). Это намерение файла, а не ошибка: вес —
     /// исходный bf16 как есть, замороженная плотная база, LoRA встаёт поверх
@@ -281,7 +295,7 @@ public final class X070Backbone {
 
     // База проекции: если есть quant — x·Wᵀ с деквантизацией на лету
     // (веса [out,in] ⇒ transpose: true), иначе обычный linear.
-    private func baseProj(_ x: MLXArray, _ wKey: String) -> MLXArray {
+    private func baseProj(_ x: MLXArray, _ wKey: String, decode: Bool = false) -> MLXArray {
         if let q = quant[wKey] {
             return quantizedMM(x, q.wq, scales: q.scales, biases: q.biases,
                                transpose: true, groupSize: q.groupSize, bits: q.bits)
@@ -301,6 +315,14 @@ public final class X070Backbone {
             }
             return matmul(x, wv(wKey).transposed())
         }
+        if decode, rwkvqSymDecodeKernel, let world = rwkvqKeys[wKey], let sc = rwkvqSidecar {
+            let lead = Array(x.shape.dropLast())
+            let x2d = x.reshaped([-1, x.shape[x.ndim - 1]])
+            if let y = sc.symGEMV(world, x2d) {
+                rwkvqSymGEMVCalls += 1
+                return y.reshaped(lead + [y.shape[1]]).asType(x.dtype)
+            }
+        }
         if let dense = rwkvqWeight(wKey, base) {
             return matmul(x.asType(base), dense.transposed()).asType(x.dtype)
         }
@@ -312,8 +334,9 @@ public final class X070Backbone {
     }
 
     // Проекция с опциональным LoRA: base + scale·(x·Aᵀ)·Bᵀ. target=nil ⇒ только база.
-    private func proj(_ x: MLXArray, _ wKey: String, lora target: String?) -> MLXArray {
-        let base = baseProj(x, wKey)
+    private func proj(_ x: MLXArray, _ wKey: String, lora target: String?,
+                      decode: Bool = false) -> MLXArray {
+        let base = baseProj(x, wKey, decode: decode)
         guard let t = target, let a = loraA[t], let b = loraB[t] else { return base }
         let z = matmul(x, a.transposed())                       // [..., rank]
         return base + (loraScale[t] ?? 1.0) * matmul(z, b.transposed())
@@ -393,8 +416,9 @@ public final class X070Backbone {
     /// декода. Он живёт в отдельном файле и обязан ходить теми же дорогами,
     /// иначе снова разойдётся с параллельным путём.
     func embedForBlock(_ ids: MLXArray) -> MLXArray { embed(ids) }
-    func projectForBlock(_ x: MLXArray, _ key: String, lora: String?) -> MLXArray {
-        proj(x, key, lora: lora)
+    func projectForBlock(_ x: MLXArray, _ key: String, lora: String?,
+                         decode: Bool = false) -> MLXArray {
+        proj(x, key, lora: lora, decode: decode)
     }
     func groupNormRaw(_ x: MLXArray) -> MLXArray { groupNorm(x) }
 
