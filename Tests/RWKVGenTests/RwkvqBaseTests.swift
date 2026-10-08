@@ -33,7 +33,7 @@ final class RwkvqBaseTests: XCTestCase {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let env = ProcessInfo.processInfo.environment
         let modelPath = env["RWKV_PARITY_MODEL"]
-            ?? home.appendingPathComponent("Develop/rwkv-metal/world_0.1b_x070.safetensors").path
+            ?? home.appendingPathComponent("Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors").path
         let sidecarPath = env["RWKV_RWKVQ_SIDECAR"]
             ?? home.appendingPathComponent("Develop/SwiftRWKV/.testdata/0.1B_reduction.rwkvq_mlx").path
         let refPath = env["RWKV_RWKVQ_MODEL_REFERENCE"]

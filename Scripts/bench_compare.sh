@@ -26,7 +26,7 @@ echo "драйвер: pid $$ (убить целиком: kill -9 -$$  или  pk
 INPUT="${1:-/tmp/bench_input.json}"
 REPEATS="${2:-2}"
 OUT=/tmp/bench
-MODEL=~/Develop/rwkv-metal/world_0.1b_x070.safetensors
+MODEL=~/Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors
 VOCAB=.testdata/rwkv_vocab_v20230424.txt
 PYREPO=~/Develop/rwkv-metal
 WARMUP=3

@@ -17,7 +17,7 @@ import RWKVRerank
 //
 //  Пример:
 //    swift run -c release rerank-run \
-//      --model ~/Develop/rwkv-metal/world_0.1b_x070.safetensors \
+//      --model ~/Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors \
 //      --vocab .testdata/rwkv_vocab_v20230424.txt \
 //      --data  ~/Develop/reranker-triples-multi/train.jsonl \
 //      --queries 400 --candidates 8 --eval-queries 80 \

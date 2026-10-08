@@ -21,7 +21,7 @@ final class EmbeddingSmokeTests: XCTestCase {
         let env = ProcessInfo.processInfo.environment
         let modelPath = env["RWKV_PARITY_MODEL"]
             ?? home.appendingPathComponent(
-                "Develop/rwkv-metal/world_0.1b_x070.safetensors").path
+                "Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors").path
         let vocabPath = env["RWKV_WORLD_VOCAB"]
             ?? home.appendingPathComponent(
                 "Develop/SwiftRWKV/.testdata/rwkv_vocab_v20230424.txt").path

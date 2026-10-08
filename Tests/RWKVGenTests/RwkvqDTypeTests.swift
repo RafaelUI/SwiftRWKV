@@ -121,7 +121,7 @@ final class RwkvqDTypeTests: XCTestCase {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let env = ProcessInfo.processInfo.environment
         let mp = env["RWKV_PARITY_MODEL"] ?? home.appendingPathComponent(
-            "Develop/rwkv-metal/world_0.1b_x070.safetensors").path
+            "Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors").path
         try XCTSkipUnless(FileManager.default.fileExists(atPath: mp), "нет модели")
         let sc = try loadSidecar()
 

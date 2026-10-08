@@ -48,12 +48,12 @@ import RWKVQuant
 //  Собирается и запускается ТОЛЬКО в release:
 //
 //      swift run -c release decode-bench \
-//        --model ~/Develop/rwkv-metal/world_0.1b_x070.safetensors \
+//        --model ~/Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors \
 //        --sidecar ~/Develop/SwiftRWKV/.testdata/0.1B_reduction.rwkvq_mlx
 // ───────────────────────────────────────────────────────────────────────
 
 struct Args {
-    var model = "~/Develop/rwkv-metal/world_0.1b_x070.safetensors"
+    var model = "~/Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors"
     var sidecar = "~/Develop/SwiftRWKV/.testdata/0.1B_reduction.rwkvq_mlx"
     var steps = 64
     var rounds = 5

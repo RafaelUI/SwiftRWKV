@@ -57,7 +57,7 @@ final class EmbeddingParityTests: XCTestCase {
         let env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser
         let modelPath = env["RWKV_PARITY_MODEL"]
-            ?? home.appendingPathComponent("Develop/rwkv-metal/world_0.1b_x070.safetensors").path
+            ?? home.appendingPathComponent("Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors").path
         let refPath = env["RWKV_EMBEDDING_REFERENCE"]
             ?? home.appendingPathComponent("Develop/SwiftRWKV/.testdata/embedding_ref.safetensors").path
         let slicePath = env["RWKV_LITRETRIEVAL_SLICE"]

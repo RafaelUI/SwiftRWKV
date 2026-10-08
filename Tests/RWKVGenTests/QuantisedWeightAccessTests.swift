@@ -28,7 +28,7 @@ final class QuantisedWeightAccessTests: XCTestCase {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let env = ProcessInfo.processInfo.environment
         let mp = env["RWKV_PARITY_MODEL"] ?? home.appendingPathComponent(
-            "Develop/rwkv-metal/world_0.1b_x070.safetensors").path
+            "Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors").path
         let sp = env["RWKV_RWKVQ_SIDECAR"] ?? home.appendingPathComponent(
             "Develop/SwiftRWKV/.testdata/0.1B_reduction.rwkvq_mlx").path
         try XCTSkipUnless(FileManager.default.fileExists(atPath: mp), "нет модели")
@@ -101,7 +101,7 @@ final class QuantisedWeightAccessTests: XCTestCase {
         let w = try loadArrays(url: URL(fileURLWithPath:
             ProcessInfo.processInfo.environment["RWKV_PARITY_MODEL"]
             ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Develop/rwkv-metal/world_0.1b_x070.safetensors").path))
+                .appendingPathComponent("Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors").path))
         let denseBB = X070Backbone(weights: w, cfg: cfg)
         let denseBlock = try RWKVBlock.fromBase(denseBB, layer: 0, index: 1)
         XCTAssertEqual(keys, Set(denseBlock.weightKeys),
