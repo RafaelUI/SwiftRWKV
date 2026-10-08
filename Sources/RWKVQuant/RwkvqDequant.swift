@@ -223,3 +223,230 @@ public func rwkvqUnpackInt4(_ packed: MLXArray, columns nCols: Int) -> MLXArray 
     let full = concatenated([lo, hi], axis: 1)     // split-раскладка
     return full[0..., 0 ..< nCols].asType(.int8)
 }
+
+// ───────────────────────────────────────────────────────────────────────
+//  Раскладка sym (Q6_K): блок 16 БЕЗ min, масштаб блока — int8-код против
+//  одной fp16 d на суперблок из 16 блоков (256 весов). 6 и 8 бит.
+//
+//  Порт rwkv_quant/backends/metal/quant_linear_sym.py::_get_kernel_dequant
+//  (скалярные ветки "half", "float" и "bf16"). Арифметика перенесена
+//  ДОСЛОВНО, включая то, чем ветки отличаются друг от друга:
+//
+//    fp16:  w = (half)q * s          — произведение в half. Под этой веткой
+//                                      измерены числа пресета; её текст в
+//                                      rwkv-quant заморожен гейтом равенства.
+//    fp32:  w = (float)q * (float)s  — бит-в-бит codec.dequant_sym.
+//    bf16:  то же, что fp32, с одним округлением при записи.
+//
+//  Масштаб `s = half(qs · d)` округляется через half ВО ВСЕХ ветках, как в
+//  файле: без half-роундтрипа ядро расходится с writer на последнем бите.
+//
+//  Интерлив (qblk) — раскладка загрузчика, не диска:
+//    bits=8: qblk[row] = IN знаковых байт-кодов, как есть;
+//    bits=6: на ПАРУ блоков (32 колонки) 16Б нибблов + 4Б qh + 4Б qh2.
+//            Коды лежат СО СДВИГОМ +32 в 0...63; сдвиг снимается в ядре.
+//            Split нибблов блок-локальный, а блок 16 — поэтому колонки
+//            пары идут l0,l1,h0,h1 (первый блок), l2,l3,h2,h3 (второй).
+//            Перепутать порядок — получить правдоподобный, но неверный
+//            результат: величины те же, места не те.
+//
+//  Почему не родной quantizedMM, как у sb6: MLX принимает группы 32, 64 и
+//  128, блока 16 там нет. Точной перекладки не существует, а неточная была
+//  бы ДРУГОЙ квантованной базой под тем же именем.
+// ───────────────────────────────────────────────────────────────────────
+
+/// Порядок регистров → порядок колонок внутри пары блоков по 16.
+private let symPairRegs = ["l0", "l1", "h0", "h1", "l2", "l3", "h2", "h3"]
+
+/// Мульт-трюк битплоскости: ниббл → 4 байта одним умножением, порядок
+/// регистров — парный.
+private func symPlanePair(_ src: String, shift: Int) -> String {
+    var out = ""
+    for (i, reg) in symPairRegs.enumerated() {
+        let sh = i * 4
+        let nib = sh == 0 ? "(\(src) & 0xFu)"
+            : sh == 28 ? "(\(src) >> 28)" : "((\(src) >> \(sh)) & 0xFu)"
+        out += "    \(reg) |= as_type<uchar4>((\(nib) * 0x00204081u & 0x01010101u) << \(shift));\n"
+    }
+    return out
+}
+
+/// Восемь записей на регистр × четыре регистра = 16 колонок одного блока.
+private func symWrites(_ regs: ArraySlice<String>, scale: String, base: Int,
+                       outType: String) -> String {
+    var out = ""
+    for (i, reg) in regs.enumerated() {
+        for (c, comp) in ["x", "y", "z", "w"].enumerated() {
+            let idx = base + i * 4 + c
+            switch outType {
+            case "half":
+                out += "    o[\(idx)] = ((half)(float)\(reg).\(comp) - (half)32.0h) * \(scale);\n"
+            case "bfloat16_t":
+                out += "    o[\(idx)] = (bfloat16_t)(((float)\(reg).\(comp) - 32.0f) * (float)\(scale));\n"
+            default:
+                out += "    o[\(idx)] = ((float)\(reg).\(comp) - 32.0f) * (float)\(scale);\n"
+            }
+        }
+    }
+    return out
+}
+
+private struct SymDequantKey: Hashable {
+    let inFeatures: Int
+    let outFeatures: Int
+    let bits: Int
+    let dtype: String
+}
+
+private var symDequantKernelCache: [SymDequantKey: MLXFastKernel] = [:]
+
+private func symMetalTypeName(_ d: DType) -> String {
+    switch d {
+    case .float32: return "float"
+    case .bfloat16: return "bfloat16_t"
+    case .float16: return "half"
+    default: preconditionFailure("деквантизация sym в \(d) не поддержана")
+    }
+}
+
+private func symDequantKernel(inFeatures IN: Int, outFeatures OUT: Int,
+                              bits: Int, dtype: DType) -> MLXFastKernel {
+    let T = symMetalTypeName(dtype)
+    let key = SymDequantKey(inFeatures: IN, outFeatures: OUT, bits: bits, dtype: T)
+    if let k = symDequantKernelCache[key] { return k }
+
+    precondition(bits == 6 || bits == 8, "sym: битность \(bits) вне {6, 8}")
+    precondition(IN % 256 == 0, "sym-ядро: IN=\(IN) не кратен суперблоку 256")
+
+    let total = bits == 8 ? OUT * (IN / 16) : OUT * (IN / 32)
+    let header = """
+    constant uint IN_C  = \(IN);
+    constant uint OUT_C = \(OUT);
+    constant uint NB    = \(IN / 16);
+    constant uint NSB   = \(IN / 256);
+    constant uint NPAIR = \(IN / 32);
+    constant uint TOTAL = \(total);
+    """
+
+    let source: String
+    if bits == 8 {
+        let write: String
+        switch T {
+        case "half":
+            write = "o[i] = (half)((float)c[row*IN_C + b*16 + i]) * s;"
+        case "bfloat16_t":
+            write = "o[i] = (bfloat16_t)((float)c[row*IN_C + b*16 + i] * (float)s);"
+        default:
+            write = "o[i] = (float)c[row*IN_C + b*16 + i] * (float)s;"
+        }
+        source = """
+            uint gid = thread_position_in_grid.x;
+            if (gid >= TOTAL) return;
+            uint row = gid / NB;
+            uint b   = gid % NB;
+            device const char* c  = (device const char*)qblk;
+            device const char* sc = (device const char*)qs;
+            half s = (half)((float)sc[row*NB + b] * (float)d[row*NSB + b/16]);
+            device \(T)* o = out + row*IN_C + b*16;
+            for (uint i = 0; i < 16; i++)
+                \(write)
+        """
+    } else {
+        source = """
+            uint gid = thread_position_in_grid.x;
+            if (gid >= TOTAL) return;
+            uint row = gid / NPAIR;
+            uint p   = gid % NPAIR;
+            device const uint* qb = ((device const uint*)qblk) + gid*6;
+            uint4 qw = uint4(qb[0], qb[1], qb[2], qb[3]);
+            uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
+            uchar4 l1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+            uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu);
+            uchar4 h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+            uchar4 l2 = as_type<uchar4>(qw.z & 0x0F0F0F0Fu);
+            uchar4 l3 = as_type<uchar4>(qw.w & 0x0F0F0F0Fu);
+            uchar4 h2 = as_type<uchar4>((qw.z >> 4) & 0x0F0F0F0Fu);
+            uchar4 h3 = as_type<uchar4>((qw.w >> 4) & 0x0F0F0F0Fu);
+            uint hb = qb[4];
+        \(symPlanePair("hb", shift: 4))    uint hb2 = qb[5];
+        \(symPlanePair("hb2", shift: 5))
+            device const char* sc = (device const char*)qs;
+            float dsb = (float)d[row*NSB + p/8];
+            half s0 = (half)((float)sc[row*NB + 2*p]     * dsb);
+            half s1 = (half)((float)sc[row*NB + 2*p + 1] * dsb);
+            device \(T)* o = out + row*IN_C + p*32;
+        \(symWrites(symPairRegs[0 ..< 4], scale: "s0", base: 0, outType: T))
+        \(symWrites(symPairRegs[4 ..< 8], scale: "s1", base: 16, outType: T))
+        """
+    }
+
+    let kern = MLXFast.metalKernel(
+        name: "rwkvq_symdq\(bits)_\(IN)_\(OUT)_\(T)",
+        inputNames: ["qblk", "qs", "d"],
+        outputNames: ["out"],
+        source: source,
+        header: header
+    )
+    symDequantKernelCache[key] = kern
+    return kern
+}
+
+/// sym-интерлив → dense [OUT, IN].
+///
+/// `dtype` здесь — НЕ только тип хранения: ветка fp16 считает произведение
+/// в half (норма инференса rwkv-quant), ветки fp32 и bf16 — во float.
+/// При IN, не кратном суперблоку 256, ядро не применимо; тогда считает
+/// цепочка MLX-операций (`rwkvqDequantSymReference`) — fp32-арифметика
+/// codec с приведением результата.
+public func rwkvqDequantSym(qblk: MLXArray, qs: MLXArray, d: MLXArray,
+                            outFeatures OUT: Int, inFeatures IN: Int, bits: Int,
+                            dtype: DType = .float32) -> MLXArray {
+    guard IN % 256 == 0 else {
+        return rwkvqDequantSymReference(qblk: qblk, qs: qs, d: d, outFeatures: OUT,
+                                        inFeatures: IN, bits: bits).asType(dtype)
+    }
+    let kern = symDequantKernel(inFeatures: IN, outFeatures: OUT, bits: bits, dtype: dtype)
+    let threadgroup = 256
+    let total = OUT * (IN / (bits == 8 ? 16 : 32))
+    let groups = (total + threadgroup - 1) / threadgroup
+    return kern([qblk, qs, d],
+                grid: (groups * threadgroup, 1, 1),
+                threadGroup: (threadgroup, 1, 1),
+                outputShapes: [[OUT, IN]],
+                outputDTypes: [dtype])[0]
+}
+
+/// Байт int8, лежащий в uint8-контейнере, → значение (int32). Арифметикой,
+/// а не сменой вида: не зависит от того, как версия MLX трактует каст.
+private func signedByte(_ u: MLXArray) -> MLXArray {
+    ((u.asType(.int32) + 128) % 256) - 128
+}
+
+/// ЭТАЛОН: тот же деквант цепочкой MLX-операций, fp32, формула
+/// codec.dequant_sym. Медленный, но от ядра не зависит — ради этого и есть:
+/// им сверяется ядро и считаются формы, которых ядро не берёт.
+public func rwkvqDequantSymReference(qblk: MLXArray, qs: MLXArray, d: MLXArray,
+                                     outFeatures OUT: Int, inFeatures IN: Int,
+                                     bits: Int) -> MLXArray {
+    let NB = IN / 16
+    var q: MLXArray
+    if bits == 8 {
+        q = signedByte(qblk.reshaped([OUT, IN])).asType(.float32)
+    } else {
+        let NP = IN / 32
+        let blk = qblk.reshaped([OUT, NP, 24])
+        // блок-локальный split: байт j блока несёт колонку j (low) и j+8 (high)
+        let cb = blk[0..., 0..., 0 ..< 16].reshaped([OUT, NP * 2, 8])
+        var qi = concatenated([cb & 0xF, cb >> 4], axis: 2).asType(.int32)
+        let shifts = MLXArray(Array(0 ..< 8).map { UInt8($0) })
+        for (off, weight) in [(16, Int32(16)), (20, Int32(32))] {
+            let plane = blk[0..., 0..., off ..< (off + 4)].reshaped([OUT, IN / 8])
+            let b = (plane.expandedDimensions(axis: -1) >> shifts) & 1
+            qi = qi + b.reshaped([OUT, NP * 2, 16]).asType(.int32) * weight
+        }
+        q = (qi - 32).asType(.float32).reshaped([OUT, IN])    // снятие сдвига упаковки
+    }
+    let dd = repeated(d.asType(.float32), count: 16, axis: 1)[0..., 0 ..< NB]
+    let scale = (signedByte(qs).asType(.float32) * dd).asType(.float16).asType(.float32)
+    return (q.reshaped([OUT, NB, 16]) * scale.reshaped([OUT, NB, 1])).reshaped([OUT, IN])
+}

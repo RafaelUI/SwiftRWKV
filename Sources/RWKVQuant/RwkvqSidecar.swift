@@ -45,10 +45,12 @@ public enum RwkvqError: Error, CustomStringConvertible {
     }
 }
 
-/// Раскладка тензора. Манифест полного экспорта содержит все четыре, и
+/// Раскладка тензора. Манифест полного экспорта содержит все пять, и
 /// `dequantize(_:)` разворачивает любую из них.
 public enum RwkvqKind: String, Sendable {
-    case sb6        // блочная квантизация, единственная, что здесь считается
+    case sb6        // блок 32 с min, суперблок 8: COMPRESSION и прежний REDUCTION
+    case sym        // Q6_K: блок 16 БЕЗ min, int8-масштаб блока, fp16 d на суперблок
+                    // 256; 6 и 8 бит. Нынешний REDUCTION целиком на ней
     case asym       // low-rank LoRA, fp32 scale/min на блок
     case rtn        // per-row, коды int8 либо нибблы
     case dense      // bf16 как есть: нормы, token-shift миксы, bias-термы
@@ -69,8 +71,17 @@ public struct RwkvqTensorInfo: Sendable {
     public let superBlock: Int     // gw_sb, только sb6
     public let packed: Bool        // только rtn: коды нибблами (bits<=4)
     public let outlierCount: Int   // только rtn: сколько SpQR-выбросов
+    /// Надо ли транспонировать тензор после деквантизации, чтобы получить
+    /// вес в Linear-конвенции [out, in]. ДАННЫЕ ФАЙЛА, А НЕ ТАБЛИЦА ИМЁН:
+    /// сырой world-чекпоинт хранит w/a/v/g{1,2} как [in, out], но .rwkvq с
+    /// 28.08 квантует их вдоль оси редукции и хранит уже [out, in] — второй
+    /// поворот там ломает форму. Манифест v2 пишет это поле явно; для
+    /// прежних оно выводится по таблице имён (`RwkvqNaming.isRawLoRAWorld`).
+    public let transposed: Bool
 
     public var isSb6: Bool { kind == .sb6 }
+    /// Раскладки, которые остаются в памяти сжатыми и считаются проекцией.
+    public var isQuantizedBase: Bool { kind == .sb6 || kind == .sym }
     /// Только для двумерных. У одномерных записей полного экспорта
     /// обращение к ним — ошибка вызывающего, а не данных.
     public var outFeatures: Int { shape[0] }
@@ -87,6 +98,22 @@ public final class RwkvqSidecar {
     public let nEmbd: Int
     public let headSize: Int
     public let vocabSize: Int
+
+    /// Старшая версия формата, которую читает этот код (и .rwkvq, и сайдкар).
+    public static let maxFormatVersion = 2
+
+    /// Уже разобранная база — общий конец обоих входов (сайдкар и .rwkvq
+    /// напрямую, см. RwkvqFile.swift).
+    init(arrays: [String: MLXArray], tensors: [String: RwkvqTensorInfo],
+         naming: String, nLayer: Int, nEmbd: Int, headSize: Int, vocabSize: Int) {
+        self.arrays = arrays
+        self.tensors = tensors
+        self.naming = naming
+        self.nLayer = nLayer
+        self.nEmbd = nEmbd
+        self.headSize = headSize
+        self.vocabSize = vocabSize
+    }
 
     /// - path: путь БЕЗ суффикса — рядом должны лежать `<path>.safetensors`
     ///   и `<path>.json` (так их кладёт export_mlx).
@@ -106,7 +133,8 @@ public final class RwkvqSidecar {
               let tensorDict = root["tensors"] as? [String: Any] else {
             throw RwkvqError.malformedManifest("нет секции \"tensors\"")
         }
-        self.naming = root["naming"] as? String ?? "world"
+        let namingValue = root["naming"] as? String ?? "world"
+        self.naming = namingValue
         self.nLayer = root["n_layer"] as? Int ?? 0
         self.nEmbd = root["n_embd"] as? Int ?? 0
         self.headSize = root["head_size"] as? Int ?? 64
@@ -131,6 +159,8 @@ public final class RwkvqSidecar {
                 throw RwkvqError.malformedManifest(
                     "неизвестная раскладка \(raw) у \(key)")
             }
+            let transposed = (d["transposed"] as? Bool)
+                ?? (namingValue == "world" && RwkvqNaming.isRawLoRAWorld(key))
             if kind == .sb6 {
                 guard shape.count == 2,
                       let bits = d["bits"] as? Int,
@@ -143,7 +173,7 @@ public final class RwkvqSidecar {
                 infos[key] = RwkvqTensorInfo(kind: kind, shape: shape, bits: bits,
                                              xbits: xbits, groupSize: gs,
                                              superBlock: sb, packed: false,
-                                             outlierCount: 0)
+                                             outlierCount: 0, transposed: transposed)
             } else {
                 infos[key] = RwkvqTensorInfo(
                     kind: kind, shape: shape,
@@ -151,7 +181,8 @@ public final class RwkvqSidecar {
                     groupSize: d["gw_gs"] as? Int ?? 0,
                     superBlock: d["gw_sb"] as? Int ?? 0,
                     packed: d["packed"] as? Bool ?? false,
-                    outlierCount: d["outliers"] as? Int ?? 0)
+                    outlierCount: d["outliers"] as? Int ?? 0,
+                    transposed: transposed)
             }
         }
         self.tensors = infos
@@ -161,7 +192,10 @@ public final class RwkvqSidecar {
 
     public func contains(_ key: String) -> Bool { tensors[key] != nil }
 
-    /// Восстановить плотный вес — любая раскладка манифеста (sb6/asym/rtn/dense).
+    /// Восстановить плотный вес — любая раскладка манифеста
+    /// (sb6/sym/asym/rtn/dense). В ТОМ ЖЕ виде, в каком тензор лежал в
+    /// исходном чекпоинте: поворот (`RwkvqTensorInfo.transposed`) делает
+    /// вызывающий — блоки и масштабы посчитаны вдоль хранимых строк.
     ///
     /// Результат ТРАНЗИЕНТНЫЙ и намеренно не кэшируется для sb6/asym/rtn:
     /// смысл квантованной базы в том, что она живёт в памяти сжатой. Кэш
@@ -199,6 +233,21 @@ public final class RwkvqSidecar {
                                      superBlock: info.superBlock,
                                      xbits: info.xbits,
                                      dtype: dtype)
+
+        case .sym:
+            guard let qblk = arrays["\(key)::qblk"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "qblk")
+            }
+            guard let qs = arrays["\(key)::qs"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "qs")
+            }
+            guard let d = arrays["\(key)::d"] else {
+                throw RwkvqError.missingBuffer(tensor: key, buffer: "d")
+            }
+            return rwkvqDequantSym(qblk: qblk, qs: qs, d: d,
+                                   outFeatures: info.outFeatures,
+                                   inFeatures: info.inFeatures,
+                                   bits: info.bits, dtype: dtype)
 
         case .asym:
             guard let codes = arrays["\(key)::codes"] else {
@@ -282,6 +331,17 @@ public enum RwkvqNaming {
         default:
             return nil
         }
+    }
+
+    /// Ключ world-чекпоинта, который СЫРОЙ чекпоинт хранит в ориентации
+    /// [in, out]: blocks.N.att.{w,a,v,g}{1,2}. Порт codec.is_raw_lora_world;
+    /// нужен только манифестам без поля `transposed`.
+    public static func isRawLoRAWorld(_ key: String) -> Bool {
+        let parts = key.split(separator: ".").map(String.init)
+        guard parts.count == 4, parts[0] == "blocks", Int(parts[1]) != nil,
+              parts[2] == "att", parts[3].count == 2 else { return false }
+        let c = Array(parts[3])
+        return "wavg".contains(c[0]) && (c[1] == "1" || c[1] == "2")
     }
 
     /// world-имя → x070-имя.
