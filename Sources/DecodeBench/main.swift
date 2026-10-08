@@ -93,6 +93,20 @@ struct Args {
     var legacyBase = true
     /// В режиме --rwkvq: плечо «норма» подаёт в родное ядро fp16 вместо fp32.
     var nativeIn16 = false
+    /// Размен «вход родного ядра sb6: fp32 против fp16» на одном файле:
+    /// точность (KL к исходной модели и к точному счёту тех же весов, по
+    /// окнам, парный бутстрэп) и скорость декода — см. `nativeInStudy`.
+    var nativeInStudy: String? = nil
+    /// Окна токенов [N, T] (safetensors, ключ "ids") для --native-in-study.
+    var windows = "/tmp/swr_0910/windows.safetensors"
+    /// Плотная исходная модель (safetensors, имена x070) — «истина» замера;
+    /// считается в fp32. Не задана — меряется только шум счёта.
+    var truth: String? = nil
+    /// Скорость декода при двух положениях одного переключателя на ОДНОЙ
+    /// модели, чередованием: "native-in" (вход родного ядра sb6 fp32 / fp16)
+    /// либо "sym-gemv" (декод sym ядром GEMV / деквант + матмул).
+    var knob: String? = nil
+    var knobPath: String? = nil
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -123,6 +137,10 @@ func parseArgs() -> Args {
         case "--rwkvq": a.rwkvq = it.next()
         case "--norm-base": a.legacyBase = false
         case "--native-in16": a.nativeIn16 = true
+        case "--native-in-study": a.nativeInStudy = it.next()
+        case "--windows": a.windows = it.next() ?? a.windows
+        case "--truth": a.truth = it.next()
+        case "--knob-ab": a.knob = it.next(); a.knobPath = it.next()
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -594,6 +612,165 @@ func rwkvqNormAB(_ path: String, _ args: Args) throws {
 
 if let path = args.rwkvq {
     try rwkvqNormAB(path, args)
+    exit(0)
+}
+
+/// Вход родного ядра sb6 (`quantizedMM`): fp32 (как в rwkv-metal) против
+/// fp16 — на ОДНОЙ модели, переключением `rwkvqNativeInputDType`.
+///
+/// Точность — прибором статьи rwkv-quant: KL(истина ‖ плечо), истина —
+/// исходный чекпоинт (веса bf16, счёт fp32), по окнам текста; разница плеч —
+/// парным бутстрэпом по окнам. Вторая мера, доступная без исходной модели:
+/// KL к точному счёту ТЕХ ЖЕ квантованных весов (fp32-параметры, fp32-вход) —
+/// это чистый шум счёта, без ошибки квантования.
+func nativeInStudy(_ path: String, _ args: Args) throws {
+    let win = try loadArrays(url: URL(fileURLWithPath: expand(args.windows)))["ids"]!
+    let N = win.shape[0], T = win.shape[1]
+    print("окон \(N) по \(T) токенов; файл \(path)")
+
+    func logProbs(_ bb: X070Backbone, _ i: Int) -> MLXArray {
+        let l = bb(win[i ..< (i + 1)])[0].asType(.float32)
+        let lp = l - logSumExp(l, axis: -1, keepDims: true)
+        eval(lp)
+        return lp
+    }
+    func kl(_ lp: MLXArray, _ lq: MLXArray) -> Double {
+        Double((exp(lp) * (lp - lq)).sum(axis: -1).mean().item(Float.self))
+    }
+    func mean(_ x: [Double]) -> Double { x.reduce(0, +) / Double(x.count) }
+    /// Δ% среднего b к среднему a, парный бутстрэп по окнам, 95%.
+    func deltaPct(_ a: [Double], _ b: [Double]) -> (Double, Double, Double) {
+        var state: UInt64 = 0x9E3779B97F4A7C15
+        func next() -> Int {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return Int((state >> 33) % UInt64(a.count))
+        }
+        var ds: [Double] = []
+        for _ in 0 ..< 4000 {
+            var sa = 0.0, sb = 0.0
+            for _ in 0 ..< a.count { let i = next(); sa += a[i]; sb += b[i] }
+            ds.append((sb / sa - 1) * 100)
+        }
+        ds.sort()
+        return ((mean(b) / mean(a) - 1) * 100, ds[Int(0.025 * 4000)], ds[Int(0.975 * 4000)])
+    }
+
+    // 1. истина
+    var truth: [MLXArray] = []
+    if let tp = args.truth {
+        let weights = try loadArrays(url: URL(fileURLWithPath: expand(tp)))
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            k.hasPrefix("blocks.") ? Int(k.split(separator: ".")[1]) : nil
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer, nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        let t = X070Backbone(weights: weights, cfg: cfg, computeDType: .float32)
+        for i in 0 ..< N { truth.append(logProbs(t, i)) }
+        print("истина посчитана (\(tp), счёт fp32)")
+    }
+    GPU.clearCache()
+
+    // 2. точный счёт тех же квантованных весов
+    var exact: [MLXArray] = []
+    do {
+        let e = try X070Backbone.load(fromRwkvq: expand(path), paramDType: .float32)
+        for i in 0 ..< N { exact.append(logProbs(e, i)) }
+    }
+    GPU.clearCache()
+
+    // 3. норма, два плеча на одной модели
+    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    let nativeKeys = bb.rwkvqBackedKeys.filter { bb.hasNativeRepack($0) }.count
+    print("L=\(bb.cfg.nLayer) D=\(bb.cfg.nEmbd); в родном контейнере \(nativeKeys) из \(bb.rwkvqBackedKeys.count) тензоров")
+    var t32: [Double] = [], t16: [Double] = [], e32: [Double] = [], e16: [Double] = [], cross: [Double] = []
+    var agree = 0, total = 0
+    for i in 0 ..< N {
+        bb.rwkvqNativeInputDType = .float32
+        let a = logProbs(bb, i)
+        bb.rwkvqNativeInputDType = .float16
+        let b = logProbs(bb, i)
+        if !truth.isEmpty { t32.append(kl(truth[i], a)); t16.append(kl(truth[i], b)) }
+        e32.append(kl(exact[i], a)); e16.append(kl(exact[i], b)); cross.append(kl(a, b))
+        agree += (argMax(a, axis: -1) .== argMax(b, axis: -1)).asType(.int32).sum().item(Int.self)
+        total += T
+    }
+    if !truth.isEmpty {
+        let (d, lo, hi) = deltaPct(t32, t16)
+        let te = (0 ..< N).map { kl(truth[$0], exact[$0]) }
+        print(String(format: "KL(истина‖·): точный счёт %.6f | вход fp32 %.6f | вход fp16 %.6f | fp16 к fp32: %+.3f%% [%+.3f; %+.3f]",
+                     mean(te), mean(t32), mean(t16), d, lo, hi))
+        let (d2, lo2, hi2) = deltaPct(te, t32)
+        print(String(format: "              норма (вход fp32) к точному счёту: %+.3f%% [%+.3f; %+.3f]", d2, lo2, hi2))
+    }
+    print(String(format: "KL(точный счёт‖·): вход fp32 %.3e | вход fp16 %.3e;  KL(fp32‖fp16) %.3e;  top-1 fp32 == fp16: %d из %d",
+                 mean(e32), mean(e16), mean(cross), agree, total))
+
+    // 4. скорость декода, чередование плеч на одной модели
+    let (ids, _) = inputIds(args.steps, vocab: bb.cfg.vocab, vocabPath: args.vocab)
+    let (warm, _) = inputIds(args.warmup, vocab: bb.cfg.vocab, vocabPath: args.vocab)
+    bb.castWKVOutputToComputeDType = false
+    for t in [DType.float32, .float16] { bb.rwkvqNativeInputDType = t; _ = decode(bb, cfg: bb.cfg, ids: warm) }
+    var m32: [Double] = [], m16: [Double] = []
+    for r in 0 ..< args.rounds {
+        for t in (r % 2 == 0 ? [DType.float32, .float16] : [.float16, .float32]) {
+            bb.rwkvqNativeInputDType = t
+            let (dt, _, _) = decode(bb, cfg: bb.cfg, ids: ids)
+            if t == .float32 { m32.append(dt * 1e3 / Double(args.steps)) } else { m16.append(dt * 1e3 / Double(args.steps)) }
+        }
+    }
+    print(String(format: "декод, мс/ток (медиана, %d раундов по %d): вход fp32 %.2f | вход fp16 %.2f | fp16 / fp32 = %.3f",
+                 args.rounds, args.steps, median(m32), median(m16), median(m16) / median(m32)))
+}
+
+/// Скорость декода при двух положениях переключателя, одна модель.
+func knobSpeedAB(_ knob: String, _ path: String, _ args: Args) throws {
+    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    bb.castWKVOutputToComputeDType = false
+    let labels: (String, String)
+    let set: (Bool) -> Void
+    switch knob {
+    case "native-in":
+        labels = ("вход fp32", "вход fp16")
+        set = { bb.rwkvqNativeInputDType = $0 ? .float32 : .float16 }
+    case "sym-gemv":
+        labels = ("деквант+матмул", "ядро GEMV")
+        set = { bb.rwkvqSymDecodeKernel = !$0 }
+    default:
+        print("неизвестный переключатель \(knob): native-in | sym-gemv"); exit(2)
+    }
+    print("L=\(bb.cfg.nLayer) D=\(bb.cfg.nEmbd); файл \(path); переключатель \(knob)")
+    let (ids, _) = inputIds(args.steps, vocab: bb.cfg.vocab, vocabPath: args.vocab)
+    let (warm, _) = inputIds(args.warmup, vocab: bb.cfg.vocab, vocabPath: args.vocab)
+    for a in [true, false] { set(a); _ = decode(bb, cfg: bb.cfg, ids: warm) }
+    var mA: [Double] = [], mB: [Double] = []
+    var topA: [Int] = [], topB: [Int] = []
+    for r in 0 ..< args.rounds {
+        var line = String(format: "  раунд %d:", r)
+        for a in (r % 2 == 0 ? [true, false] : [false, true]) {
+            set(a)
+            let (dt, out, _) = decode(bb, cfg: bb.cfg, ids: ids)
+            let ms = dt * 1e3 / Double(args.steps)
+            if a { mA.append(ms); topA = out } else { mB.append(ms); topB = out }
+            line += String(format: "  %@ %.2f", a ? labels.0 : labels.1, ms)
+        }
+        print(line); fflush(stdout)
+    }
+    let agree = zip(topA, topB).filter { $0 == $1 }.count
+    print(String(format: "декод, мс/ток (медиана, %d раундов по %d): %@ %.2f (%.1f ток/с) | %@ %.2f (%.1f ток/с) | отношение %.3f; top-1 совпало %d из %d",
+                 args.rounds, args.steps, labels.0, median(mA), 1000 / median(mA),
+                 labels.1, median(mB), 1000 / median(mB), median(mB) / median(mA), agree, topA.count))
+    print(String(format: "footprint в конце: %.2f ГБ; MLX активная %.2f, пик %.2f ГБ",
+                 processFootprintGB(), Double(GPU.activeMemory) / 1e9, Double(GPU.peakMemory) / 1e9))
+}
+
+if let knob = args.knob, let path = args.knobPath {
+    try knobSpeedAB(knob, path, args)
+    exit(0)
+}
+
+if let path = args.nativeInStudy {
+    try nativeInStudy(path, args)
     exit(0)
 }
 let fm = FileManager.default
