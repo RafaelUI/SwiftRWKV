@@ -168,6 +168,41 @@ public final class X070Backbone {
     /// моделях и стоит точности, см. docs/Inference.md.
     public var rwkvqNativeInputDType: DType? = nil
 
+    /// Тип ОБРАТНОГО прохода через квантованную базу при базе fp16.
+    ///
+    /// Умолчание bf16: прямой проход в fp16, обратный — своим VJP,
+    /// dX = dY · W с W, деквантованной в bf16. Почему не fp16 насквозь: у
+    /// fp16 узкая экспонента (минимум нормального 6e-5), и мелкие котангенты
+    /// теряют разряды — в rwkv-metal градиенты адаптеров при fp16 насквозь
+    /// уходили от плеча без приведения на 5e-2…1.5e-1 (косинус 0.988) против
+    /// 1.3e-2 при обратном bf16. `nil` — автоград в типе базы (fp16 насквозь),
+    /// `.float32` — точнее и дороже (+360 МБ пика на 1.5B в rwkv-metal).
+    /// При базе не fp16 не действует. Прямой проход от этого не зависит.
+    /// Порт rwkv_metal/lora/rwkvq_linear.py::_build_wide_bwd_fn.
+    public var rwkvqBackwardDType: DType? = .bfloat16
+    /// Сколько проекций прошло через свой VJP (счётчик для тестов).
+    public internal(set) var rwkvqWideBackwardCalls = 0
+
+    /// x · Wᵀ в типе базы с приведением входа и выхода. `weight(dtype)` —
+    /// вес [out, in] в запрошенном типе (деквант либо плотная цель).
+    private func baseMatmul(_ x: MLXArray, base: DType,
+                            weight: @escaping (DType) -> MLXArray) -> MLXArray {
+        guard base == .float16, let bwd = rwkvqBackwardDType else {
+            return matmul(x.asType(base), weight(base).transposed()).asType(x.dtype)
+        }
+        rwkvqWideBackwardCalls += 1
+        let fn = CustomFunction {
+            Forward { ins in
+                [matmul(ins[0].asType(base), weight(base).transposed()).asType(ins[0].dtype)]
+            }
+            // буферы базы — константы, котангент только по x
+            VJP { primals, cotangents in
+                [matmul(cotangents[0].asType(bwd), weight(bwd)).asType(primals[0].dtype)]
+            }
+        }
+        return fn([x])[0]
+    }
+
     /// Декод sym ядром GEMV (без плотной матрицы) вместо «деквант + матмул».
     ///
     /// Действует ТОЛЬКО на рекуррентном шаге (`step`, генерация) и только в
@@ -192,11 +227,41 @@ public final class X070Backbone {
     /// Плотная цель в типе базы. Копия кэшируется: вес и так лежит в памяти
     /// плотным, здесь нет сжатия, которое кэш мог бы отменить.
     private func denseTarget(_ wKey: String, _ dtype: DType) -> MLXArray {
+        let raw = w[wKey]!
+        if raw.dtype == dtype { return raw }
         if let c = denseTargetCast[wKey], c.dtype == dtype { return c }
-        let c = w[wKey]!.asType(dtype)
-        eval(c)
+        let c = raw.asType(dtype)
         denseTargetCast[wKey] = c
         return c
+    }
+
+    /// Снять квантованную подложку с веса (после слияния адаптера вес
+    /// становится плотным и лежит в словаре весов).
+    func releaseRwkvqBacking(_ wKey: String) {
+        rwkvqKeys[wKey] = nil
+        rwkvqNative[wKey] = nil
+        rwkvqDenseTargets.remove(wKey)
+        denseTargetCast[wKey] = nil
+        if let sc = rwkvqSidecar {
+            let needed = Set(rwkvqKeys.filter { rwkvqNative[$0.key] == nil }.values)
+            rwkvqSidecar = needed.isEmpty ? nil : sc.pruned(keeping: needed)
+        }
+    }
+
+    /// Форма (out, in) проекции, где бы ни лежал её вес: плотным, в
+    /// стоковом кванте, в сайдкаре .rwkvq или в родном контейнере. Нужна
+    /// тем, кто навешивает адаптеры: на базе из .rwkvq плотных копий
+    /// проекций нет вовсе, и поиск по словарю плотных весов молча не
+    /// находил ни одной цели.
+    func projectionShape(_ wKey: String) -> (out: Int, in: Int)? {
+        if let v = w[wKey], v.ndim == 2 { return (v.shape[0], v.shape[1]) }
+        if let q = quant[wKey] { return (q.scales.shape[0], q.scales.shape[1] * q.groupSize) }
+        if let n = rwkvqNative[wKey] { return (n.outFeatures, n.inFeatures) }
+        if let world = rwkvqKeys[wKey], let info = rwkvqSidecar?.tensors[world],
+           info.shape.count == 2 {
+            return (info.outFeatures, info.inFeatures)
+        }
+        return nil
     }
 
     /// Считать шесть лерпов token-shift одним broadcast вместо шести пар
@@ -273,6 +338,18 @@ public final class X070Backbone {
     /// Имена таргетов с адаптерами.
     public var loraTargets: [String] { loraA.keys.sorted() }
 
+    /// Пара (A, B) адаптера цели — для внешнего цикла обучения и замеров.
+    public func loraAdapter(_ target: String) -> (MLXArray, MLXArray) {
+        (loraA[target]!, loraB[target]!)
+    }
+
+    /// Подставить пару (A, B) адаптера цели (форма и тип — на вызывающем).
+    public func setLoraAdapter(_ target: String, _ a: MLXArray, _ b: MLXArray) {
+        precondition(loraA[target] != nil, "у цели \(target) нет адаптера")
+        loraA[target] = a
+        loraB[target] = b
+    }
+
     // Чтение веса с учётом wOverride (обучаемая подмена) → frozen.
     private func wv(_ key: String) -> MLXArray { wOverride?[key] ?? w[key]! }
     private func g(_ key: String) -> MLXArray { wv(key) }
@@ -323,12 +400,17 @@ public final class X070Backbone {
                 return y.reshaped(lead + [y.shape[1]]).asType(x.dtype)
             }
         }
-        if let dense = rwkvqWeight(wKey, base) {
-            return matmul(x.asType(base), dense.transposed()).asType(x.dtype)
+        if rwkvqKeys[wKey] != nil, rwkvqSidecar != nil {
+            // вес деквантуется заново на каждое обращение (и в обратном
+            // проходе тоже): транзиент не хранится
+            return baseMatmul(x, base: base) { [unowned self] dt in
+                self.rwkvqWeight(wKey, dt)!
+            }
         }
         if rwkvqDenseTargets.contains(wKey), wOverride?[wKey] == nil {
-            return matmul(x.asType(base), denseTarget(wKey, base).transposed())
-                .asType(x.dtype)
+            return baseMatmul(x, base: base) { [unowned self] dt in
+                self.denseTarget(wKey, dt)
+            }
         }
         return matmul(x, wv(wKey).transposed())
     }

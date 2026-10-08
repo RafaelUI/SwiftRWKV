@@ -764,8 +764,58 @@ func knobSpeedAB(_ knob: String, _ path: String, _ args: Args) throws {
                  processFootprintGB(), Double(GPU.activeMemory) / 1e9, Double(GPU.peakMemory) / 1e9))
 }
 
+/// Цена своего VJP квантованной базы (обратный проход bf16 при базе fp16)
+/// против автограда в типе базы: параллельный прямой проход (T=256) и шаг
+/// градиента по адаптерам (T=64, блочный чекпоинт), чередованием.
+func wideBackwardAB(_ path: String, _ args: Args) throws {
+    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    LoRA.add(to: bb, spec: LoRASpec(rank: 16, alpha: 32))
+    bb.useBlockCheckpoint = true
+    print("L=\(bb.cfg.nLayer) D=\(bb.cfg.nEmbd); файл \(path); адаптеров \(bb.loraTargets.count)")
+    let (ids, _) = inputIds(257, vocab: bb.cfg.vocab, vocabPath: args.vocab)
+    let all = MLXArray(ids.map { Int32($0) }, [1, 257])
+    let xf = all[0..., 0 ..< 256]
+    let xg = all[0..., 0 ..< 64], yg = all[0..., 1 ..< 65]
+    let keysA = bb.loraTargets
+    func forward() -> Double {
+        let t0 = Date(); let l = bb(xf); eval(l); return Date().timeIntervalSince(t0) * 1e3
+    }
+    func gradStep() -> Double {
+        let params = keysA.map { bb.loraAdapter($0).0 } + keysA.map { bb.loraAdapter($0).1 }
+        let t0 = Date()
+        let g = grad({ (ps: [MLXArray]) -> [MLXArray] in
+            for (i, k) in keysA.enumerated() { bb.setLoraAdapter(k, ps[i], ps[keysA.count + i]) }
+            let l = bb(xg).asType(.float32)
+            let lp = l - logSumExp(l, axis: -1, keepDims: true)
+            return [-takeAlong(lp, yg.expandedDimensions(axis: -1), axis: -1).mean()]
+        }, argumentNumbers: Array(0 ..< params.count))(params)
+        eval(g)
+        let dt = Date().timeIntervalSince(t0) * 1e3
+        for (i, k) in keysA.enumerated() { bb.setLoraAdapter(k, params[i], params[keysA.count + i]) }
+        return dt
+    }
+    for (name, work) in [("прямой проход T=256", forward), ("шаг градиента T=64", gradStep)] {
+        // --only wide | through: одно плечо (для моделей, где шаг тяжёл)
+        let arms: [Bool] = args.only == "wide" ? [true] : args.only == "through" ? [false] : [true, false]
+        for wide in arms { bb.rwkvqBackwardDType = wide ? .bfloat16 : nil; _ = work() }
+        print("  \(name): прогрев пройден"); fflush(stdout)
+        var mW: [Double] = [], mT: [Double] = []
+        for r in 0 ..< args.rounds {
+            for wide in (r % 2 == 0 ? arms : arms.reversed()) {
+                bb.rwkvqBackwardDType = wide ? .bfloat16 : nil
+                let ms = work()
+                if wide { mW.append(ms) } else { mT.append(ms) }
+                print(String(format: "    %@ %.1f", wide ? "обратный bf16" : "автоград fp16", ms)); fflush(stdout)
+            }
+        }
+        print(String(format: "%@, мс (медиана, %d раундов): автоград fp16 %.1f | обратный bf16 %.1f",
+                     name, args.rounds, mT.isEmpty ? .nan : median(mT), mW.isEmpty ? .nan : median(mW)))
+    }
+    print(String(format: "footprint в конце: %.2f ГБ; MLX пик %.2f ГБ", processFootprintGB(), Double(GPU.peakMemory) / 1e9))
+}
+
 if let knob = args.knob, let path = args.knobPath {
-    try knobSpeedAB(knob, path, args)
+    if knob == "wide-bwd" { try wideBackwardAB(path, args) } else { try knobSpeedAB(knob, path, args) }
     exit(0)
 }
 

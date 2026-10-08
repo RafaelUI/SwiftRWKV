@@ -95,8 +95,14 @@ public enum LoRA {
     public static func add(to bb: X070Backbone, spec: LoRASpec) -> LoRAInfo {
         let nLayer = bb.cfg.nLayer
         let sel = spec.layers ?? (0 ..< nLayer)
-        let baseDType = bb.w["emb.weight"]?.dtype
+        var baseDType = bb.w["emb.weight"]?.dtype
             ?? bb.w.values.first?.dtype ?? .bfloat16
+        // Адаптеры в fp16 не заводятся никогда: у fp16 узкая экспонента, и
+        // на слое 0 fp16-модели (.rwkvq в норме), где вход ещё fp16, цепочка
+        // x·Aᵀ·Bᵀ шла бы в fp16 целиком — котангенты переполняются, градиент
+        // адаптеров слоя 0 выходит NaN. bf16 — тот же размер и диапазон fp32;
+        // так же держит адаптеры rwkv-metal.
+        if baseDType == .float16 { baseDType = .bfloat16 }
         let scale = spec.alpha / Float(spec.rank)
 
         // total params ДО возможного дропа bf16-базы при квантизации:
@@ -108,8 +114,10 @@ public enum LoRA {
         var newAdapters: [MLXArray] = []
 
         func attach(_ wKey: String, _ target: String, _ shortName: String) {
-            guard let W = bb.w[wKey] ?? dequantShape(bb, wKey) else { return }
-            let (outF, inF) = outIn(W)
+            // Форма — где бы ни лежал вес: на базе из .rwkvq плотных копий
+            // проекций нет, и прежний поиск по словарю плотных весов молча
+            // не навешивал НИ ОДНОГО адаптера.
+            guard let (outF, inF) = bb.projectionShape(wKey) else { return }
             let a = (MLXRandom.normal([spec.rank, inF]) * (1.0 / sqrt(Float(inF))))
                         .asType(baseDType)
             let b = MLXArray.zeros([outF, spec.rank], dtype: baseDType)
@@ -191,9 +199,17 @@ public enum LoRA {
                 bb.quant[wKey] = nil
             } else if let w0 = bb.w[wKey] {
                 baseW = w0
+            } else if let dq = bb.denseWeight(wKey) {
+                // база .rwkvq: вес разворачивается и дальше живёт плотным
+                // (как merge_lora в rwkv-metal) — в квантованный файл
+                // адаптер не «запекается»
+                baseW = dq
             } else { continue }
             let delta = scale * matmul(b, a)                  // [out,rank]·[rank,in]=[out,in]
-            bb.w[wKey] = (baseW.asType(.float32) + delta.asType(.float32)).asType(bf)
+            let fromRwkvq = bb.isRwkvqBacked(wKey) || bb.rwkvqDenseTargets.contains(wKey)
+            let outType: DType = fromRwkvq ? (bb.w["emb.weight"]?.dtype ?? bf) : bf
+            bb.w[wKey] = (baseW.asType(.float32) + delta.asType(.float32)).asType(outType)
+            if fromRwkvq { bb.releaseRwkvqBacking(wKey) }
             bb.loraA[t] = nil; bb.loraB[t] = nil; bb.loraScale[t] = nil
         }
         bb.trainLayers = []
