@@ -161,6 +161,13 @@ public final class X070Backbone {
     /// процессе.
     public var rwkvqBaseDType: DType? = nil
 
+    /// Тип входа родного ядра sb6 (`quantizedMM`). `nil` — по правилу: fp32
+    /// в норме (так считает RwkvqNativeLinear в rwkv-metal, с ним порт на
+    /// COMPRESSION совпадает до ~1e-8 KL), fp16 на прежнем пути. Явное
+    /// значение — для A/B в одном процессе: fp16-вход быстрее на крупных
+    /// моделях и стоит точности, см. docs/Inference.md.
+    public var rwkvqNativeInputDType: DType? = nil
+
     /// Цели, которые лежат в файле ПЛОТНЫМИ (нынешние пресеты: o_proj слоя 0,
     /// bits_overrides → 16). Это намерение файла, а не ошибка: вес —
     /// исходный bf16 как есть, замороженная плотная база, LoRA встаёт поверх
@@ -284,7 +291,8 @@ public final class X070Backbone {
         if let n = rwkvqNative[wKey] {
             // Норма: вход quantizedMM в fp32, как у RwkvqNativeLinear в
             // rwkv-metal. Прежний путь подавал fp16.
-            let inType: DType = rwkvqBaseDType == nil ? .float16 : .float32
+            let inType = rwkvqNativeInputDType
+                ?? (rwkvqBaseDType == nil ? DType.float16 : DType.float32)
             return n(x.asType(inType)).asType(x.dtype)
         }
         guard let base = rwkvqBaseDType else {

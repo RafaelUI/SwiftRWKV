@@ -84,6 +84,15 @@ struct Args {
     var noFuseLerp = false
     var manifest = false
     var nativeRef = "~/Develop/SwiftRWKV/.testdata/mlx_affine_ref.safetensors"
+    /// A/B нормы против прежнего пути порта на ОДНОМ .rwkvq, чередованием:
+    /// см. `rwkvqNormAB`. Плотная модель и сайдкар в этом режиме не нужны.
+    var rwkvq: String? = nil
+    /// Прежний путь базы (деквант в тип входа, без приведения) в обычном
+    /// режиме замера. По умолчанию ВКЛЮЧЁН: под ним сняты все числа
+    /// docs/Inference.md, и замер «как раньше» обязан мерить то же самое.
+    var legacyBase = true
+    /// В режиме --rwkvq: плечо «норма» подаёт в родное ядро fp16 вместо fp32.
+    var nativeIn16 = false
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -111,6 +120,9 @@ func parseArgs() -> Args {
         case "--fuse-parity": a.fuseParity = true
         case "--no-fuse-lerp": a.noFuseLerp = true
         case "--manifest": a.manifest = true
+        case "--rwkvq": a.rwkvq = it.next()
+        case "--norm-base": a.legacyBase = false
+        case "--native-in16": a.nativeIn16 = true
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -518,6 +530,72 @@ func fuseParity(_ model: X070Backbone, cfg: X070Config, ids: [Int]) -> Int {
 // ── Прогон ──────────────────────────────────────────────────────────────
 
 let args = parseArgs()
+
+/// Норма (.rwkvq: параметры fp16, база fp16) против прежнего пути порта
+/// (параметры bf16, деквант в тип входа) на одном файле, чередованием в
+/// одном процессе. `--only norm|legacy` — для моделей, две копии которых в
+/// память не помещаются; тогда чередование делается запусками.
+func rwkvqNormAB(_ path: String, _ args: Args) throws {
+    func load(_ norm: Bool) throws -> (X070Backbone, Double) {
+        let before = processFootprintGB()
+        let bb = norm
+            ? try X070Backbone.load(fromRwkvq: expand(path), useNativeKernel: true)
+            : try X070Backbone.load(fromRwkvq: expand(path), paramDType: .bfloat16,
+                                    baseDType: nil, useNativeKernel: true)
+        bb.castWKVOutputToComputeDType = args.castWKV
+        bb.fuseLerp = !args.noFuseLerp
+        if norm, args.nativeIn16 { bb.rwkvqNativeInputDType = .float16 }
+        GPU.clearCache()
+        let grown = processFootprintGB() - before
+        print(String(format: "  после загрузки (%@): footprint +%.2f ГБ; MLX активная %.2f, кеш %.2f, пик %.2f ГБ",
+                     norm ? "норма" : "прежний", grown, Double(GPU.activeMemory) / 1e9,
+                     Double(GPU.cacheMemory) / 1e9, Double(GPU.peakMemory) / 1e9))
+        return (bb, grown)
+    }
+    let wantNorm = args.only != "legacy", wantLegacy = args.only != "norm"
+    let norm = wantNorm ? try load(true) : nil
+    let legacy = wantLegacy ? try load(false) : nil
+    let cfg = (norm ?? legacy)!.0.cfg
+    print("L=\(cfg.nLayer) D=\(cfg.nEmbd) V=\(cfg.vocab); castWKV = \(args.castWKV); "
+          + "вход родного ядра в норме: \(args.nativeIn16 ? "fp16" : "fp32")")
+    if let n = norm { print(String(format: "footprint загрузки, норма: +%.2f ГБ", n.1)) }
+    if let l = legacy { print(String(format: "footprint загрузки, прежний путь: +%.2f ГБ", l.1)) }
+
+    let (ids, _) = inputIds(args.steps, vocab: cfg.vocab, vocabPath: args.vocab)
+    let (warm, _) = inputIds(args.warmup, vocab: cfg.vocab, vocabPath: args.vocab)
+    if let n = norm { _ = decode(n.0, cfg: cfg, ids: warm) }
+    if let l = legacy { _ = decode(l.0, cfg: cfg, ids: warm) }
+    var msN: [Double] = [], msL: [Double] = []
+    var topN: [Int] = [], topL: [Int] = []
+    for r in 0 ..< args.rounds {
+        var line = String(format: "  раунд %d:", r)
+        // порядок плеч чередуется: кто идёт вторым, тот идёт по нагретому
+        let order = r % 2 == 0 ? [true, false] : [false, true]
+        for isNorm in order {
+            guard let m = isNorm ? norm : legacy else { continue }
+            let (t, out, _) = decode(m.0, cfg: cfg, ids: ids)
+            let ms = t * 1e3 / Double(args.steps)
+            if isNorm { msN.append(ms); topN = out } else { msL.append(ms); topL = out }
+            line += String(format: "  %@ %.2f мс/ток", isNorm ? "норма" : "прежний", ms)
+        }
+        print(line); fflush(stdout)
+    }
+    if !msN.isEmpty { print(String(format: "норма:        медиана %.2f мс/ток = %.1f ток/с", median(msN), 1000 / median(msN))) }
+    if !msL.isEmpty { print(String(format: "прежний путь: медиана %.2f мс/ток = %.1f ток/с", median(msL), 1000 / median(msL))) }
+    if !msN.isEmpty, !msL.isEmpty {
+        print(String(format: "норма / прежний = %.3f", median(msN) / median(msL)))
+        let agree = zip(topN, topL).filter { $0 == $1 }.count
+        print("top-1 при общем входе: совпало \(agree) из \(topN.count)")
+    }
+    print(String(format: "footprint в конце: %.2f ГБ; MLX активная %.2f, кеш %.2f, пик %.2f ГБ",
+                 processFootprintGB(), Double(GPU.activeMemory) / 1e9,
+                 Double(GPU.cacheMemory) / 1e9, Double(GPU.peakMemory) / 1e9))
+}
+
+if let path = args.rwkvq {
+    try rwkvqNormAB(path, args)
+    exit(0)
+}
 let fm = FileManager.default
 guard fm.fileExists(atPath: expand(args.model)) else {
     print("нет модели: \(args.model)"); exit(2)
@@ -587,7 +665,8 @@ if let q = quantized {
         sidecar,
         options: X070Backbone.RwkvqAttachOptions(quantizeCmix: args.quantizeCmix,
                                                  quantizeHead: args.quantizeHead,
-                                                 useNativeKernel: args.native))
+                                                 useNativeKernel: args.native,
+                                                 baseDType: args.legacyBase ? nil : .float16))
     print("сайдкар: подключено \(info.attached) весов, "
           + "не найдено \(info.missing.count), "
           + "сжатых буферов \(String(format: "%.1f", Double(info.packedBytes) / 1e6)) МБ, "

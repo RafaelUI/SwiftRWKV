@@ -63,8 +63,8 @@ run "база по умолчанию — прежний путь (без при
 run "деквант базы округляется в bf16" \
     "$BB" 'if let dense = rwkvqWeight(wKey, base) {' 'if let dense = rwkvqWeight(wKey, .bfloat16) {'
 run "родное ядро получает вход в fp16" \
-    "$BB" 'let inType: DType = rwkvqBaseDType == nil ? .float16 : .float32' \
-          'let inType: DType = .float16'
+    "$BB" '?? (rwkvqBaseDType == nil ? DType.float16 : DType.float32)' \
+          '?? DType.float16'
 run "нормировка fp16 идёт ручной формулой" \
     "$BB" 'if x.dtype == .float16 { return MLX.layerNorm' 'if x.dtype == .float64 { return MLX.layerNorm'
 run "зажим scale обнуляется всегда (fp16)" \
