@@ -205,6 +205,30 @@ final class RwkvqModelTests: XCTestCase {
         }
     }
 
+    /// Рекуррентный шаг от ПУСТОГО состояния на fp16-модели: слой 0 обязан
+    /// считать в fp16, как параллельный путь, а не подниматься до fp32 из-за
+    /// того, что пустое состояние заведено в bf16.
+    func testStepFromEmptyStateStaysInTheNorm() throws {
+        for preset in RwkvqFileTests.presets {
+            let f = try Self.fixture(preset)
+            let bb = try X070Backbone.load(fromRwkvq: f.path)
+            let ids = f.ref["input_ids"]!
+            var rs = RWKVState(cfg: bb.cfg)                      // нули в bf16
+            var rsHalf = RWKVState(cfg: bb.cfg, dtype: .float16) // нули в типе модели
+            var rows: [MLXArray] = []
+            for i in 0 ..< 8 {
+                let id = ids[0, i].item(Int.self)
+                rows.append(bb.step(id, state: &rs).asType(.float32))
+                let same = bb.step(id, state: &rsHalf).asType(.float32)
+                XCTAssertEqual(RwkvqFileTests.mismatches(rows[i], same), 0,
+                               "\(preset), токен \(i): результат зависит от типа пустого состояния")
+            }
+            let kl = Self.kl(f.ref["logits_metal"]![0 ..< 8], stacked(rows, axis: 0).reshaped([8, -1]))
+            print(String(format: "ШАГ С НУЛЯ %@: KL(metal‖шаг) %.3e", preset, kl))
+            XCTAssertLessThan(kl, 2 * f.klRefMetal, preset)
+        }
+    }
+
     // ── Типы: плечи в одном процессе ─────────────────────────────────
 
     /// Норма не декларация, а измеримое свойство: к точному счёту fp16-база

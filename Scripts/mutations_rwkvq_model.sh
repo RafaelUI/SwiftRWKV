@@ -71,6 +71,10 @@ run "зажим scale обнуляется всегда (fp16)" \
     "$NA" 'if exactScales, !arrayEqual' 'if false, !arrayEqual'
 run "зажим scale: тип решает не сверка декванта" \
     "$NA" 'useHalf = arrayEqual(a, b).item(Bool.self)' 'useHalf = false'
+run "шаг: prev не приводится к типу fp16-модели" \
+    Sources/RWKVGen/X070Generation.swift \
+    'let prev = x.dtype == .float16 ? state.tmixPrev[layer].asType(.float16)' \
+    'let prev = x.dtype == .float64 ? state.tmixPrev[layer].asType(.float16)'
 
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

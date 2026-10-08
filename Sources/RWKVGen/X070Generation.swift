@@ -119,7 +119,15 @@ extension X070Backbone {
         let p = "blocks.\(layer).tmix."
         let D = cfg.nEmbd, H = cfg.nHead, S = cfg.headSize
 
-        let prev = state.tmixPrev[layer]      // [1,D]
+        // fp16-модель (норма .rwkvq): prev приводится к типу x, как это
+        // делает параллельный путь (rwkvTokenShift). Иначе пустое состояние
+        // (оно заводится в bf16) или состояние из батчевого (стопка слоёв,
+        // fp32) подняло бы слой 0 до fp32, и шаг разошёлся бы с ядром.
+        // ТОЛЬКО для fp16: у bf16-модели шаг после моста из батчевого
+        // состояния считает слой 0 в fp32 с самого начала, под этим сняты
+        // эталоны декода, и сдвигать их незачем.
+        let prev = x.dtype == .float16 ? state.tmixPrev[layer].asType(.float16)
+                                       : state.tmixPrev[layer]      // [1,D]
         let xx = prev - x                     // token-shift: prev - x
         state.tmixPrev[layer] = x             // обновляем shift-state
 
@@ -184,7 +192,8 @@ extension X070Backbone {
     // cmix для одного токена.
     private func cmixStep(_ x: MLXArray, _ layer: Int, _ state: inout RWKVState) -> MLXArray {
         let p = "blocks.\(layer).cmix."
-        let prev = state.cmixPrev[layer]
+        let prev = x.dtype == .float16 ? state.cmixPrev[layer].asType(.float16)
+                                       : state.cmixPrev[layer]
         let xx = prev - x
         state.cmixPrev[layer] = x
         let xk = x + xx * gg(p+"x_k")
