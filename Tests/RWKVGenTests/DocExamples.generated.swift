@@ -683,6 +683,27 @@ func doc_Train_6() throws {
                              vocab: weights["head.weight"]!.shape[0])
         return X070Backbone(weights: weights, cfg: cfg)
     }
+    let model = try X070Backbone.load(fromRwkvq: "~/models/rwkv7-g1d-0.1b-reduction.rwkvq")
+    let added = LoRA.add(to: model, spec: LoRASpec(rank: 16, alpha: 32))
+    print(added.numAdapters)        // every tmix target, quantised or dense
+    // ... train as above ...
+    LoRA.merge(model)               // merged targets become dense weights
+}
+
+func doc_Train_7() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
     let examples = [X070Example(ids: [1, 2, 3], label: 0),
                     X070Example(ids: [4, 5, 6], label: 1)]
@@ -703,7 +724,7 @@ func doc_Train_6() throws {
     X070PartialFinetune.clearCache()
 }
 
-func doc_Train_7() throws {
+func doc_Train_8() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -740,7 +761,7 @@ func doc_Train_7() throws {
     print(cfg.modelConfig.nLayer, cfg.resolvedMaxSteps())
 }
 
-func doc_Train_8() throws {
+func doc_Train_9() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -762,7 +783,7 @@ func doc_Train_8() throws {
     print(weights.count, backbone.cfg.nLayer)
 }
 
-func doc_Train_9() throws {
+func doc_Train_10() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -789,7 +810,7 @@ func doc_Train_9() throws {
     print(source().x.shape)
 }
 
-func doc_Train_10() throws {
+func doc_Train_11() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)

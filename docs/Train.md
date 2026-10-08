@@ -267,8 +267,41 @@ print(LoRA.adapterState(base).count)
 
 **QLoRA note.** `spec.quantizeBits > 0` quantises the target weights through
 MLX's own affine quantisation, which is a *different* mechanism from the
-`.rwkvq` sidecar described in [Inference.md](Inference.md). The two coexist;
-there is no path today that trains adapters on top of a `.rwkvq` base.
+`.rwkvq` base described in [Inference.md](Inference.md). The two coexist.
+
+### Adapters on a `.rwkvq` base
+
+A backbone loaded from a `.rwkvq` takes adapters the same way; the base stays
+compressed and frozen, and the gradient flows through it:
+
+```swift
+let model = try X070Backbone.load(fromRwkvq: "~/models/rwkv7-g1d-0.1b-reduction.rwkvq")
+let added = LoRA.add(to: model, spec: LoRASpec(rank: 16, alpha: 32))
+print(added.numAdapters)        // every tmix target, quantised or dense
+// ... train as above ...
+LoRA.merge(model)               // merged targets become dense weights
+```
+
+Three things differ from a dense base, all deliberate:
+
+- **The backward pass through the base is wider than the forward.** The base
+  computes in fp16 (the rwkv-quant norm); differentiating straight through it
+  loses small cotangents to fp16's narrow exponent. On 0.1B the relative error
+  of adapter gradients against an fp32 matmul goes from 4.8e-3 to 0.65 when the
+  loss is scaled down by 4096 — which is what a long averaged batch does to it.
+  So the base carries its own VJP: forward in fp16, backward `dX = dY · W` with
+  `W` dequantised in bf16 (`rwkvqBackwardDType`, default `.bfloat16`; `nil` is
+  plain autograd, `.float32` is more exact and costs memory). Its error stays
+  at 7.0e-3 at both scales, and it costs about 2% of a training step.
+- **Adapters are never created in fp16**, even though the model's dense
+  parameters are: they are bf16, as in rwkv-metal. In fp16 the adapters of
+  layer 0, whose input is still fp16, overflow in the backward pass.
+- **`merge` produces dense weights.** A merged target is dequantised, the
+  adapter is added, and the result lives as an ordinary dense weight; nothing
+  is baked back into the quantised file.
+
+The `sym` decode kernel (see Inference.md) is not on this path at all: it is
+opaque to autograd and runs only in the recurrent step.
 
 ---
 
@@ -450,5 +483,16 @@ legitimate training input.
   `RerankDataset` does this correctly and the code transfers by copying.
 - **No tokeniser for non-World vocabularies**, which limits pretraining on a
   custom vocabulary: Swift has no equivalent of HuggingFace `tokenizers`.
-- **No training on a `.rwkvq` base.** QLoRA quantises through MLX's own
-  mechanism; the sidecar format is inference-only here.
+- **Large backward passes can trip the GPU watchdog.** MLX packs up to 40 ops
+  into one Metal command buffer on this class of machine. With the WKV
+  backward kernel inside, a buffer can run long enough for the GPU to be reset
+  (`kIOGPUCommandBufferCallbackErrorHang`, then address faults or "innocent
+  victim" errors in the buffers that follow); the process either dies or
+  carries on with NaN gradients in the lowest layers. Reproduced on a *dense*
+  bf16 0.1B with LoRA at T = 48 without block checkpointing (NaN or a crash in
+  3 runs of 3) and on a 1.5B `.rwkvq` base at T = 64 with it (crash in 3 runs
+  of 4). `MLX_MAX_OPS_PER_BUFFER=4` in the environment removed it in every run
+  tried (0.1B: 18 rounds clean; 1.5B: 4 runs of 4) and made the 1.5B step 7%
+  faster (490 ms against 529). T = 16 was clean either way. Found 09.10 on
+  macOS 27 beta; whether a release OS behaves the same is not known. Until
+  that is settled, set the variable for training runs on real models.

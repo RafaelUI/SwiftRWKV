@@ -377,7 +377,7 @@ Both current rwkv-quant presets open this way:
 | preset | projections, FFN, head | how they are computed |
 |---|---|---|
 | `compression` | `sb6`, 4–6 bit, block 32 | relayouted once into MLX's quantised container; `quantizedMM`, no dense matrix ever materialised |
-| `reduction` | `sym` (Q6_K-like), 6 and 8 bit, block 16 | dequantised by one Metal kernel per call, then an fp16 matmul — MLX's quantised matmul has no block-16 group, and an inexact relayout would be a different base under the same name |
+| `reduction` | `sym` (Q6_K-like), 6 and 8 bit, block 16 | decode: a GEMV kernel over the compressed codes, no dense matrix. Parallel pass: dequantised by one Metal kernel per call, then an fp16 matmul — MLX's quantised matmul has no block-16 group, and an inexact relayout would be a different base under the same name |
 
 Everything else in the file (norms, token-shift mixes, the low-rank branches,
 the embedding table) is unpacked once at load into dense parameters. A target
@@ -395,23 +395,46 @@ same weights is 4.80e-6 (`reduction`) and 3.72e-6 (`compression`), against
 model for an A/B in one process. A dense `.safetensors` backbone is unaffected
 and stays bf16.
 
-Decode speed on an M4 (16 GB, fanless), release build, one process with the
-two arms alternating; "before" is this port's previous path (bf16 parameters,
-dequantise into the type of the input):
+Decode speed on an M4 (16 GB, fanless), release build, arms alternating in
+one process, ms per token:
 
-| 1.5B, ms/token | norm | before |
-|---|---|---|
-| `reduction` (sym, dequantise + matmul per call) | 84.8 | 150.2 |
-| `compression` (sb6, `quantizedMM`) | 25.4 | 20.0 |
+| | 0.1B | 0.4B | 1.5B | 2.9B |
+|---|---|---|---|---|
+| `reduction`, sym GEMV kernel (default) | 5.06 | 10.91 | 24.84 | 45.61 |
+| `reduction`, dequantise + matmul per call | 9.54 | 24.26 | 85.36 | 169.08 |
+| `compression`, `quantizedMM`, fp32 input (default) | 4.99 | 11.16 | 25.61 | 49.13 |
+| `compression`, `quantizedMM`, fp16 input | 4.91 | 10.81 | 20.01 | 37.55 |
 
-`reduction` gets faster because the matmul is fp16 instead of fp32. It is still
-far from what the format allows: rwkv-quant's own Metal backend decodes sym
-inside a GEMV kernel and never materialises the matrix; that kernel is not
-ported here. `compression` gets 27% slower, and the cause is one cast: the
-norm feeds `quantizedMM` an fp32 input, as rwkv-metal does, where the previous
-path fed fp16. `rwkvqNativeInputDType = .float16` buys the speed back (20.0
-ms/token) for +2.3e-6 KL on 0.1B — the same order as the fp16 matmul noise the
-`reduction` path already carries. The default follows the reference.
+**`reduction` decodes through a GEMV kernel** ported from rwkv-quant's Metal
+backend: the codes are decoded inside the dot product and no dense matrix is
+ever materialised. It runs in the recurrent step only (`step`, generation) —
+the kernel is opaque to autograd, so the parallel pass and everything a
+gradient flows through keep the dequantise-and-matmul path. Its output is
+bit-equal to rwkv-quant's kernel. The numbers differ slightly from the
+parallel path by construction: the kernel uses the exact weight `q · s` and
+accumulates in fp32, the parallel path rounds the weight to fp16 first; the two
+agree to ~2e-6 KL on 0.1B, the same order as the fp16 matmul noise.
+`rwkvqSymDecodeKernel = false` turns it off.
+
+**`compression` and the input type of `quantizedMM`.** The norm feeds it an
+fp32 input, as rwkv-metal does; `rwkvqNativeInputDType = .float16` is faster on
+large models. What it costs, measured with rwkv-quant's instrument — KL to the
+original checkpoint (bf16 weights, fp32 evaluation) over 12 held-out windows of
+256 tokens (en/ru/sr), paired bootstrap over windows:
+
+| | KL(original ‖ fp32 in) | KL(original ‖ fp16 in) | change | decode time |
+|---|---|---|---|---|
+| 0.1B | 0.033165 | 0.033175 | +0.03% [−0.03; +0.11] | −1.4% |
+| 0.4B | 0.027963 | 0.027966 | +0.01% [−0.05; +0.07] | −3.1% |
+| 1.5B | 0.017904 | 0.017918 | +0.08% [+0.02; +0.14] | −21.9% |
+| 2.9B | — | — | — | −23.6% |
+
+The original 2.9B does not fit in 16 GB in fp32, so there the only measure is
+the noise against an exact evaluation of the same quantised weights: 8.8e-7
+(fp32 in) against 2.6e-6 (fp16 in), the same pattern as at 1.5B (1.0e-6 against
+3.4e-6). The cost is three to four orders of magnitude below the quantisation
+error itself; the default still follows the reference. Do not use the fp16
+input for training — the gradient would go straight through fp16.
 
 Loading 1.5B `compression` (0.95 GiB on disk) peaks at 3.5 GB and settles at
 1.5 GB; `reduction` (1.34 GiB) peaks at 1.9 GB with 1.6 GB of MLX memory live.
