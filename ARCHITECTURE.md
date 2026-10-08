@@ -285,8 +285,22 @@ with bit-exact verification against a PyTorch reference:
   a quantized base is that it lives compressed in memory; a dense cache silently
   converts QLoRA back into LoRA with extra steps.
 
-**Decision: two-stage conversion stays — but the reason it stood no longer
-holds.** It rested on "reading `.rwkvq` natively requires torch", and that was
+**Update, 08.10: `.rwkvq` is read directly.** `RwkvqFile.swift` ports the
+container and the loader-layout relayout from `rwkv_quant.formats.codec`
+(safetensors parsed here, manifest from `__metadata__`, K3 and the sym
+interleave built at load and equal to the sidecar's buffer for buffer). The
+`sym` layout (Q6_K-like, block 16, 6 and 8 bit — the whole current REDUCTION
+preset) has its own dequant kernel, ported from `quant_linear_sym.py`; it has
+no MLX-native container, because `quantizedMM` has no block-16 group. The
+numeric norm for a quantised base is fp16 — dense parameters and base alike —
+and a target the file keeps dense is a frozen dense base. The sidecar remains
+as an optional cache. The first invariant below ("the final combine is fp32")
+still holds for the sb6 and sym fp32/bf16 branches; the sym fp16 branch
+multiplies in half by design, bit-equal to fp16 of the fp32 result. What
+follows is the earlier state of this decision, kept for the reasoning.
+
+**Decision (superseded): two-stage conversion stays — but the reason it stood
+no longer holds.** It rested on "reading `.rwkvq` natively requires torch", and that was
 true of the pickle-era container. `.rwkvq` is now a safetensors archive with a
 self-describing manifest, and `rwkv_quant.formats.codec` reads it *and* builds
 either loader layout in pure numpy, with a gate that blocks torch at the import

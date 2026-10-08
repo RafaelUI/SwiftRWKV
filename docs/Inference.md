@@ -355,16 +355,80 @@ with mean pairwise cosine 0.9127. Fine-tune before using this for retrieval.
 ## The `.rwkvq` quantised backend
 
 `.rwkvq` is the checkpoint format of [rwkv-quant], a quantisation toolkit for
-RWKV-7 on Apple silicon. It is a **sidecar**: quantised weights live in their
-own file, and a dense backbone is told to read from it instead of from its own
-copies. Nothing about it is specific to generation, reranking or embeddings —
-it replaces weight access underneath all three.
+RWKV-7 on Apple silicon. Nothing about it is specific to generation, reranking
+or embeddings — it replaces weight access underneath all three.
 
 [rwkv-quant]: https://github.com/RafaelUI/rwkv-quant
 
+### Loading a `.rwkvq` directly
+
+A `.rwkvq` is self-contained: a safetensors archive whose metadata carries the
+manifest, holding every tensor of the model. One call builds the backbone from
+it — no dense checkpoint, no conversion step:
+
+```swift
+let model = try X070Backbone.load(fromRwkvq: "~/models/rwkv7-g1d-0.1b-reduction.rwkvq")
+var st = RWKVState(cfg: model.cfg)
+print(model.prefill([1, 2, 3], state: &st).shape)
+```
+
+Both current rwkv-quant presets open this way:
+
+| preset | projections, FFN, head | how they are computed |
+|---|---|---|
+| `compression` | `sb6`, 4–6 bit, block 32 | relayouted once into MLX's quantised container; `quantizedMM`, no dense matrix ever materialised |
+| `reduction` | `sym` (Q6_K-like), 6 and 8 bit, block 16 | dequantised by one Metal kernel per call, then an fp16 matmul — MLX's quantised matmul has no block-16 group, and an inexact relayout would be a different base under the same name |
+
+Everything else in the file (norms, token-shift mixes, the low-rank branches,
+the embedding table) is unpacked once at load into dense parameters. A target
+the file keeps dense — the layer-0 output projection in both presets — stays a
+frozen dense base.
+
+**The numeric norm is fp16**, for dense parameters and for the quantised base
+alike: dequantised weights are rounded to fp16 and the projection runs in fp16,
+with the input cast in and the result cast back. This is the norm rwkv-quant
+measures its presets under; bf16 keeps three fewer mantissa bits in the same
+two bytes. Checked against rwkv-metal on 0.1B: KL to an exact evaluation of the
+same weights is 4.80e-6 (`reduction`) and 3.72e-6 (`compression`), against
+4.68e-6 and 3.71e-6 for rwkv-metal itself. Both types can be overridden
+(`paramDType:`, `baseDType:`), and `rwkvqBaseDType` can be switched on a live
+model for an A/B in one process. A dense `.safetensors` backbone is unaffected
+and stays bf16.
+
+Decode speed on an M4 (16 GB, fanless), release build, one process with the
+two arms alternating; "before" is this port's previous path (bf16 parameters,
+dequantise into the type of the input):
+
+| 1.5B, ms/token | norm | before |
+|---|---|---|
+| `reduction` (sym, dequantise + matmul per call) | 84.8 | 150.2 |
+| `compression` (sb6, `quantizedMM`) | 25.4 | 20.0 |
+
+`reduction` gets faster because the matmul is fp16 instead of fp32. It is still
+far from what the format allows: rwkv-quant's own Metal backend decodes sym
+inside a GEMV kernel and never materialises the matrix; that kernel is not
+ported here. `compression` gets 27% slower, and the cause is one cast: the
+norm feeds `quantizedMM` an fp32 input, as rwkv-metal does, where the previous
+path fed fp16. `rwkvqNativeInputDType = .float16` buys the speed back (20.0
+ms/token) for +2.3e-6 KL on 0.1B — the same order as the fp16 matmul noise the
+`reduction` path already carries. The default follows the reference.
+
+Loading 1.5B `compression` (0.95 GiB on disk) peaks at 3.5 GB and settles at
+1.5 GB; `reduction` (1.34 GiB) peaks at 1.9 GB with 1.6 GB of MLX memory live.
+
+The other decode numbers in this section were measured on the older path; see
+the note on `baseDType` below.
+
+### Attaching a quantised base to a dense backbone
+
+The same file (or the optional `export_mlx` **sidecar**, which holds the
+loader layout ready-made) can also be attached to a dense backbone, which is
+then told to read from it instead of from its own copies:
+
 ```swift
 let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
-let sidecar = try RwkvqSidecar(path: "~/models/0.1B_reduction.rwkvq_mlx")
+// `open` takes a .rwkvq or a sidecar path (without the suffix)
+let sidecar = try RwkvqSidecar.open("~/models/0.1B_reduction.rwkvq_mlx")
 
 let info = base.attachRwkvq(sidecar)
 print(info.attached,            // tensors now backed by the sidecar
@@ -383,8 +447,13 @@ base.detachRwkvq()   // only meaningful with dropDenseWeights: false
 Measured on 0.1B with the `reduction` preset: **73 tensors attached, 270 MB of
 dense weights freed, 153 MB packed in their place.**
 
-By default `attachRwkvq` covers the four tmix projections on every layer plus
-the LM head. What it covers is configurable:
+By default `attachRwkvq` covers the four tmix projections and the two cmix
+matrices on every layer plus the LM head. What it covers is configurable, and
+so is the type of the base: `baseDType` defaults to `.float16` (the norm
+above); `nil` selects the path this port used before — dequantise into the
+type of the input, no cast, which after the first WKV means an fp32 matrix and
+an fp32 matmul. The measurements in the rest of this section were taken on
+that older path.
 
 ```swift
 let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
@@ -585,9 +654,10 @@ moved.
   mirostat). Temperature, top-k, top-p and the penalties are there; each
   further scheme adds a branch to one loop, and is worth adding against a
   request rather than in advance.
-- **`weight(_:)` force-unwraps.** The public accessor crashes on a quantised
-  backbone where the dense copy was dropped. Callers that may see a quantised
-  model should go through the projection path instead.
+- **`weight(_:)` on a quantised backbone dequantises.** It reads through the
+  sidecar or, when only the native container is left, through MLX's own
+  `dequantized`. That is a one-off cost and the right tool for copying weights
+  out; on the hot path go through the projection instead.
 - **Decode dequantises per projection per token — unless you ask it not to.**
   This is the default and it is what makes a quantised backbone usable at all,
   but it costs 2.21× against dense bf16 at 2.9B, because writing and re-reading

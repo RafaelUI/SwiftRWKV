@@ -420,8 +420,30 @@ func doc_Inference_5() throws {
                              vocab: weights["head.weight"]!.shape[0])
         return X070Backbone(weights: weights, cfg: cfg)
     }
+    let model = try X070Backbone.load(fromRwkvq: "~/models/rwkv7-g1d-0.1b-reduction.rwkvq")
+    var st = RWKVState(cfg: model.cfg)
+    print(model.prefill([1, 2, 3], state: &st).shape)
+}
+
+func doc_Inference_6() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        // Geometry is derived from weight shapes. There is simply no
+        // configuration here that could be specified incorrectly.
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
-    let sidecar = try RwkvqSidecar(path: "~/models/0.1B_reduction.rwkvq_mlx")
+    // `open` takes a .rwkvq or a sidecar path (without the suffix)
+    let sidecar = try RwkvqSidecar.open("~/models/0.1B_reduction.rwkvq_mlx")
 
     let info = base.attachRwkvq(sidecar)
     print(info.attached,            // tensors now backed by the sidecar
@@ -437,7 +459,7 @@ func doc_Inference_5() throws {
     base.detachRwkvq()   // only meaningful with dropDenseWeights: false
 }
 
-func doc_Inference_6() throws {
+func doc_Inference_7() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)

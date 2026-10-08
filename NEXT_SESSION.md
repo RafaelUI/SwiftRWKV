@@ -1,15 +1,93 @@
 # NEXT_SESSION
 
 Рабочая записка по SwiftRWKV — переносу `rwkv-metal` (Python/MLX) в Swift.
-Состояние на 03.08.
+Состояние на 03.08; квантованная база — на 08.10 (раздел сразу ниже).
+Рабочая записка проекта одна и живёт в `~/Develop/rwkv-quant/NEXT_SESSION.md`;
+здесь — то, что относится только к порту.
 
 Здесь только «что есть, чем доказано, что дальше». Дизайн-решения и их
 обоснования — в [ARCHITECTURE.md](./ARCHITECTURE.md), пользовательская
 документация — в [docs/](./docs).
 
-**Итог:** 421 тест, все зелёные (один пропускается — см. «Снимок бэкбона»).
+**Итог:** 440 тестов, все зелёные (два пропускаются — ручные дампы, см.
+«Снимок бэкбона» и `RwkvqLegacyDump`).
 Задокументированы на английском, с проверяемыми примерами:
 `docs/Inference.md`, `docs/reranker.md`, `docs/Embedding.md`, `docs/Train.md`.
+
+---
+
+## 08.10 — порт догнал нынешние пресеты rwkv-quant
+
+Что сделано (коммиты 3353592, a81e2c2, 651b6bd и следующие за ними):
+
+- **`.rwkvq` читается напрямую** (`RwkvqSidecar(rwkvq:)`, `RwkvqSidecar.open`,
+  `X070Backbone.load(fromRwkvq:)`): свой разбор safetensors, манифест из
+  `__metadata__`, интерлив sb6 (K3) и sym строится при загрузке и равен
+  сайдкарному буфер в буфер. Сайдкар `.rwkvq_mlx` — необязательный кеш.
+- **Раскладка sym** (Q6_K, 6 и 8 бит): порт ядра
+  `quant_linear_sym._get_kernel_dequant`, ветки fp16 / fp32 / bf16. Родного
+  контейнера MLX у неё нет (блок 16) — деквант на каждый проход.
+- **Норма fp16**: плотные параметры и квантованная база. Вход базы приводится
+  к её типу и обратно. Родное ядро sb6 — вход fp32, scale в fp16 только там,
+  где деквант от этого не меняется. Нормировка fp16 — штатным ядром MLX.
+- **Плотная цель** (o_proj слоя 0) — замороженная плотная база; ориентация
+  low-rank веток — по полю `transposed` манифеста; ранги — из форм файла
+  (0.4B: g = 128 при формуле 160 — открывается).
+- Прежний путь (`RwkvqAttachOptions.baseDType = nil`) побитно прежний: снимок
+  `RwkvqLegacyDump` до == после. Июльские наборы закреплены на нём явно.
+
+Чем доказано (0.1B, files_0110, эталон `tools/gen_rwkvq_fixtures.py`):
+
+| | reduction | compression |
+|---|---|---|
+| деквант против codec | побитно (fp32), fp16 == fp16(codec) | то же; вырожденных блоков sb6 на 0.1B нет |
+| KL(ref‖порт) | 4.80e-6 | 3.72e-6 |
+| KL(ref‖metal), для масштаба | 4.68e-6 | 3.71e-6 |
+| KL(metal‖порт) | 2.7e-6 | ~1e-8 |
+| декод 8 токенов, KL(metal‖порт) | 1.8e-6 | 1.8e-8 |
+| 0.4B, KL(metal‖порт) | 1.8e-6 | 4.6e-8 |
+
+На REDUCTION остаток 2.7e-6 — не проводка: проекции порта на общем входе равны
+rwkv-metal ПОБИТНО (проверено пробой на k_proj / o_proj / cmix.key / head), а
+расходятся единичные элементы нормировок слоя 0 (1 и 9 из 49152), и каждое
+fp16-округление матмула разносит это дальше. На COMPRESSION после слоя 0 всё
+идёт в fp32, и порт совпадает с rwkv-metal.
+
+Мутации: `Scripts/mutations_rwkvq_file.sh` (19) и
+`Scripts/mutations_rwkvq_model.sh` (16) — все пойманы.
+
+Скорость и память (M4, release, чередование в одном процессе,
+`decode-bench --rwkvq <файл> --no-cast-wkv`; своп за прогоны +0):
+
+| 1.5B, мс/ток | норма | прежний путь порта |
+|---|---|---|
+| reduction | 84.8 | 150.2 |
+| compression | 25.4 | 20.0 |
+| compression, `rwkvqNativeInputDType = .float16` | 20.0 | 20.0 |
+
+0.1B: reduction 9.55 против 15.21, compression 5.06 против 5.06.
+Загрузка 1.5B: compression — пик MLX 3.5 ГБ, после загрузки активная 1.3 ГБ,
+footprint оседает на 1.5 ГБ; reduction — пик 1.9 ГБ, активная 1.6 ГБ.
+
+**Не сделано / открыто:**
+
+- **Вход родного ядра sb6: fp32 (как в rwkv-metal) стоит +27% времени декода
+  на 1.5B COMPRESSION; fp16 возвращает скорость ценой +2.3e-6 KL на 0.1B.**
+  Умолчание оставлено за эталоном, переключатель — `rwkvqNativeInputDType`.
+  Решение владельца.
+- **sym на декоде считается «деквант + матмул»**: 11.8 ток/с на 1.5B при
+  65.6 у Metal-бэкенда rwkv-quant (там GEMV-ядро без плотной матрицы). Порт
+  GEMV-ядра sym — отдельная работа, следующий рычаг скорости REDUCTION.
+- **Обучение над fp16-базой**: в rwkv-metal обратный проход идёт своим VJP в
+  bf16 (fp16 насквозь портит градиенты, косинус 0.988). Здесь VJP нет — для
+  QLoRA базу надо ставить `baseDType: .bfloat16` либо `nil`, пока его не будет.
+- `castWKVOutputToComputeDType` с нормой fp16 не выверялся: на 0.1B он ухудшает
+  KL к точному счёту с 3.7–4.8e-6 до 1.0e-5; rwkv-metal так не считает.
+- Перекладка в родной контейнер идёт целым тензором (пик загрузки 3.5 ГБ на
+  1.5B); полосами строк, как в rwkv-metal с 07.10, не сделано.
+- Вырожденные блоки sb6 (зажим scale 1e-8): деквант-ядро, как и в rwkv-metal,
+  считает scale нулём; на 0.1B таких блоков нет, правило родного контейнера
+  проверено на синтетике, на крупных файлах не гонялось.
 
 ---
 
@@ -820,6 +898,8 @@ swift test -c release --filter WKVDTypeLeakTests    # ~13 с против ~35 в
 ./Scripts/mutations_decode.sh           # декод, параллельный prefill, мост состояния (11 мутаций)
 ./Scripts/mutations_sampling.sh         # сэмплер и цикл генерации (21 мутация)
 ./Scripts/mutations_rwkvq.sh            # деквантизация и тип её выхода
+./Scripts/mutations_rwkvq_file.sh       # чтение .rwkvq напрямую, раскладка sym, K3 (19 мутаций)
+./Scripts/mutations_rwkvq_model.sh      # модель из .rwkvq: проводка, плотная цель, типы (16 мутаций)
 ```
 
 `mutations_sampling.sh` идёт около 15 минут: каждая мутация — полный прогон
@@ -855,7 +935,20 @@ python3 Scripts/dump_vocab_reference.py \
     --src ~/Develop/reranker-triples-multi/data \
     --out .testdata/reranker_slice.jsonl --per-language 6 --max-chars 600
 
-# 0а. эталон блока И головы реранкера (нужна только модель, ~99 МБ)
+# 0-. плотная 0.1B, на которой сняты все эталоны паритета. Источник:
+#     huggingface.co/BlinkDL/rwkv-7-world,
+#     RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth
+#     (sha256 60c98129b9529963bff2c164b8ab4bd17c19332ae06dc2dcae32aa3a3739295a)
+cd ~/Develop/SwiftRWKV/.testdata
+curl -L -O https://huggingface.co/BlinkDL/rwkv-7-world/resolve/main/RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth
+cd /tmp && ~/Develop/rwkv-metal/.venv/bin/python -c "
+from rwkv_metal.model.convert import save_converted
+import os; d = os.path.expanduser('~/Develop/SwiftRWKV/.testdata/')
+save_converted(d + 'RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth', d + 'world_0.1b_x070.safetensors')"
+#     ниже `--model world_0.1b_x070.safetensors` — это он, путь
+#     ~/Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors
+
+# 0а. эталон блока И головы реранкера (нужна только модель)
 cd ~/Develop/rwkv-metal
 .venv/bin/python ~/Develop/SwiftRWKV/Scripts/dump_block_reference.py \
     --model world_0.1b_x070.safetensors \
@@ -895,6 +988,18 @@ cd ~/Develop/rwkv-metal
     --model    world_0.1b_x070.safetensors \
     --sidecar  ~/Develop/SwiftRWKV/.testdata/0.1B_reduction.rwkvq_mlx \
     --out      ~/Develop/SwiftRWKV/.testdata/rwkvq_model_ref.safetensors
+
+# 3а. нынешние пресеты (08.10): .rwkvq напрямую, эталоны codec и rwkv-metal
+#     источник — ~/Develop/WKV-kvant/files_0110/0p1b_{reduction,compression}.rwkvq
+cd ~/Develop/rwkv-metal && .venv/bin/python tools/gen_rwkvq_fixtures.py
+#     -> .testdata/rwkvq2_<preset>{_dequant,_model}.safetensors, rwkvq2_<preset>.json
+.venv/bin/python ~/Develop/SwiftRWKV/Scripts/dump_rwkvq2_logits.py 0p4b
+#     -> .testdata/rwkvq2_0p4b_<preset>_logits.safetensors (ранги не по формуле)
+#     сайдкары тех же файлов -- для сверки интерлива (венв с torch):
+for p in reduction compression; do
+  python -m rwkv_quant.formats.export_mlx ~/Develop/WKV-kvant/files_0110/0p1b_$p.rwkvq \
+      ~/Develop/SwiftRWKV/.testdata/rwkvq2_$p.rwkvq_mlx
+done
 
 # 4. срез LitRetrieval (120 строк, по 40 на задачу) и словарь World
 #    режется из ~/Develop/retrieval_literature/train.jsonl, тексты до 600
@@ -959,6 +1064,9 @@ git stash pop && mv /tmp/RWKVBlock.swift Sources/RWKVGen/
 | WKV7StepTests | 8 | шаг против ядра и эталона, цепочка шагов, градиенты |
 | QuantisedWeightAccessTests | 3 | доступ к весам на квантованной базе: allWeightKeys, деквантизация в weight(_:), полнота блока из fromBase |
 | RwkvqTests | 8 | деквантизация бит-в-бит, манифест, имена |
+| RwkvqFileTests | 8 | .rwkvq напрямую: манифест, деквант всех раскладок против codec, ядро sym против цепочки операций, интерлив против сайдкара, отказы |
+| RwkvqModelTests | 10 | модель из .rwkvq против rwkv-metal: сборка и типы, плотная цель, логиты / блоки / состояние / декод, 0.4B, зажим scale, отказы |
+| RwkvqLegacyDump | 1 | снимок прежнего пути квантованной базы для сверки до / после (пропускается) |
 | PerplexityTests | 1 | перплексия под флагом приведения, A/B в одном процессе с контрольным повтором |
 | WKVDTypeLeakTests | 5 | флаг приведения выхода WKV: умолчание, тип в обоих путях, состояние остаётся fp32, цена по точности, A/B замер |
 | RwkvqDTypeTests | 6 | тип выхода деквантизации: bf16 == fp32→bf16 бит-в-бит, умолчание, течь fp32 в проходе |
