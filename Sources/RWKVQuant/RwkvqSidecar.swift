@@ -190,6 +190,22 @@ public final class RwkvqSidecar {
 
     public var keys: [String] { tensors.keys.sorted() }
 
+    /// Та же база, но только с перечисленными тензорами. Нужна, чтобы после
+    /// сборки модели не держать в памяти буферы, которые уже никто не
+    /// прочитает (развёрнутые в плотный вид ветки, emb, переложенные в
+    /// родной контейнер sb6): сама база общая и неизменяемая, обрезка — это
+    /// новый объект над теми же буферами оставшихся ключей.
+    public func pruned(keeping keep: Set<String>) -> RwkvqSidecar {
+        var a: [String: MLXArray] = [:]
+        for (name, v) in arrays {
+            guard let r = name.range(of: "::") else { continue }
+            if keep.contains(String(name[..<r.lowerBound])) { a[name] = v }
+        }
+        return RwkvqSidecar(arrays: a, tensors: tensors.filter { keep.contains($0.key) },
+                            naming: naming, nLayer: nLayer, nEmbd: nEmbd,
+                            headSize: headSize, vocabSize: vocabSize)
+    }
+
     public func contains(_ key: String) -> Bool { tensors[key] != nil }
 
     /// Восстановить плотный вес — любая раскладка манифеста

@@ -37,8 +37,8 @@ import MLX
 /// Вес в родном контейнере MLX: то, что принимает `quantizedMM`.
 public struct RwkvqNativeWeight: Sendable {
     public let wq: MLXArray          // uint32 [OUT, NB·bits]
-    public let scales: MLXArray      // fp16   [OUT, NB]
-    public let biases: MLXArray      // fp16   [OUT, NB]
+    public let scales: MLXArray      // fp16 (fp32 у тензоров с зажатым scale) [OUT, NB]
+    public let biases: MLXArray      // того же типа, что scales             [OUT, NB]
     public let bits: Int
     public let outFeatures: Int
     public let inFeatures: Int
@@ -65,7 +65,17 @@ extension RwkvqSidecar {
     ///
     /// Считается один раз при загрузке. Дорогих операций тут нет: всё
     /// векторное, 32 сдвига на тензор.
-    public func nativeAffine(_ key: String) throws -> RwkvqNativeWeight {
+    ///
+    /// `exactScales` — что делать с зажимом scale снизу (1e-8). Формат держит
+    /// scale вырожденного блока на 1e-8, а в fp16 это число не представимо
+    /// (минимальная субнормаль ~6e-8) и становится нулём. Если коды такого
+    /// блока нулевые, веса от этого не меняются, и scale / bias хранятся в
+    /// fp16 — вдвое компактнее. Если нет — тензор остаётся в fp32 с зажимом,
+    /// как в файле: решает сверка ДЕКВАНТА, а не предположение (так же
+    /// поступает rwkv-metal, RwkvqNativeLinear). `false` — прежнее поведение:
+    /// fp16 всегда, зажим обнуляется (так устроен эталон
+    /// codec.sb6_to_mlx_affine; расхождение не больше 63·1e-8 на вес).
+    public func nativeAffine(_ key: String, exactScales: Bool = true) throws -> RwkvqNativeWeight {
         guard let info = tensors[key] else {
             throw RwkvqError.missingBuffer(tensor: key, buffer: "manifest")
         }
@@ -119,9 +129,10 @@ extension RwkvqSidecar {
         // контейнере окажется scale = 0. Все веса такого блока равны
         // bias, расхождение не больше 63·1e-8; на 2.9B таких блоков
         // 0.0034%, и все в emb (неиспользуемые строки словаря).
-        let scales = maximum((qs * d).asType(.float16).asType(.float32), 1e-8)
-            .asType(.float16)
-        let biases = (qm * dm).asType(.float16).asType(.float32).asType(.float16)
+        let scales32 = maximum((qs * d).asType(.float16).asType(.float32), 1e-8)
+        let biases32 = (qm * dm).asType(.float16).asType(.float32)
+        let scales16 = scales32.asType(.float16)
+        let biases16 = biases32.asType(.float16)      // точно: значение уже fp16
 
         // ── упаковка ────────────────────────────────────────────────
         var words = [MLXArray](repeating: MLXArray.zeros([OUT, NB], dtype: .uint32),
@@ -139,6 +150,18 @@ extension RwkvqSidecar {
             }
         }
         let wq = stacked(words, axis: -1).reshaped([OUT, NB * bits])
+
+        var useHalf = true
+        if exactScales, !arrayEqual(scales16.asType(.float32), scales32).item(Bool.self) {
+            // есть блоки на зажиме: fp16 законен, только если деквант тот же
+            let a = dequantized(wq, scales: scales16.asType(.float32), biases: biases32,
+                                groupSize: 32, bits: bits)
+            let b = dequantized(wq, scales: scales32, biases: biases32,
+                                groupSize: 32, bits: bits)
+            useHalf = arrayEqual(a, b).item(Bool.self)
+        }
+        let scales = useHalf ? scales16 : scales32
+        let biases = useHalf ? biases16 : biases32
         eval(wq, scales, biases)
 
         return RwkvqNativeWeight(wq: wq, scales: scales, biases: biases,

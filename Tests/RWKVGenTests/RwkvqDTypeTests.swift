@@ -139,7 +139,7 @@ final class RwkvqDTypeTests: XCTestCase {
         eval(denseOut)
 
         let quant = X070Backbone(weights: w, cfg: cfg)
-        XCTAssertGreaterThan(quant.attachRwkvq(sc).attached, 0, "сайдкар не подключился")
+        XCTAssertGreaterThan(quant.attachRwkvq(sc, options: .init(baseDType: nil)).attached, 0, "сайдкар не подключился")
         let quantOut = quant.body(ids)
         eval(quantOut)
 

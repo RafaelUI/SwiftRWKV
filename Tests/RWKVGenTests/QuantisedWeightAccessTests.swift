@@ -42,7 +42,7 @@ final class QuantisedWeightAccessTests: XCTestCase {
                              headSize: w["blocks.0.tmix.k_k"]!.shape[1],
                              vocab: w["head.weight"]!.shape[0])
         let bb = X070Backbone(weights: w, cfg: cfg)
-        XCTAssertGreaterThan(bb.attachRwkvq(try RwkvqSidecar(path: sp)).attached, 0)
+        XCTAssertGreaterThan(bb.attachRwkvq(try RwkvqSidecar(path: sp), options: .init(baseDType: nil)).attached, 0)
         XCTAssertFalse(bb.hasWeight("blocks.0.tmix.r_proj.weight"),
                        "плотная копия не выброшена — тест вырожден")
         return (bb, cfg)

@@ -154,7 +154,7 @@ final class InferenceSmokeTests: XCTestCase {
         let (quant, _, _) = try backbone()
         let sc = try sidecar()
 
-        let info = quant.attachRwkvq(sc)
+        let info = quant.attachRwkvq(sc, options: .init(baseDType: nil))
         XCTAssertGreaterThan(info.attached, 0, "не подключено ни одного веса")
         XCTAssertEqual(info.missing, [], "часть весов не нашлась в сайдкаре")
         XCTAssertGreaterThan(info.freedDenseBytes, 0, "плотные копии не выброшены")
@@ -172,7 +172,7 @@ final class InferenceSmokeTests: XCTestCase {
         let (bb, _, _) = try backbone()
         let sc = try sidecar()
         _ = bb.attachRwkvq(sc, options: {
-            var o = X070Backbone.RwkvqAttachOptions()
+            var o = X070Backbone.RwkvqAttachOptions(baseDType: nil)
             o.dropDenseWeights = false   // иначе возвращать будет нечего
             return o
         }())
@@ -256,7 +256,7 @@ final class InferenceSmokeTests: XCTestCase {
     /// проверять качество квантования, а не верность декода.
     func testQuantizedDecodeMatchesQuantizedParallel() throws {
         let (quant, tok, cfg) = try backbone()
-        let info = quant.attachRwkvq(try sidecar())
+        let info = quant.attachRwkvq(try sidecar(), options: .init(baseDType: nil))
         XCTAssertGreaterThan(info.attached, 0)
         XCTAssertFalse(quant.hasWeight("blocks.0.tmix.k_proj.weight"),
                        "плотный вес не выброшен — тест не про квантованный путь")
@@ -300,7 +300,7 @@ final class InferenceSmokeTests: XCTestCase {
     /// совпадают сами собой.
     func testDecodeWorksWithQuantisedEmbedding() throws {
         let (bb, tok, cfg) = try backbone()
-        var opts = X070Backbone.RwkvqAttachOptions()
+        var opts = X070Backbone.RwkvqAttachOptions(baseDType: nil)
         opts.quantizeEmbedding = true
         let info = bb.attachRwkvq(try sidecar(), options: opts)
         try XCTSkipUnless(bb.isRwkvqBacked("emb.weight"),
@@ -329,7 +329,7 @@ final class InferenceSmokeTests: XCTestCase {
     /// экономию памяти.
     func testEmbeddingNotQuantizedByDefault() throws {
         let (bb, _, _) = try backbone()
-        _ = bb.attachRwkvq(try sidecar())
+        _ = bb.attachRwkvq(try sidecar(), options: .init(baseDType: nil))
         XCTAssertFalse(bb.isRwkvqBacked("emb.weight"),
                        "таблица эмбеддингов квантована по умолчанию")
     }

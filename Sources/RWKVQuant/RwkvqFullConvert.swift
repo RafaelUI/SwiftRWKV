@@ -7,9 +7,11 @@ import MLX
 //
 //  Точный порт rwkv_metal/model/convert.py::convert(). Переносится один в
 //  один, включая три места, где это НЕ простое переименование ключа:
-//    1. w1/w2, a1/a2, v1/v2, g1/g2 — TRANSPOSED при переносе в x070-имена
-//       (мир хранит их как [in,rank]/[rank,in] под "x @ w1" без транспонирования
-//       в оригинальном коде; x070 ждёт Linear-конвенцию [out,in]).
+//    1. w1/w2, a1/a2, v1/v2, g1/g2 — в x070 это Linear-конвенция [out,in].
+//       Поворачивать ли — ДАННЫЕ ФАЙЛА (`RwkvqTensorInfo.transposed`), а не
+//       таблица имён: сырой world-чекпоинт хранит их [in,out] и поворот
+//       нужен, а .rwkvq с 28.08 квантует вдоль оси редукции и хранит уже
+//       [out,in] — второй поворот там даёт (D,rank) на месте (rank,D).
 //    2. w0/a0/v0 — форма [1,1,D] в мире, СПЛЮЩИВАЮТСЯ в 1D-bias при переносе
 //       (это не отдельные веса, а bias-термы у *_lora_B).
 //    3. v_lora (v1/v2/v0) кладётся в x070-словарь ТОЛЬКО для слоёв i>0 — у
@@ -40,9 +42,11 @@ extension RwkvqSidecar {
     /// x070-словарь ВСЕГО, кроме sb6-проекций (тело модели: нормы,
     /// token-shift, внутренние low-rank LoRA-ветки decay/iclr/value/gate).
     ///
-    /// `computeDType` — тип хранения результата (веса модели считают в
-    /// bf16 по умолчанию — см. X070Backbone.init).
-    public func buildDenseWeights(computeDType: DType = .bfloat16) throws -> [String: MLXArray] {
+    /// `computeDType` — тип плотных параметров. Умолчание fp16 — норма
+    /// rwkv-quant с 02.10: значения файла в нём точны, а у bf16 на три бита
+    /// мантиссы меньше при тех же двух байтах (в rwkv-metal перевод плотных
+    /// параметров на fp16 дал −4…5% KL на REDUCTION при той же памяти).
+    public func buildDenseWeights(computeDType: DType = .float16) throws -> [String: MLXArray] {
         guard nLayer > 0, nEmbd > 0, headSize > 0 else {
             throw RwkvqFullConvertError.incompleteManifest(
                 "n_layer/n_embd/head_size отсутствуют или нулевые — манифест не самоописан")
@@ -52,6 +56,22 @@ extension RwkvqSidecar {
 
         func dq(_ worldKey: String) throws -> MLXArray {
             try dequantize(worldKey, dtype: computeDType)
+        }
+        // low-rank ветка в Linear-конвенции: A — [rank, D], B — [D, rank].
+        // Форма сверяется: ошибка ориентации иначе всплыла бы broadcast-ом
+        // посреди прохода, а при rank == D не всплыла бы вовсе.
+        func lowRank(_ worldKey: String, isA: Bool) throws -> MLXArray {
+            guard let info = tensors[worldKey] else {
+                throw RwkvqError.missingBuffer(tensor: worldKey, buffer: "manifest")
+            }
+            let raw = try dq(worldKey)
+            let v = info.transposed ? raw.transposed() : raw
+            guard v.ndim == 2, v.shape[isA ? 1 : 0] == nEmbd else {
+                throw RwkvqError.shapeMismatch(
+                    tensor: worldKey,
+                    expected: isA ? [-1, nEmbd] : [nEmbd, -1], got: v.shape)
+            }
+            return v
         }
 
         // ── глобальные веса ──
@@ -76,20 +96,20 @@ extension RwkvqSidecar {
             out[P + "k_a"] = try dq(att + "k_a").reshaped([H, headSize])
             out[P + "r_k"] = try dq(att + "r_k").reshaped([H, headSize])
 
-            out[P + "w_lora_A.weight"] = try dq(att + "w1").transposed()
-            out[P + "w_lora_B.weight"] = try dq(att + "w2").transposed()
+            out[P + "w_lora_A.weight"] = try lowRank(att + "w1", isA: true)
+            out[P + "w_lora_B.weight"] = try lowRank(att + "w2", isA: false)
             out[P + "w_lora_B.bias"]   = try dq(att + "w0").reshaped([nEmbd])
 
-            out[P + "a_lora_A.weight"] = try dq(att + "a1").transposed()
-            out[P + "a_lora_B.weight"] = try dq(att + "a2").transposed()
+            out[P + "a_lora_A.weight"] = try lowRank(att + "a1", isA: true)
+            out[P + "a_lora_B.weight"] = try lowRank(att + "a2", isA: false)
             out[P + "a_lora_B.bias"]   = try dq(att + "a0").reshaped([nEmbd])
 
-            out[P + "g_lora_A.weight"] = try dq(att + "g1").transposed()
-            out[P + "g_lora_B.weight"] = try dq(att + "g2").transposed()
+            out[P + "g_lora_A.weight"] = try lowRank(att + "g1", isA: true)
+            out[P + "g_lora_B.weight"] = try lowRank(att + "g2", isA: false)
 
             if i > 0 {
-                out[P + "v_lora_A.weight"] = try dq(att + "v1").transposed()
-                out[P + "v_lora_B.weight"] = try dq(att + "v2").transposed()
+                out[P + "v_lora_A.weight"] = try lowRank(att + "v1", isA: true)
+                out[P + "v_lora_B.weight"] = try lowRank(att + "v2", isA: false)
                 out[P + "v_lora_B.bias"]   = try dq(att + "v0").reshaped([nEmbd])
             }
 

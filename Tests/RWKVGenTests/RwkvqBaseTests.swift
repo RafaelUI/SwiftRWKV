@@ -82,7 +82,7 @@ final class RwkvqBaseTests: XCTestCase {
     /// порядки больше и здесь не пройдёт.
     func testQuantizedModelMatchesReference() throws {
         let f = try require()
-        let info = f.backbone.attachRwkvq(f.sidecar)
+        let info = f.backbone.attachRwkvq(f.sidecar, options: .init(baseDType: nil))
         XCTAssertGreaterThan(info.attached, 0, "ничего не подключилось")
         XCTAssertTrue(info.missing.isEmpty || info.missing.allSatisfy {
             $0.contains("emb.weight")
@@ -119,7 +119,7 @@ final class RwkvqBaseTests: XCTestCase {
         let dense = f.backbone(ids)
         eval(dense)
 
-        f.backbone.attachRwkvq(f.sidecar)
+        f.backbone.attachRwkvq(f.sidecar, options: .init(baseDType: nil))
         let quantized = f.backbone(ids)
         eval(quantized)
 
@@ -142,7 +142,7 @@ final class RwkvqBaseTests: XCTestCase {
         let refLogits = f.reference["logits"]!
 
         // правильная проводка
-        f.backbone.attachRwkvq(f.sidecar)
+        f.backbone.attachRwkvq(f.sidecar, options: .init(baseDType: nil))
         let correct = relDiff(refLogits, f.backbone(ids))
 
         // перепутанная: k_proj ↔ v_proj во всех слоях
@@ -171,7 +171,7 @@ final class RwkvqBaseTests: XCTestCase {
     func testDenseWeightsAreFreed() throws {
         let f = try require()
         let before = f.backbone.w.count
-        let info = f.backbone.attachRwkvq(f.sidecar)
+        let info = f.backbone.attachRwkvq(f.sidecar, options: .init(baseDType: nil))
 
         XCTAssertLessThan(f.backbone.w.count, before,
                           "плотные веса не выброшены")
@@ -188,7 +188,7 @@ final class RwkvqBaseTests: XCTestCase {
     /// для сравнения путей, а не для экономии.
     func testKeepDenseOption() throws {
         let f = try require()
-        var opts = X070Backbone.RwkvqAttachOptions()
+        var opts = X070Backbone.RwkvqAttachOptions(baseDType: nil)
         opts.dropDenseWeights = false
         f.backbone.attachRwkvq(f.sidecar, options: opts)
         for key in f.backbone.rwkvqBackedKeys {
@@ -203,7 +203,7 @@ final class RwkvqBaseTests: XCTestCase {
     /// строки, и таблицу пришлось бы разворачивать целиком на каждом проходе.
     func testEmbeddingNotQuantizedByDefault() throws {
         let f = try require()
-        f.backbone.attachRwkvq(f.sidecar)
+        f.backbone.attachRwkvq(f.sidecar, options: .init(baseDType: nil))
         XCTAssertFalse(f.backbone.isRwkvqBacked("emb.weight"),
                        "emb не должен подключаться по умолчанию")
         XCTAssertNotNil(f.backbone.w["emb.weight"], "emb должен остаться плотным")
@@ -214,7 +214,7 @@ final class RwkvqBaseTests: XCTestCase {
     /// Ограничение по слоям и по таргетам.
     func testSelectiveAttach() throws {
         let f = try require()
-        var opts = X070Backbone.RwkvqAttachOptions()
+        var opts = X070Backbone.RwkvqAttachOptions(baseDType: nil)
         opts.layers = 0 ..< 2
         opts.tmixTargets = ["k_proj"]
         opts.quantizeCmix = false
@@ -245,7 +245,7 @@ final class RwkvqBaseTests: XCTestCase {
             weights[key] = MLXArray.zeros([512, 512])
         }
         let bb = X070Backbone(weights: weights, cfg: wrongCfg)
-        let info = bb.attachRwkvq(f.sidecar)
+        let info = bb.attachRwkvq(f.sidecar, options: .init(baseDType: nil))
         XCTAssertEqual(info.attached, 0,
                        "сайдкар с другой геометрией подключился молча")
         XCTAssertFalse(info.missing.isEmpty)
@@ -255,7 +255,7 @@ final class RwkvqBaseTests: XCTestCase {
     /// будет ходить именно этим путём.
     func testStateWorksWithQuantizedBase() throws {
         let f = try require()
-        f.backbone.attachRwkvq(f.sidecar)
+        f.backbone.attachRwkvq(f.sidecar, options: .init(baseDType: nil))
         let ids = f.reference["ids"]!
         let T = ids.shape[1], half = T / 2
 

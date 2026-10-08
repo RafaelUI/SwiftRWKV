@@ -49,6 +49,11 @@ extension X070Backbone {
         /// 5.9 у плотного bf16 — отсюда и 2.21x проигрыша.
         /// Перекладка одноразовая, при подключении.
         public var useNativeKernel: Bool
+        /// Тип квантованной базы — см. `X070Backbone.rwkvqBaseDType`.
+        /// Умолчание fp16 (норма rwkv-quant с 02.10); `nil` — путь порта до
+        /// 08.10 (деквант в тип входа, без приведения), под ним сняты
+        /// июльские эталоны.
+        public var baseDType: DType?
 
         public init(tmixTargets: [String] = ["r_proj", "k_proj", "v_proj", "o_proj"],
                     quantizeCmix: Bool = true,
@@ -56,8 +61,10 @@ extension X070Backbone {
                     quantizeEmbedding: Bool = false,
                     layers: Range<Int>? = nil,
                     dropDenseWeights: Bool = true,
-                    useNativeKernel: Bool = false) {
+                    useNativeKernel: Bool = false,
+                    baseDType: DType? = .float16) {
             self.useNativeKernel = useNativeKernel
+            self.baseDType = baseDType
             self.tmixTargets = tmixTargets
             self.quantizeCmix = quantizeCmix
             self.quantizeHead = quantizeHead
@@ -76,6 +83,9 @@ extension X070Backbone {
         public let freedDenseBytes: Int
         /// Сколько байт занимают упакованные буферы.
         public let packedBytes: Int
+        /// Цели, которые в файле лежат плотными и подключены плотной
+        /// замороженной базой (см. `X070Backbone.rwkvqDenseTargets`).
+        public let denseTargets: [String]
     }
 
     /// Подключить квантованную базу: перечисленные веса начинают читаться из
@@ -103,14 +113,35 @@ extension X070Backbone {
         if options.quantizeEmbedding { wanted.append("emb.weight") }
 
         var missing: [String] = []
+        var denseTargets: [String] = []
         var freed = 0
+        rwkvqBaseDType = options.baseDType
         for key in wanted {
-            // sb6 обязателен: полный манифест содержит и asym/rtn/dense,
-            // и подключить их сюда нельзя — этот путь умеет только sb6.
-            // Молча привязаться и упасть потом, при первом forward, было
-            // бы хуже, чем честно назвать ключ ненайденным.
             guard let world = RwkvqNaming.worldKey(forX070: key),
-                  let info = sidecar.tensors[world], info.isSb6 else {
+                  let info = sidecar.tensors[world] else {
+                missing.append(key)
+                continue
+            }
+            // Плотная цель — не «не умеем», а «файл так решил»: вес берётся
+            // из файла как есть (bf16) и остаётся плотной замороженной базой.
+            if info.kind == .dense {
+                guard info.shape.count == 2,
+                      w[key].map({ $0.shape == info.shape }) ?? true,
+                      let raw = try? sidecar.dequantize(world, dtype: .bfloat16) else {
+                    missing.append(key)
+                    continue
+                }
+                w[key] = info.transposed ? raw.transposed() : raw
+                denseTargetCast[key] = nil
+                rwkvqDenseTargets.insert(key)
+                denseTargets.append(key)
+                continue
+            }
+            // Квантованная база — sb6 или sym. Полный манифест содержит и
+            // asym/rtn, и подключить их сюда нельзя. Молча привязаться и
+            // упасть потом, при первом forward, было бы хуже, чем честно
+            // назвать ключ ненайденным.
+            guard info.isQuantizedBase else {
                 missing.append(key)
                 continue
             }
@@ -125,8 +156,13 @@ extension X070Backbone {
                 freed += dense.size * dense.dtype.size
             }
             rwkvqKeys[key] = world
-            if options.useNativeKernel,
-               let native = try? sidecar.nativeAffine(world) {
+            // Родной контейнер есть только у sb6: у sym блок 16, а
+            // quantizedMM принимает группы 32, 64 и 128. Прежний путь
+            // (baseDType == nil) перекладывает по-прежнему — scale всегда
+            // в fp16, — чтобы его числа не сдвинулись.
+            if options.useNativeKernel, info.isSb6,
+               let native = try? sidecar.nativeAffine(
+                   world, exactScales: options.baseDType != nil) {
                 rwkvqNative[key] = native
             }
             if options.dropDenseWeights { w[key] = nil }
@@ -143,11 +179,16 @@ extension X070Backbone {
         let fullyNative = options.useNativeKernel
             && !rwkvqKeys.isEmpty
             && rwkvqKeys.keys.allSatisfy { rwkvqNative[$0] != nil }
-        rwkvqSidecar = fullyNative ? nil : sidecar
+        // Удерживается не вся база, а только буферы ключей, которые ещё
+        // читаются деквантом: развёрнутые при сборке ветки, emb и
+        // переложенные в родной контейнер sb6 держать незачем.
+        let needed = Set(rwkvqKeys.filter { rwkvqNative[$0.key] == nil }.values)
+        rwkvqSidecar = fullyNative ? nil : sidecar.pruned(keeping: needed)
 
         return RwkvqAttachInfo(attached: rwkvqKeys.count, missing: missing,
                                freedDenseBytes: freed,
-                               packedBytes: sidecar.packedBytes)
+                               packedBytes: sidecar.packedBytes,
+                               denseTargets: denseTargets.sorted())
     }
 
     /// Отключить квантованную базу. Плотные веса при этом НЕ возвращаются —
@@ -156,6 +197,10 @@ extension X070Backbone {
     public func detachRwkvq() {
         rwkvqSidecar = nil
         rwkvqKeys.removeAll()
+        rwkvqNative.removeAll()
+        rwkvqDenseTargets.removeAll()
+        denseTargetCast.removeAll()
+        rwkvqBaseDType = nil
     }
 
     /// Читается ли этот вес из квантованной базы.

@@ -197,7 +197,7 @@ final class WKVDTypeLeakTests: XCTestCase {
                 .appendingPathComponent("Develop/SwiftRWKV/.testdata/0.1B_reduction.rwkvq_mlx").path
         try XCTSkipUnless(FileManager.default.fileExists(atPath: p + ".safetensors"),
                           "нет сайдкара .rwkvq")
-        XCTAssertGreaterThan(bb.attachRwkvq(try RwkvqSidecar(path: p)).attached, 0)
+        XCTAssertGreaterThan(bb.attachRwkvq(try RwkvqSidecar(path: p), options: .init(baseDType: nil)).attached, 0)
 
         let ids = tok.encode("The capital of France is the city of")
         func decodeMs(_ flag: Bool, n: Int = 48) -> Double {

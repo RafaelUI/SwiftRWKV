@@ -46,6 +46,14 @@ func l2norm(_ x: MLXArray) -> MLXArray {
 
 func layerNorm(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
                eps: Float = 1e-5) -> MLXArray {
+    // fp16 — норма квантованной базы (.rwkvq): там нормировка идёт штатным
+    // ядром MLX, тем же, что у nn.LayerNorm в rwkv-metal. Ручная формула ниже
+    // в fp16 копит среднее и дисперсию заметно грубее: на 0.1B это +1.1e-6 KL
+    // к точному счёту при 3.7–4.7e-6 у самого rwkv-metal, а со штатным ядром
+    // порт встаёт с ним вровень (COMPRESSION: KL между ними ~1e-8).
+    // Остальные типы считаются по-прежнему: под ручной формулой сняты все
+    // эталоны паритета плотной модели, и сдвигать их незачем.
+    if x.dtype == .float16 { return MLX.layerNorm(x, weight: weight, bias: bias, eps: eps) }
     let mean = x.mean(axis: -1, keepDims: true)
     let varc = (x - mean).square().mean(axis: -1, keepDims: true)
     let normed = (x - mean) / sqrt(varc + eps)
@@ -138,6 +146,37 @@ public final class X070Backbone {
     /// транзиент, отчего на 2.9B и выходит 2.21x против bf16.
     /// Заполняется по `RwkvqAttachOptions.useNativeKernel`.
     public internal(set) var rwkvqNative: [String: RwkvqNativeWeight] = [:]
+
+    /// Тип квантованной базы: чем округляется деквант и в чём считается
+    /// матмул проекции. Вход приводится к этому типу, выход — обратно к типу
+    /// входа, так что fp32 из ядра WKV не тащит за собой fp32-копию матрицы.
+    ///
+    /// `.float16` — норма rwkv-quant с 02.10 и то, что `attachRwkvq` ставит
+    /// по умолчанию: у 8-битных кодов bf16-округление съедало четверть шага
+    /// сетки (+2–3% KL на REDUCTION). `.bfloat16` — база rwkv-metal до 07.10.
+    /// `nil` — путь, каким порт считал до 08.10: деквант в тип ВХОДА без
+    /// приведения (после WKV это fp32), вход родного ядра в fp16.
+    ///
+    /// Переключается на живом объекте: плечи A/B сравниваются в одном
+    /// процессе.
+    public var rwkvqBaseDType: DType? = nil
+
+    /// Цели, которые лежат в файле ПЛОТНЫМИ (нынешние пресеты: o_proj слоя 0,
+    /// bits_overrides → 16). Это намерение файла, а не ошибка: вес —
+    /// исходный bf16 как есть, замороженная плотная база, LoRA встаёт поверх
+    /// так же, как поверх квантованной. Считается в типе базы.
+    public internal(set) var rwkvqDenseTargets: Set<String> = []
+    var denseTargetCast: [String: MLXArray] = [:]
+
+    /// Плотная цель в типе базы. Копия кэшируется: вес и так лежит в памяти
+    /// плотным, здесь нет сжатия, которое кэш мог бы отменить.
+    private func denseTarget(_ wKey: String, _ dtype: DType) -> MLXArray {
+        if let c = denseTargetCast[wKey], c.dtype == dtype { return c }
+        let c = w[wKey]!.asType(dtype)
+        eval(c)
+        denseTargetCast[wKey] = c
+        return c
+    }
 
     /// Считать шесть лерпов token-shift одним broadcast вместо шести пар
     /// «умножить и сложить».
@@ -243,10 +282,23 @@ public final class X070Backbone {
         // родной контейнер раньше сайдкарного: числа те же, но без
         // плотного транзиента
         if let n = rwkvqNative[wKey] {
-            return n(x.asType(.float16)).asType(x.dtype)
+            // Норма: вход quantizedMM в fp32, как у RwkvqNativeLinear в
+            // rwkv-metal. Прежний путь подавал fp16.
+            let inType: DType = rwkvqBaseDType == nil ? .float16 : .float32
+            return n(x.asType(inType)).asType(x.dtype)
         }
-        if let dense = rwkvqWeight(wKey, x.dtype) {
-            return matmul(x, dense.transposed())
+        guard let base = rwkvqBaseDType else {
+            if let dense = rwkvqWeight(wKey, x.dtype) {
+                return matmul(x, dense.transposed())
+            }
+            return matmul(x, wv(wKey).transposed())
+        }
+        if let dense = rwkvqWeight(wKey, base) {
+            return matmul(x.asType(base), dense.transposed()).asType(x.dtype)
+        }
+        if rwkvqDenseTargets.contains(wKey), wOverride?[wKey] == nil {
+            return matmul(x.asType(base), denseTarget(wKey, base).transposed())
+                .asType(x.dtype)
         }
         return matmul(x, wv(wKey).transposed())
     }
@@ -383,7 +435,18 @@ public final class X070Backbone {
     /// сразу в тип вычислений и умеет LoRA.
     public func denseWeight(_ key: String) -> MLXArray? {
         if let v = w[key] { return v }
-        return rwkvqWeight(key, w["ln0.weight"]?.dtype ?? .bfloat16)
+        let dtype = w["ln0.weight"]?.dtype ?? .bfloat16
+        if let v = rwkvqWeight(key, dtype) { return v }
+        // Вес, оставшийся ТОЛЬКО в родном контейнере (сайдкар отпущен):
+        // разворачивается штатной обратной функцией упаковки. Раньше здесь
+        // был nil, и `weight(_:)` падал на базе, собранной с
+        // useNativeKernel, — то есть на загрузке по умолчанию.
+        if let n = rwkvqNative[key] {
+            return dequantized(n.wq, scales: n.scales.asType(.float32),
+                               biases: n.biases.asType(.float32),
+                               groupSize: n.groupSize, bits: n.bits).asType(dtype)
+        }
+        return nil
     }
 
     private func tmix(_ x: MLXArray, _ vFirst: MLXArray?, _ layer: Int,
