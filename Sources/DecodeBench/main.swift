@@ -1072,24 +1072,40 @@ func prefillProfile(_ path: String, _ args: Args) throws {
     var r = (0 ..< 6).map { _ in MLXRandom.normal([1, T, H, S]) * 0.1 }
     r[1] = exp(-abs(r[1]))
     eval(r)
-    let tWkv = med {
-        for _ in 0 ..< L {
-            let (o, h) = wkv7ForwardWithState(r[0], r[1], r[2], r[3], r[4], r[5], nil); eval(o, h)
+    func wkvAll(_ whole: Bool) -> Double {
+        med {
+            for _ in 0 ..< L {
+                let (o, h) = whole ? wkv7SequenceForward(r[0], r[1], r[2], r[3], r[4], r[5])
+                                   : wkv7ForwardChunked(r[0], r[1], r[2], r[3], r[4], r[5])
+                eval(o, h)
+            }
         }
     }
-    print(String(format: "WKV по 16 токенов на весь промпт x %d слоёв: %.1f мс", L, tWkv))
+    let tChunk = wkvAll(false), tWkv = wkvAll(true)
+    print(String(format: "WKV на весь промпт x %d слоёв: одним запуском %.1f мс | нарезкой по 16 — %.1f мс", L, tWkv, tChunk))
     fflush(stdout)
-    func whole(_ compiled: Bool) -> Double {
+    // целиком: три плеча чередованием в одном процессе
+    func whole(_ seq: Bool, _ compiled: Bool) -> Double {
+        wkv7WholeSequenceForward = seq
         bb.useCompiledPrefill = compiled
-        return med {
-            var st = RWKVState(cfg: bb.cfg)
-            let lg = bb.prefill(pre, state: &st); eval(lg); st.eval()
+        defer { wkv7WholeSequenceForward = true; bb.useCompiledPrefill = false }
+        var st = RWKVState(cfg: bb.cfg)
+        let t = Date()
+        let lg = bb.prefill(pre, state: &st); eval(lg); st.eval()
+        return Date().timeIntervalSince(t) * 1e3
+    }
+    let arms: [(String, Bool, Bool)] = [("нарезка, покомандно", false, false), ("один запуск, покомандно", true, false),
+                                        ("один запуск, собранный", true, true)]
+    var ts = [[Double]](repeating: [], count: arms.count)
+    for (_, s, c) in arms { _ = whole(s, c); _ = whole(s, c) }
+    for round in 0 ..< 7 {
+        for i in (round % 2 == 0 ? Array(0 ..< arms.count) : Array((0 ..< arms.count).reversed())) {
+            ts[i].append(whole(arms[i].1, arms[i].2))
         }
     }
-    var e: [Double] = [], c: [Double] = []
-    for _ in 0 ..< 2 { e.append(whole(false)); c.append(whole(true)) }
-    print(String(format: "префилл целиком (голова на 1 позиции): покомандно %.1f мс | собранный %.1f мс", e.min()!, c.min()!))
-    print(String(format: "остальное (покомандно - проекции тела - WKV): %.1f мс", e.min()! - tLin - tWkv))
+    print("префилл целиком (голова на 1 позиции), медиана 7: "
+        + zip(arms, ts).map { String(format: "%@ %.1f мс", $0.0.0, median($0.1)) }.joined(separator: " | "))
+    print(String(format: "остальное (один запуск, покомандно - проекции тела - WKV): %.1f мс", median(ts[1]) - tLin - tWkv))
 }
 
 if let path = args.loadProfile {
