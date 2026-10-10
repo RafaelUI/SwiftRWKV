@@ -228,7 +228,9 @@ public struct Embedder {
         let ids = encode(text)
         let idx = MLXArray(ids.map { Int32($0) }, [1, ids.count])
         let poolIdx = MLXArray([Int32(model.pooling == .last ? ids.count - 1 : ids.count)])
-        return model.embed(idx, poolIndex: poolIdx)[0]
+        // выдача — без градиента: и у модели с навешенными адаптерами длина
+        // текста не обязана быть кратной шагу дифференцируемого ядра
+        return model.backbone.withoutGradientPath { model.embed(idx, poolIndex: poolIdx)[0] }
     }
 
     /// Векторы списка текстов [N,D].

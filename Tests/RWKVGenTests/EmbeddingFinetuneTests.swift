@@ -573,6 +573,69 @@ final class EmbeddingFinetuneTests: XCTestCase {
         }
     }
 
+    /// Оценка до и после обучения идёт при ЛЮБОЙ длине текста и тогда, когда
+    /// база обучается (`trainLayers` выставлен): она считается прямым путём.
+    /// Раньше оценка уходила в дифференцируемое ядро и роняла процесс на
+    /// первой же пачке, чья длина не кратна 16, — то есть любой режим, кроме
+    /// `.frozen`, с непустой отложенной выборкой.
+    func testEvaluationRunsWhileBaseIsTrainable() throws {
+        let tok = try loadWorldTokenizerOrSkip()
+        let rows = try slice().filter { $0.task == .retrieval }
+        try XCTSkipIf(rows.count < 8, "мало строк retrieval в срезе")
+        for mode in [BaseTrainingMode.topLayers(1), .lora] {
+            let model = makeModel(vocab: 65536)
+            if mode == .lora { LoRA.add(to: model.backbone, spec: LoRASpec(rank: 2, alpha: 2)) }
+            let trainable = EmbeddingTrainable.make(model: model, mode: mode)
+            XCTAssertFalse(model.backbone.trainLayers.isEmpty)
+            // 37 токенов: длина оценочной пачки заведомо не кратна шагу ядра
+            let stage = EmbeddingStage(
+                task: .retrieval, train: Array(rows.prefix(4)), heldOut: Array(rows.suffix(4)),
+                config: TrainingConfig(lr: 1e-3, maxSteps: 2, logEvery: 0),
+                batchSize: 2, maxTokens: 37, maxChars: 400)
+            let r = try EmbeddingFinetune.runStage(model: model, tokenizer: tok,
+                                                   trainable: trainable, stage: stage)
+            XCTAssertNotNil(r.before, "\(mode)")
+            XCTAssertNotNil(r.after, "\(mode)")
+            XCTAssertFalse(r.finalLoss.isNaN, "\(mode)")
+            XCTAssertFalse(model.backbone.trainLayers.isEmpty, "\(mode): оценка сбросила обучаемые слои")
+            // и выдача: текст произвольной длины
+            let v = Embedder(model: model, tokenizer: tok).embed("короткий текст")
+            XCTAssertFalse(MLX.isNaN(v).any().item(Bool.self))
+        }
+    }
+
+    /// Прямой путь (оценка, выдача) и дифференцируемый (обучение) считают
+    /// одну и ту же модель — в том числе с адаптерами.
+    func testForwardPathMatchesTrainingPathWithAdapters() {
+        let model = makeModel(nLayer: 3)
+        let bb = model.backbone
+        LoRA.add(to: bb, spec: LoRASpec(rank: 2, alpha: 2))
+        MLXRandom.seed(41)
+        for t in bb.loraTargets {
+            let b = bb.loraB[t]!
+            bb.loraB[t] = (MLXRandom.normal(b.shape) * 0.2).asType(b.dtype)
+        }
+        _ = EmbeddingTrainable.make(model: model, mode: .lora)
+        let batch = makeTripletBatch()
+        let viaTrain = model.embed(batch.anchorIdx, poolIndex: batch.anchorPool).asType(.float32)
+        let viaForward = bb.withoutGradientPath {
+            model.embed(batch.anchorIdx, poolIndex: batch.anchorPool) }.asType(.float32)
+        eval(viaTrain, viaForward)
+        XCTAssertEqual(bb.trainLayers, Set(0 ..< 3), "обёртка обязана вернуть trainLayers")
+        let diff = maxAbs(viaTrain, viaForward)
+        // различающее: без адаптеров вектор другой
+        for t in bb.loraTargets {
+            let b = bb.loraB[t]!
+            bb.loraB[t] = MLXArray.zeros(b.shape, dtype: b.dtype)
+        }
+        let bare = bb.withoutGradientPath {
+            model.embed(batch.anchorIdx, poolIndex: batch.anchorPool) }.asType(.float32)
+        let gap = maxAbs(bare, viaForward)
+        print(String(format: "ПРЯМОЙ/ОБУЧАЕМЫЙ путь с адаптерами: расхождение %.3e; вклад адаптеров %.3e", diff, gap))
+        XCTAssertGreaterThan(gap, 1e-2, "адаптеры на прямом пути не видны")
+        XCTAssertLessThan(diff, gap * 0.05, "выдача считает не ту модель, что обучалась")
+    }
+
     /// Curriculum над одной моделью: обучаемое множество общее, значит вторая
     /// стадия обязана стартовать с параметров, оставленных первой, а не с
     /// исходных весов модели.

@@ -172,6 +172,21 @@ public final class X070Backbone {
     // поведение идентично исходному, parity-тесты остаются зелёными.
     /// Слои, чьё WKV считается через дифференцируемое ядро (wkv7Train).
     public var trainLayers: Set<Int> = []
+
+    /// Посчитать `body` БЕЗ дифференцируемого ядра: все слои — прямым путём.
+    ///
+    /// Для потребителей, которым градиент не нужен, а `trainLayers` выставлен
+    /// (оценка между шагами обучения, выдача модели с навешенными адаптерами).
+    /// Дифференцируемое ядро требует длину, кратную `WKV7_CHUNK`; у оценки и
+    /// выдачи длина произвольная, и без этой обёртки процесс падал на первом
+    /// же тексте не той длины. Путь выбирается при ПОСТРОЕНИИ графа, поэтому
+    /// граф обязан строиться внутри `body` (вычислять его можно и позже).
+    public func withoutGradientPath<T>(_ body: () throws -> T) rethrows -> T {
+        let saved = trainLayers
+        trainLayers = []
+        defer { trainLayers = saved }
+        return try body()
+    }
     /// Подмена весов на обучаемые (fp32) во время valueAndGrad для full-weight
     /// partial-finetune верхних слоёв. nil ⇒ читаются frozen-веса (инференс не меняется).
     public var wOverride: [String: MLXArray]? = nil { didSet { stepVersion &+= 1 } }

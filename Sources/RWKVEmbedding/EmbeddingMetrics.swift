@@ -77,6 +77,11 @@ public enum EmbeddingMetrics {
     /// forward-ядро работает при любой длине. Именно поэтому параметра
     /// padMultiple тут нет — добавлять его значило бы платить лишними
     /// токенами за требование, которого на этом пути не существует.
+    ///
+    /// Прямой путь здесь ВЫБИРАЕТСЯ ЯВНО (`withoutGradientPath`), а не
+    /// предполагается: оценка идёт и между шагами обучения, когда у базы
+    /// выставлен `trainLayers` (верхние слои, вся база, адаптеры). Без этого
+    /// она уходила в дифференцируемое ядро и падала на длине, не кратной 16.
     public static func embedAll(model: EmbeddingModel, tokenizer: WorldTokenizer,
                                 texts: [String], batchSize: Int = 16,
                                 terminator: Int = 0,
@@ -89,7 +94,7 @@ public enum EmbeddingMetrics {
                                           texts: Array(texts[i ..< end]),
                                           terminator: terminator,
                                           maxTokens: maxTokens)
-            let v = model.embed(idx, poolIndex: pool)
+            let v = model.backbone.withoutGradientPath { model.embed(idx, poolIndex: pool) }
             eval(v)                       // иначе ленивый граф удержит активации
             parts.append(v)
             i = end
