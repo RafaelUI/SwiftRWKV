@@ -183,7 +183,16 @@ extension X070Backbone {
         // читаются деквантом: развёрнутые при сборке ветки, emb и
         // переложенные в родной контейнер sb6 держать незачем.
         let needed = Set(rwkvqKeys.filter { rwkvqNative[$0.key] == nil }.values)
-        rwkvqSidecar = fullyNative ? nil : sidecar.pruned(keeping: needed)
+        // r/k/v каждого слоя сводятся в один буфер ради декода одним
+        // запуском ядра (только sym одной формы и битности; остальные
+        // группы остаются как были). Копии байт при этом нет.
+        var groups: [String: [String]] = [:]
+        for i in 0 ..< cfg.nLayer {
+            let keys = ["receptance", "key", "value"].map { "blocks.\(i).att.\($0).weight" }
+            if keys.allSatisfy(needed.contains) { groups["blocks.\(i).att.rkv"] = keys }
+        }
+        rwkvqSidecar = fullyNative ? nil
+            : sidecar.pruned(keeping: needed).fusingSym(options.baseDType == nil ? [:] : groups)
 
         return RwkvqAttachInfo(attached: rwkvqKeys.count, missing: missing,
                                freedDenseBytes: freed,

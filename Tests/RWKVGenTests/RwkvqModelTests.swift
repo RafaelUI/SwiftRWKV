@@ -201,7 +201,7 @@ final class RwkvqModelTests: XCTestCase {
                          preset, klRef, klMetal, klStep, f.klRefMetalDecode))
             XCTAssertLessThan(klRef, 1.25 * f.klRefMetalDecode, preset)
             XCTAssertLessThan(klMetal, f.klRefMetalDecode, preset)
-            XCTAssertLessThan(klStep, 2 * f.klRefMetalDecode, preset)
+            XCTAssertLessThan(klStep, 3 * f.klRefMetalDecode, preset)
         }
     }
 
@@ -234,10 +234,44 @@ final class RwkvqModelTests: XCTestCase {
             let metalRef = Self.kl(f.ref["logits_ref"]![0 ..< 8], f.ref["logits_metal"]![0 ..< 8])
             print(String(format: "ШАГ С НУЛЯ %@: KL(ref‖шаг) %.3e, KL(metal‖шаг) %.3e, KL(ref‖metal) на тех же позициях %.3e",
                          preset, kl, klMetal, metalRef))
-            XCTAssertLessThan(kl, 4 * metalRef, preset)
+            // COMPRESSION: шаг подаёт в родное ядро fp16 (решение 10.10), и
+            // на первых токенах с пустого состояния это заметнее всего:
+            // 7.1e-5 против 1.0e-5 при fp32-входе (после префилла разница
+            // 3.5e-6 против 2.4e-6). Граница — здравость, а не паритет.
+            XCTAssertLessThan(kl, preset == "compression" ? 2e-4 : 4 * metalRef, preset)
             XCTAssertEqual((argMax(got, axis: -1) .== argMax(f.ref["logits_metal"]![0 ..< 8], axis: -1))
                 .asType(.int32).sum().item(Int.self), 8, "\(preset): top-1")
         }
+    }
+
+    /// Вход родного ядра sb6: fp16 на генерации, fp32 на параллельном
+    /// проходе (решение 10.10). Явное значение действует на оба пути.
+    func testNativeInputIsHalfOnDecodeAndSingleOnParallelPass() throws {
+        let f = try Self.fixture("compression")
+        let bb = try X070Backbone.load(fromRwkvq: f.path)
+        let ids = f.ref["input_ids"]!
+        func parallel() -> MLXArray { let l = bb(ids[0..., 0 ..< 16])[0].asType(.float32); eval(l); return l }
+        bb.useCompiledStep = false      // покомандный путь: сравнение побитное
+        func stepped() -> MLXArray {
+            var rs = RWKVState(cfg: bb.cfg)
+            var last = MLXArray(Float(0))
+            for i in 0 ..< 4 { last = bb.step(ids[0, i].item(Int.self), state: &rs).asType(.float32) }
+            eval(last); return last
+        }
+        let p0 = parallel(), s0 = stepped()
+        bb.rwkvqNativeInputDType = .float32
+        let p32 = parallel(), s32 = stepped()
+        bb.rwkvqNativeInputDType = .float16
+        let p16 = parallel(), s16 = stepped()
+        XCTAssertEqual(RwkvqFileTests.mismatches(p0, p32), 0, "параллельный проход по умолчанию — fp32")
+        XCTAssertGreaterThan(RwkvqFileTests.mismatches(p32, p16), 0, "тип входа ни на что не влияет")
+        XCTAssertGreaterThan(RwkvqFileTests.mismatches(s32, s16), 0)
+        // шаг по умолчанию: внутренние проекции в fp16, голова в fp32 — он не
+        // равен ни шагу «всё fp32», ни шагу «всё fp16», и к «всё fp16» ближе
+        XCTAssertGreaterThan(RwkvqFileTests.mismatches(s0, s32), 0, "шаг по умолчанию считает в fp32")
+        XCTAssertGreaterThan(RwkvqFileTests.mismatches(s0, s16), 0, "голова на шаге считается в fp16")
+        XCTAssertLessThan(Self.kl(s16.reshaped([1, -1]), s0.reshaped([1, -1])),
+                          Self.kl(s32.reshaped([1, -1]), s0.reshaped([1, -1])))
     }
 
     // ── Типы: плечи в одном процессе ─────────────────────────────────
@@ -307,6 +341,43 @@ final class RwkvqModelTests: XCTestCase {
             XCTAssertTrue(text.contains("blocks.7.ffn.key.weight"), text)
             XCTAssertTrue(text.contains("НЕТ В ФАЙЛЕ"), text)
         }
+    }
+
+    // ── Перекладка в родной контейнер полосами ───────────────────────
+
+    /// Перекладка sb6 в контейнер MLX идёт полосами строк (иначе пик
+    /// загрузки втрое выше файла). Результат от нарезки не зависит: одна
+    /// полоса на тензор и много мелких дают побитно одно и то же — на всех
+    /// битностях, на прямоугольных формах и на голове, где число строк на
+    /// полосу не делит число строк тензора.
+    func testNativeRepackDoesNotDependOnBanding() throws {
+        let s = try RwkvqFileTests.base("compression")
+        let saved = RwkvqSidecar.nativeRepackBandBytes
+        defer { RwkvqSidecar.nativeRepackBandBytes = saved }
+        var bitsSeen: Set<Int> = []
+        for key in ["blocks.1.att.key.weight", "blocks.0.att.receptance.weight",
+                    "blocks.4.ffn.key.weight", "blocks.4.ffn.value.weight", "head.weight"] {
+            RwkvqSidecar.nativeRepackBandBytes = Int.max / 2          // одна полоса: весь тензор
+            let whole = try s.nativeAffine(key)
+            let info = s.tensors[key]!
+            // 1000 строк на полосу: не делит ни 768, ни 3072, ни 65536
+            RwkvqSidecar.nativeRepackBandBytes = 1000 * (info.inFeatures / 32) * 32 * 4
+            let banded = try s.nativeAffine(key)
+            XCTAssertEqual(banded.wq.shape, whole.wq.shape, key)
+            XCTAssertEqual(RwkvqFileTests.mismatches(banded.wq, whole.wq), 0, "\(key): коды")
+            XCTAssertEqual(banded.scales.dtype, whole.scales.dtype, key)
+            XCTAssertEqual(RwkvqFileTests.mismatches(banded.scales, whole.scales), 0, "\(key): scale")
+            XCTAssertEqual(RwkvqFileTests.mismatches(banded.biases, whole.biases), 0, "\(key): bias")
+            bitsSeen.insert(whole.bits)
+            // и сам контейнер верен: деквант равен декванту своим ядром
+            if key != "head.weight" {
+                let want = try s.dequantize(key, dtype: .float32)
+                let got = dequantized(banded.wq, scales: banded.scales.asType(.float32),
+                                      biases: banded.biases.asType(.float32), groupSize: 32, bits: banded.bits)
+                XCTAssertLessThan(Self.relErr(got, want), 1e-6, key)
+            }
+        }
+        XCTAssertEqual(bitsSeen, [4, 5, 6], "тест обязан покрыть все битности пресета")
     }
 
     // ── Зажим scale у родного контейнера ─────────────────────────────

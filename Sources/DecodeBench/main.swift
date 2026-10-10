@@ -3,6 +3,7 @@ import MLX
 import MLXRandom
 import RWKVGen
 import RWKVQuant
+import RWKVKernel
 
 // ───────────────────────────────────────────────────────────────────────
 //  Сколько стоит декодирование на квантованной базе .rwkvq против плотной.
@@ -107,6 +108,10 @@ struct Args {
     /// либо "sym-gemv" (декод sym ядром GEMV / деквант + матмул).
     var knob: String? = nil
     var knobPath: String? = nil
+    /// Замер «как в приложении» на одном .rwkvq: загрузка, префилл T=512,
+    /// декод — скорость и память. Протокол общий с эталоном (Metal-бэкенд
+    /// rwkv-quant, /tmp/swr_1010/ref_bench.py): те же окна текста.
+    var appBench: String? = nil
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -141,6 +146,7 @@ func parseArgs() -> Args {
         case "--windows": a.windows = it.next() ?? a.windows
         case "--truth": a.truth = it.next()
         case "--knob-ab": a.knob = it.next(); a.knobPath = it.next()
+        case "--app-bench": a.appBench = it.next()
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -736,8 +742,14 @@ func knobSpeedAB(_ knob: String, _ path: String, _ args: Args) throws {
     case "sym-gemv":
         labels = ("деквант+матмул", "ядро GEMV")
         set = { bb.rwkvqSymDecodeKernel = !$0 }
+    case "compiled":
+        labels = ("покомандный шаг", "собранный шаг")
+        set = { bb.useCompiledStep = !$0 }
+    case "fuse-rkv":
+        labels = ("r/k/v по одной", "фьюз r/k/v")
+        set = { bb.rwkvqSymFuseRKV = !$0 }
     default:
-        print("неизвестный переключатель \(knob): native-in | sym-gemv"); exit(2)
+        print("неизвестный переключатель \(knob): native-in | sym-gemv | compiled | fuse-rkv"); exit(2)
     }
     print("L=\(bb.cfg.nLayer) D=\(bb.cfg.nEmbd); файл \(path); переключатель \(knob)")
     let (ids, _) = inputIds(args.steps, vocab: bb.cfg.vocab, vocabPath: args.vocab)
@@ -812,6 +824,57 @@ func wideBackwardAB(_ path: String, _ args: Args) throws {
                      name, args.rounds, mT.isEmpty ? .nan : median(mT), mW.isEmpty ? .nan : median(mW)))
     }
     print(String(format: "footprint в конце: %.2f ГБ; MLX пик %.2f ГБ", processFootprintGB(), Double(GPU.peakMemory) / 1e9))
+}
+
+/// Загрузка, префилл T=512 и декод одной модели: скорость и память.
+func appBench(_ path: String, _ args: Args) throws {
+    let win = try loadArrays(url: URL(fileURLWithPath: expand(args.windows)))["ids"]!
+    let pre = (win[0].asArray(Int32.self) + win[4].asArray(Int32.self)).map(Int.init)   // en + ru, 512
+    let dec = win[8].asArray(Int32.self).prefix(72).map(Int.init)                       // sr
+    let f0 = processFootprintGB()
+    let t0 = Date()
+    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    GPU.clearCache()
+    print(String(format: "загрузка %.1f с; footprint +%.2f ГБ; MLX активная %.2f ГБ, пик %.2f ГБ",
+                 Date().timeIntervalSince(t0), processFootprintGB() - f0,
+                 Double(GPU.activeMemory) / 1e9, Double(GPU.peakMemory) / 1e9))
+    fflush(stdout)
+    // префилл: первый вызов — сборка ядер, меряются следующие
+    var ts: [Double] = []
+    var state = RWKVState(cfg: bb.cfg)
+    for i in 0 ..< 4 {
+        if i == 1 { GPU.resetPeakMemory() }
+        state = RWKVState(cfg: bb.cfg)
+        let t = Date()
+        let lg = bb.prefill(pre, state: &state)
+        eval(lg); state.eval()
+        ts.append(Date().timeIntervalSince(t) * 1e3)
+    }
+    let pm = median(Array(ts.dropFirst()))
+    print(String(format: "префилл T=512: первый вызов %.0f мс; далее медиана %.1f мс = %.0f ток/с; MLX пик %.2f ГБ",
+                 ts[0], pm, 512e3 / pm, Double(GPU.peakMemory) / 1e9))
+    fflush(stdout)
+    // декод: продолжение после префилла, teacher-forced, чтение argmax на каждом шаге
+    func run(_ ids: ArraySlice<Int>) -> Double {
+        let t = Date()
+        for id in ids {
+            let lg = bb.step(id, state: &state)
+            let next = argMax(lg, axis: -1); eval(next); state.eval()
+            _ = next.item(Int.self)
+        }
+        return Date().timeIntervalSince(t) * 1e3 / Double(ids.count)
+    }
+    _ = run(dec[0 ..< 8])
+    GPU.resetPeakMemory()
+    let ms = (0 ..< 5).map { _ in run(dec[8 ..< 72]) }
+    print(String(format: "декод: медиана %.2f мс/ток = %.1f ток/с (раунды %@); MLX активная %.2f, пик %.2f ГБ; footprint %.2f ГБ",
+                 median(ms), 1e3 / median(ms), ms.map { String(format: "%.2f", $0) }.joined(separator: " "),
+                 Double(GPU.activeMemory) / 1e9, Double(GPU.peakMemory) / 1e9, processFootprintGB()))
+}
+
+if let path = args.appBench {
+    try appBench(path, args)
+    exit(0)
 }
 
 if let knob = args.knob, let path = args.knobPath {

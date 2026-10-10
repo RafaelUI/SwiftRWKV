@@ -99,13 +99,19 @@ public final class RwkvqSidecar {
     public let headSize: Int
     public let vocabSize: Int
 
+    /// Группы sym-тензоров, строки которых сведены в один буфер ради декода
+    /// одним запуском ядра (см. `fusingSym` в RwkvqSymGEMV.swift).
+    public let symFused: [String: RwkvqSymFusedGroup]
+
     /// Старшая версия формата, которую читает этот код (и .rwkvq, и сайдкар).
     public static let maxFormatVersion = 2
 
     /// Уже разобранная база — общий конец обоих входов (сайдкар и .rwkvq
     /// напрямую, см. RwkvqFile.swift).
     init(arrays: [String: MLXArray], tensors: [String: RwkvqTensorInfo],
-         naming: String, nLayer: Int, nEmbd: Int, headSize: Int, vocabSize: Int) {
+         naming: String, nLayer: Int, nEmbd: Int, headSize: Int, vocabSize: Int,
+         symFused: [String: RwkvqSymFusedGroup] = [:]) {
+        self.symFused = symFused
         self.arrays = arrays
         self.tensors = tensors
         self.naming = naming
@@ -133,6 +139,7 @@ public final class RwkvqSidecar {
               let tensorDict = root["tensors"] as? [String: Any] else {
             throw RwkvqError.malformedManifest("нет секции \"tensors\"")
         }
+        self.symFused = [:]
         let namingValue = root["naming"] as? String ?? "world"
         self.naming = namingValue
         self.nLayer = root["n_layer"] as? Int ?? 0
@@ -203,7 +210,8 @@ public final class RwkvqSidecar {
         }
         return RwkvqSidecar(arrays: a, tensors: tensors.filter { keep.contains($0.key) },
                             naming: naming, nLayer: nLayer, nEmbd: nEmbd,
-                            headSize: headSize, vocabSize: vocabSize)
+                            headSize: headSize, vocabSize: vocabSize,
+                            symFused: symFused.filter { $0.value.keys.allSatisfy(keep.contains) })
     }
 
     public func contains(_ key: String) -> Bool { tensors[key] != nil }

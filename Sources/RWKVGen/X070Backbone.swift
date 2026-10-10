@@ -82,7 +82,85 @@ struct QuantBase {
 /// x070-backbone поверх плоского словаря весов (MLX-имена тензоров).
 public final class X070Backbone {
     public let cfg: X070Config
-    var w: [String: MLXArray]
+
+    /// Версия всего, от чего зависит рекуррентный шаг: веса, адаптеры,
+    /// квантованная база и переключатели пути. Растёт при ЛЮБОЙ записи в
+    /// эти свойства (у каждого didSet); по ней собранный шаг узнаёт, что
+    /// его пора пересобрать, — см. `step` в X070Generation.swift.
+    var stepVersion = 0
+    /// Собранный (mx.compile) рекуррентный шаг и версия, под которую он собран.
+    var compiledStepFn: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    var compiledStepVersion = -1
+    /// Рекуррентный шаг через `compile`: граф шага трассируется один раз и
+    /// дальше исполняется готовым, цепочки поэлементных операций сливаются.
+    /// На декоде малых моделей время шага — это число операций, а не
+    /// арифметика, поэтому выигрыш тем больше, чем модель меньше.
+    /// Числа те же в пределах шума fp16 (слитые цепочки считаются в другом
+    /// порядке округлений); `false` — покомандный путь всегда.
+    ///
+    /// СОБИРАЕТСЯ НЕ ВСЯКАЯ МОДЕЛЬ — только та, в графе шага которой нет ни
+    /// одного массива bfloat16 (см. `stepIsCompilable`): модель из .rwkvq в
+    /// норме fp16 без неслитых адаптеров, плотная fp32 / fp16. Причина —
+    /// дефект MLX (ядро 0.31.1): библиотеку слитого поэлементного ядра он
+    /// именует по РОДУ И РАЗМЕРУ типа («f2»), и у float16 с bfloat16 они
+    /// совпадают. Собранные в одном процессе одинаковые по строению цепочки
+    /// на fp16 и на bf16 получают одно имя, вторая исполняется кодом первой
+    /// — биты одного формата читаются как другой, и шаг выдаёт мусор без
+    /// единой ошибки (найдено 10.10: плотная bf16-модель после квантованной
+    /// fp16 в одном процессе). Пока bf16 в собранные графы не попадает,
+    /// столкнуться нечему. Остальные модели идут покомандным путём.
+    public var useCompiledStep = true
+    /// Префилл (`prefill`) через `compile` — см. `prefillCompiled`.
+    ///
+    /// ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН, и это итог замера, а не осторожность. Собранный
+    /// префилл быстрее на 7–8% (T=512: 0.4B 333 → 305 мс, 1.5B 829 → 771), но
+    /// каждая НОВАЯ длина промпта стоит трассировки (~60–80 мс, первая в
+    /// процессе — до 0.8 с на сборку слитых ядер) и +0.1 ГБ пика. В чате
+    /// длина промпта каждый раз другая — там это чистый убыток. Включать
+    /// стоит, когда длины повторяются (реранкинг, фиксированное окно).
+    /// Короткие промпты (меньше `compiledPrefillMinTokens`) идут обычным
+    /// путём в любом случае.
+    public var useCompiledPrefill = false
+    public var compiledPrefillMinTokens = 64
+    /// Сколько разных длин держит кеш трасс до пересоздания функции.
+    public var compiledPrefillMaxLengths = 32
+    var compiledPrefillFn: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    var compiledPrefillVersion = -1
+    var compiledPrefillLengths: Set<Int> = []
+    /// Сколько префиллов прошло собранным путём (счётчик для тестов).
+    public internal(set) var compiledPrefillCalls = 0
+    /// Сколько шагов прошло собранным путём (счётчик для тестов и замеров).
+    public internal(set) var compiledStepCalls = 0
+    private var compilableVersion = -1
+    private var compilable = false
+
+    /// Можно ли собирать шаг этой модели: в его графе нет bfloat16.
+    /// Плотные цели .rwkvq лежат в bf16, но в шаге читаются уже
+    /// приведённой к типу базы копией, вычисленной ДО трассировки.
+    var stepIsCompilable: Bool {
+        if compilableVersion == stepVersion { return compilable }
+        var ok = wOverride == nil && quant.isEmpty
+            && rwkvqBaseDType != .bfloat16
+            && !loraA.values.contains { $0.dtype == .bfloat16 }
+            && !loraB.values.contains { $0.dtype == .bfloat16 }
+        if ok {
+            for (k, v) in w where v.dtype == .bfloat16 {
+                if rwkvqDenseTargets.contains(k), let base = rwkvqBaseDType, base != .bfloat16 {
+                    continue
+                }
+                ok = false
+                break
+            }
+        }
+        if ok, let base = rwkvqBaseDType {
+            // приведённые копии плотных целей — константами, до трассировки
+            eval(rwkvqDenseTargets.map { denseTarget($0, base) })
+        }
+        compilable = ok
+        compilableVersion = stepVersion
+        return ok
+    }
+    var w: [String: MLXArray] { didSet { stepVersion &+= 1 } }
 
     // ── LoRA / QLoRA / training hooks ──
     // Инертны для обычного инференса (пустые словари + trainLayers пуст) ⇒
@@ -91,7 +169,7 @@ public final class X070Backbone {
     public var trainLayers: Set<Int> = []
     /// Подмена весов на обучаемые (fp32) во время valueAndGrad для full-weight
     /// partial-finetune верхних слоёв. nil ⇒ читаются frozen-веса (инференс не меняется).
-    public var wOverride: [String: MLXArray]? = nil
+    public var wOverride: [String: MLXArray]? = nil { didSet { stepVersion &+= 1 } }
     /// Если true — каждый блок (ln1+tmix+resid+ln2+cmix+resid) считается через
     /// gradient checkpoint (recompute в backward). Дифф-входы (x, v_first, LoRA)
     /// протягиваются явными аргументами чекпоинта; frozen-веса захватываются.
@@ -116,13 +194,13 @@ public final class X070Backbone {
     ///
     /// Флаг переключается на живом объекте, так что обе ветки сравниваются в
     /// ОДНОМ процессе — замер «до и после» разными сборками недействителен.
-    public var castWKVOutputToComputeDType = false
+    public var castWKVOutputToComputeDType = false { didSet { stepVersion &+= 1 } }
     /// LoRA-адаптеры по таргету: "blocks.L.tmix.r_proj" и т.п.
-    var loraA: [String: MLXArray] = [:]      // [rank, in]
-    var loraB: [String: MLXArray] = [:]      // [out, rank]
-    var loraScale: [String: Float] = [:]     // alpha / rank
+    var loraA: [String: MLXArray] = [:] { didSet { stepVersion &+= 1 } }      // [rank, in]
+    var loraB: [String: MLXArray] = [:] { didSet { stepVersion &+= 1 } }      // [out, rank]
+    var loraScale: [String: Float] = [:] { didSet { stepVersion &+= 1 } }     // alpha / rank
     /// Квантованная замороженная база по имени веса (напр. "...r_proj.weight", "head.weight", "emb.weight").
-    var quant: [String: QuantBase] = [:]
+    var quant: [String: QuantBase] = [:] { didSet { stepVersion &+= 1 } }
 
     /// Второй бэкенд квантованной базы: родной формат .rwkvq (sb6).
     ///
@@ -134,8 +212,8 @@ public final class X070Backbone {
     ///
     /// Ключи — x070-имена (blocks.N.tmix.k_proj.weight); в сайдкар они
     /// переводятся таблицей RwkvqNaming.
-    var rwkvqSidecar: RwkvqSidecar? = nil
-    var rwkvqKeys: [String: String] = [:]     // x070-имя → world-имя в сайдкаре
+    var rwkvqSidecar: RwkvqSidecar? = nil { didSet { stepVersion &+= 1 } }
+    var rwkvqKeys: [String: String] = [:] { didSet { stepVersion &+= 1 } }     // x070-имя → world-имя в сайдкаре
 
     /// Тот же `.rwkvq`, переложенный в родной контейнер MLX.
     ///
@@ -145,7 +223,7 @@ public final class X070Backbone {
     /// Путь через `sc.dequantize` пишет и перечитывает плотный
     /// транзиент, отчего на 2.9B и выходит 2.21x против bf16.
     /// Заполняется по `RwkvqAttachOptions.useNativeKernel`.
-    public internal(set) var rwkvqNative: [String: RwkvqNativeWeight] = [:]
+    public internal(set) var rwkvqNative: [String: RwkvqNativeWeight] = [:] { didSet { stepVersion &+= 1 } }
 
     /// Тип квантованной базы: чем округляется деквант и в чём считается
     /// матмул проекции. Вход приводится к этому типу, выход — обратно к типу
@@ -159,14 +237,18 @@ public final class X070Backbone {
     ///
     /// Переключается на живом объекте: плечи A/B сравниваются в одном
     /// процессе.
-    public var rwkvqBaseDType: DType? = nil
+    public var rwkvqBaseDType: DType? = nil { didSet { stepVersion &+= 1 } }
 
-    /// Тип входа родного ядра sb6 (`quantizedMM`). `nil` — по правилу: fp32
-    /// в норме (так считает RwkvqNativeLinear в rwkv-metal, с ним порт на
-    /// COMPRESSION совпадает до ~1e-8 KL), fp16 на прежнем пути. Явное
-    /// значение — для A/B в одном процессе: fp16-вход быстрее на крупных
-    /// моделях и стоит точности, см. docs/Inference.md.
-    public var rwkvqNativeInputDType: DType? = nil
+    /// Тип входа родного ядра sb6 (`quantizedMM`). `nil` — по правилу:
+    ///   • генерация (рекуррентный шаг) — fp16: на 1.5B и 2.9B это −22…24%
+    ///     времени декода при +0.08% KL к исходной модели на 1.5B (на 0.1B
+    ///     и 0.4B разница незначима), см. docs/Inference.md;
+    ///   • параллельный проход (префилл, обучение) — fp32, как
+    ///     RwkvqNativeLinear в rwkv-metal: с ним порт на COMPRESSION
+    ///     совпадает до ~1e-8 KL, и градиент не идёт сквозь fp16;
+    ///   • прежний путь базы (`rwkvqBaseDType == nil`) — fp16 везде.
+    /// Явное значение действует на оба пути — для A/B в одном процессе.
+    public var rwkvqNativeInputDType: DType? = nil { didSet { stepVersion &+= 1 } }
 
     /// Тип ОБРАТНОГО прохода через квантованную базу при базе fp16.
     ///
@@ -211,7 +293,37 @@ public final class X070Backbone {
     /// и адаптеры ниже слоя молча получили бы нулевые градиенты.
     /// Числа у ядра другие (точный вес, сумма в fp32), см. RwkvqSymGEMV.swift.
     /// Переключается на живом объекте — A/B в одном процессе.
-    public var rwkvqSymDecodeKernel = true
+    public var rwkvqSymDecodeKernel = true { didSet { stepVersion &+= 1 } }
+    /// Декод r/k/v слоя ОДНИМ запуском ядра (фьюз, порт SymQuantLinearFused):
+    /// бит-в-бит равен трём отдельным запускам, памяти не добавляет
+    /// (см. RwkvqSymGEMV.swift). Действует там же, где ядро GEMV.
+    public var rwkvqSymFuseRKV = true { didSet { stepVersion &+= 1 } }
+    /// Сколько слоёв прошло фьюзом r/k/v (счётчик для тестов).
+    public internal(set) var rwkvqSymFusedCalls = 0
+
+    /// r, k, v слоя на рекуррентном шаге одним запуском ядра; nil — если
+    /// фьюз неприменим (тогда проекции считаются по одной). Адаптеры LoRA
+    /// прибавляются поверх, как в обычной проекции.
+    func decodeRKV(_ xr: MLXArray, _ xk: MLXArray, _ xv: MLXArray,
+                   layer: Int) -> (MLXArray, MLXArray, MLXArray)? {
+        guard rwkvqSymFuseRKV, rwkvqSymDecodeKernel, rwkvqBaseDType != nil,
+              let sc = rwkvqSidecar else { return nil }
+        let p = "blocks.\(layer).tmix."
+        let targets = [p + "r_proj", p + "k_proj", p + "v_proj"]
+        guard targets.allSatisfy({ rwkvqKeys[$0 + ".weight"] != nil && quant[$0 + ".weight"] == nil }),
+              let y = sc.symGEMVFused("blocks.\(layer).att.rkv",
+                                      concatenated([xr, xk, xv], axis: 0)) else { return nil }
+        rwkvqSymGEMVCalls += 3
+        rwkvqSymFusedCalls += 1
+        func finish(_ i: Int, _ x: MLXArray) -> MLXArray {
+            let base = y[i ..< (i + 1)].asType(x.dtype)
+            guard let a = loraA[targets[i]], let b = loraB[targets[i]] else { return base }
+            let z = matmul(x, a.transposed())
+            return base + (loraScale[targets[i]] ?? 1.0) * matmul(z, b.transposed())
+        }
+        return (finish(0, xr), finish(1, xk), finish(2, xv))
+    }
+
     /// Сколько проекций прошло ядром GEMV. Счётчик для тестов и замеров:
     /// «правка не применилась» обязана быть видимой, а не читаться как
     /// «правка ничего не меняет».
@@ -221,7 +333,7 @@ public final class X070Backbone {
     /// bits_overrides → 16). Это намерение файла, а не ошибка: вес —
     /// исходный bf16 как есть, замороженная плотная база, LoRA встаёт поверх
     /// так же, как поверх квантованной. Считается в типе базы.
-    public internal(set) var rwkvqDenseTargets: Set<String> = []
+    public internal(set) var rwkvqDenseTargets: Set<String> = [] { didSet { stepVersion &+= 1 } }
     var denseTargetCast: [String: MLXArray] = [:]
 
     /// Плотная цель в типе базы. Копия кэшируется: вес и так лежит в памяти
@@ -275,7 +387,7 @@ public final class X070Backbone {
     /// трейсу это не арифметика (ALU 30%) и не CPU (простаивает), а
     /// число мелких ядер. Шесть лерпов -- двенадцать операций из ~68 на
     /// слой.
-    public var fuseLerp = true
+    public var fuseLerp = true { didSet { stepVersion &+= 1 } }
 
     /// Стек коэффициентов token-shift на слой, [6,1,D]. Строится лениво
     /// и кэшируется: сам стек стоит операций, и делать его на каждом
@@ -382,8 +494,15 @@ public final class X070Backbone {
         if let n = rwkvqNative[wKey] {
             // Норма: вход quantizedMM в fp32, как у RwkvqNativeLinear в
             // rwkv-metal. Прежний путь подавал fp16.
-            let inType = rwkvqNativeInputDType
-                ?? (rwkvqBaseDType == nil ? DType.float16 : DType.float32)
+            // Норма: fp16 на генерации (рекуррентный шаг), fp32 на
+            // параллельном проходе — через него идёт градиент, а сквозь
+            // fp16 мелкие котангенты теряются. Прежний путь подавал fp16.
+            // Голова — исключение: тип входа quantizedMM есть и тип его
+            // ВЫХОДА, а логиты в fp16 (шаг сетки ~0.01 при |логит| ~ 16)
+            // стоят на порядок больше, чем fp16 во всех внутренних
+            // проекциях вместе; на декоде голова считается в fp32.
+            let half = rwkvqBaseDType == nil || (decode && wKey != "head.weight")
+            let inType = rwkvqNativeInputDType ?? (half ? DType.float16 : DType.float32)
             return n(x.asType(inType)).asType(x.dtype)
         }
         guard let base = rwkvqBaseDType else {

@@ -47,16 +47,17 @@ private struct SymGemvKey: Hashable {
     let outFeatures: Int
     let bits: Int
     let rows: Int
+    let outPer: Int
 }
 
 private var symGemvKernelCache: [SymGemvKey: MLXFastKernel] = [:]
 
-private func symGemvHeader(IN: Int, OUT: Int, NN: Int) -> String {
+private func symGemvHeader(IN: Int, OUT: Int, NN: Int, outPer: Int) -> String {
     """
     constant uint IN_C   = \(IN);
     constant uint OUT_C  = \(OUT);
-    constant uint OUT_PER= \(OUT);
-    constant uint NK     = 1;
+    constant uint OUT_PER= \(outPer);
+    constant uint NK     = \(OUT / outPer);
     constant uint NB    = \(IN / 16);
     constant uint NSB   = \(IN / 256);
     constant uint NPAIR = \(IN / 32);
@@ -81,9 +82,16 @@ private func gemvPlanePair(_ src: String, shift: Int) -> String {
     return out
 }
 
+/// `outPer` — ФЬЮЗ нескольких матриц одним параметром, а не второй копией
+/// ядра (как в rwkv-quant): строки K матриц лежат подряд, и строка сама
+/// говорит, какой вход ей нужен, — `xi = row0 / OUT_PER`. При
+/// outPer == OUT это даёт xi = 0, и индексация вырождается в обычную.
 private func symGemvKernel(inFeatures IN: Int, outFeatures OUT: Int,
-                           bits: Int, rows NN: Int) -> MLXFastKernel {
-    let key = SymGemvKey(inFeatures: IN, outFeatures: OUT, bits: bits, rows: NN)
+                           bits: Int, rows NN: Int, outPer: Int? = nil) -> MLXFastKernel {
+    let per = outPer ?? OUT
+    precondition(OUT % per == 0 && per % symGemvRS == 0,
+                 "sym-GEMV: \(OUT) строк не делятся на матрицы по \(per)")
+    let key = SymGemvKey(inFeatures: IN, outFeatures: OUT, bits: bits, rows: NN, outPer: per)
     if let k = symGemvKernelCache[key] { return k }
     precondition(bits == 6 || bits == 8, "sym: битность \(bits) вне {6, 8}")
     precondition(IN % 256 == 0 && OUT % (symGemvNSG * symGemvRS) == 0,
@@ -191,11 +199,11 @@ private func symGemvKernel(inFeatures IN: Int, outFeatures OUT: Int,
     }
 
     let kern = MLXFast.metalKernel(
-        name: "rwkvq_sym\(bits)_gemv_n\(NN)_\(IN)_\(OUT)",
+        name: "rwkvq_sym\(bits)_gemv_n\(NN)p\(per)_\(IN)_\(OUT)",
         inputNames: names,
         outputNames: ["out"],
         source: head + body + tail,
-        header: symGemvHeader(IN: IN, OUT: OUT, NN: NN)
+        header: symGemvHeader(IN: IN, OUT: OUT, NN: NN, outPer: per)
     )
     symGemvKernelCache[key] = kern
     return kern
@@ -218,6 +226,12 @@ public func rwkvqSymGEMV(_ x: MLXArray, qblk: MLXArray, qs: MLXArray, d: MLXArra
     let N = x.shape[0]
     precondition(rwkvqSymGEMVApplies(outFeatures: OUT, inFeatures: IN, bits: bits, rows: N),
                  "sym-GEMV: форма \(OUT)×\(IN), bits=\(bits), строк \(N) ядром не берётся")
+    // Типы входов ядра фиксированы НАМЕРЕННО: MLX строит исходник ядра из
+    // типов входов, а кеширует по имени, и вызов того же ядра с другими
+    // типами освобождает конвейер из-под ещё не исполненных запусков
+    // (см. WKV7Train.swift). Чужой тип — ошибка вызывающего, и громкая.
+    precondition(qblk.dtype == .uint8 && qs.dtype == .uint8 && d.dtype == .float16,
+                 "sym-GEMV: типы буферов \(qblk.dtype)/\(qs.dtype)/\(d.dtype), нужны uint8/uint8/float16")
     let x32 = x.asType(.float32)
     let kern = symGemvKernel(inFeatures: IN, outFeatures: OUT, bits: bits, rows: N)
     var inputs: [MLXArray] = [x32, qblk, qs, d]
@@ -246,5 +260,91 @@ extension RwkvqSidecar {
               let d = arrays["\(key)::d"] else { return nil }
         return rwkvqSymGEMV(x, qblk: qblk, qs: qs, d: d, outFeatures: info.outFeatures,
                             inFeatures: info.inFeatures, bits: info.bits)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+//  Фьюз: K однотипных sym-матриц (r/k/v одного слоя) одним запуском ядра.
+//
+//  Порт SymQuantLinearFused из rwkv-quant. Строки K матриц сводятся в один
+//  буфер, ядро выбирает вход по номеру строки (OUT_PER). Порядок
+//  суммирования внутри строки не меняется, поэтому фьюз обязан быть
+//  БИТ-В-БИТ равен K отдельным вызовам — это и проверяется.
+//
+//  ПАМЯТЬ. В rwkv-quant фьюз исходно держал КОПИЮ буферов поверх оригиналов
+//  (250 МБ на 1.5B). Здесь копии нет: сведённый буфер становится
+//  единственным владельцем байт, а буферы отдельных матриц заменяются
+//  срезами строк из него (срез в MLX — вид на тот же буфер, не копия).
+//  Пути декванта и одиночного GEMV читают эти срезы как раньше.
+// ───────────────────────────────────────────────────────────────────────
+
+/// Группа сведённых sym-матриц одной формы и битности.
+public struct RwkvqSymFusedGroup {
+    /// Ключи тензоров в порядке строк.
+    public let keys: [String]
+    let qblk: MLXArray
+    let qs: MLXArray
+    let d: MLXArray
+    public let outPer: Int
+    public let inFeatures: Int
+    public let bits: Int
+}
+
+extension RwkvqSidecar {
+
+    /// Свести строки каждой группы в один буфер. Группа, которая не годится
+    /// (не sym, разные формы или битность, форму не берёт ядро, нет
+    /// буферов), пропускается без ошибки: её матрицы считаются по одной.
+    public func fusingSym(_ groups: [String: [String]]) -> RwkvqSidecar {
+        var a = arrays
+        var fused = symFused
+        for (id, keys) in groups {
+            guard keys.count >= 2, let first = tensors[keys[0]], first.kind == .sym,
+                  keys.allSatisfy({
+                      guard let t = tensors[$0] else { return false }
+                      return t.kind == .sym && t.shape == first.shape && t.bits == first.bits
+                          && arrays["\($0)::qblk"] != nil && arrays["\($0)::qs"] != nil
+                          && arrays["\($0)::d"] != nil
+                  }),
+                  rwkvqSymGEMVApplies(outFeatures: first.outFeatures * keys.count,
+                                      inFeatures: first.inFeatures, bits: first.bits, rows: 1),
+                  first.outFeatures % symGemvRS == 0 else { continue }
+            let OUT = first.outFeatures
+            let qblk = concatenated(keys.map { arrays["\($0)::qblk"]! }, axis: 0)
+            let qs = concatenated(keys.map { arrays["\($0)::qs"]! }, axis: 0)
+            let d = concatenated(keys.map { arrays["\($0)::d"]! }, axis: 0)
+            eval(qblk, qs, d)
+            for (i, key) in keys.enumerated() {
+                let rows = (i * OUT) ..< ((i + 1) * OUT)
+                a["\(key)::qblk"] = qblk[rows]
+                a["\(key)::qs"] = qs[rows]
+                a["\(key)::d"] = d[rows]
+            }
+            fused[id] = RwkvqSymFusedGroup(keys: keys, qblk: qblk, qs: qs, d: d, outPer: OUT,
+                                           inFeatures: first.inFeatures, bits: first.bits)
+        }
+        eval(Array(a.values))
+        return RwkvqSidecar(arrays: a, tensors: tensors, naming: naming, nLayer: nLayer,
+                            nEmbd: nEmbd, headSize: headSize, vocabSize: vocabSize,
+                            symFused: fused)
+    }
+
+    /// K проекций одним запуском: xstack — [K, IN], по строке входа на
+    /// матрицу группы; выход [K, outPer], fp32. nil — если группы нет.
+    public func symGEMVFused(_ id: String, _ xstack: MLXArray) -> MLXArray? {
+        guard let g = symFused[id], xstack.ndim == 2,
+              xstack.shape == [g.keys.count, g.inFeatures] else { return nil }
+        let K = g.keys.count, IN = g.inFeatures, OUT = g.outPer * K
+        let x32 = xstack.asType(.float32)
+        let kern = symGemvKernel(inFeatures: IN, outFeatures: OUT, bits: g.bits, rows: 1,
+                                 outPer: g.outPer)
+        var inputs: [MLXArray] = [x32, g.qblk, g.qs, g.d]
+        if g.bits == 6 { inputs.append(x32.reshaped([K, IN / 16, 16]).sum(axis: 2)) }
+        let nTG = OUT / (symGemvNSG * symGemvRS)
+        return kern(inputs,
+                    grid: (nTG * symGemvNSG * 32, 1, 1),
+                    threadGroup: (symGemvNSG * 32, 1, 1),
+                    outputShapes: [[1, OUT]],
+                    outputDTypes: [.float32])[0].reshaped([K, g.outPer])
     }
 }

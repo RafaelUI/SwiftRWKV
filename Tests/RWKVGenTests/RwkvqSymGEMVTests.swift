@@ -149,4 +149,83 @@ final class RwkvqSymGEMVTests: XCTestCase {
         XCTAssertLessThan(klBetween, f.klRefMetalDecode)
         XCTAssertEqual(same, dec.shape[1])
     }
+
+    // ── Фьюз r/k/v ───────────────────────────────────────────────────
+
+    /// Три проекции одним запуском — БИТ-В-БИТ три отдельных запуска (порядок
+    /// суммирования в строке тот же), на обеих битностях; а срезы строк,
+    /// которыми заменены буферы отдельных матриц, равны исходным буферам.
+    func testFusedGroupIsBitExactToSeparateCalls() throws {
+        let plain = try RwkvqFileTests.base("reduction")
+        let groups = [
+            "att8": ["blocks.3.att.receptance.weight", "blocks.3.att.key.weight", "blocks.3.att.value.weight"],
+            "ffn6": ["blocks.2.ffn.key.weight", "blocks.7.ffn.key.weight"],
+        ]
+        let fused = plain.fusingSym(groups)
+        XCTAssertEqual(Set(fused.symFused.keys), ["att8", "ffn6"])
+        MLXRandom.seed(21)
+        for (id, keys) in groups {
+            let info = plain.tensors[keys[0]]!
+            let x = MLXRandom.normal([keys.count, info.inFeatures])
+            let got = try XCTUnwrap(fused.symGEMVFused(id, x), id)
+            XCTAssertEqual(got.shape, [keys.count, info.outFeatures])
+            for (i, key) in keys.enumerated() {
+                let alone = try XCTUnwrap(plain.symGEMV(key, x[i ..< (i + 1)]))
+                XCTAssertEqual(RwkvqFileTests.mismatches(got[i ..< (i + 1)], alone), 0,
+                               "\(id), матрица \(i): фьюз разошёлся с отдельным запуском")
+                // одиночные пути читают срезы сведённого буфера как прежние буферы
+                for field in ["qblk", "qs", "d"] {
+                    XCTAssertEqual(RwkvqFileTests.mismatches(fused.arrays["\(key)::\(field)"]!,
+                                                             plain.arrays["\(key)::\(field)"]!), 0)
+                }
+                XCTAssertEqual(RwkvqFileTests.mismatches(try fused.dequantize(key, dtype: .float16),
+                                                         try plain.dequantize(key, dtype: .float16)), 0)
+                XCTAssertEqual(RwkvqFileTests.mismatches(try XCTUnwrap(fused.symGEMV(key, x[i ..< (i + 1)])), alone), 0)
+            }
+        }
+        // группа, которая не годится, пропускается, а не ломает остальное
+        let odd = plain.fusingSym(["mixed": ["blocks.3.att.key.weight", "blocks.3.ffn.key.weight"],
+                                   "dense": ["blocks.0.att.output.weight", "blocks.0.att.key.weight"]])
+        XCTAssertTrue(odd.symFused.isEmpty)
+        XCTAssertNil(fused.symGEMVFused("att8", MLXArray.zeros([2, 768])), "не то число строк входа")
+        XCTAssertNil(fused.symGEMVFused("нет", MLXArray.zeros([3, 768])))
+        // обрезка сохраняет группу, только если целы все её матрицы
+        XCTAssertEqual(Set(fused.pruned(keeping: Set(groups["att8"]!)).symFused.keys), ["att8"])
+        XCTAssertTrue(fused.pruned(keeping: ["blocks.3.att.key.weight"]).symFused.isEmpty)
+    }
+
+    /// В модели: шаг идёт фьюзом на каждом слое, выдаёт побитно то же, что без
+    /// фьюза, — и с адаптерами LoRA поверх тоже.
+    func testStepWithFusedRKVEqualsUnfused() throws {
+        let f = try RwkvqModelTests.fixture("reduction")
+        let bb = try X070Backbone.load(fromRwkvq: f.path)
+        bb.useCompiledStep = false          // покомандный путь: сравнение побитное
+        XCTAssertEqual(bb.rwkvqSidecar?.symFused.count, 12, "r/k/v сведены на каждом слое")
+        let ids = f.ref["input_ids"]!
+        func run() -> MLXArray {
+            var rs = RWKVState(cfg: bb.cfg)
+            var last = MLXArray(Float(0))
+            for i in 0 ..< 3 { last = bb.step(ids[0, i].item(Int.self), state: &rs).asType(.float32) }
+            eval(last); return last
+        }
+        func both(_ what: String) {
+            bb.rwkvqSymFuseRKV = true
+            let before = (bb.rwkvqSymFusedCalls, bb.rwkvqSymGEMVCalls)
+            let a = run()
+            XCTAssertEqual(bb.rwkvqSymFusedCalls - before.0, 3 * 12, "\(what): фьюз на каждом слое каждого шага")
+            XCTAssertEqual(bb.rwkvqSymGEMVCalls - before.1, 3 * 72)
+            bb.rwkvqSymFuseRKV = false
+            let b = run()
+            XCTAssertEqual(bb.rwkvqSymFusedCalls - before.0, 3 * 12, "\(what): выключенный фьюз не зовётся")
+            XCTAssertEqual(RwkvqFileTests.mismatches(a, b), 0, "\(what): фьюз изменил выход шага")
+        }
+        both("база")
+        MLXRandom.seed(5)
+        LoRA.add(to: bb, spec: LoRASpec(rank: 8, alpha: 16))
+        for k in bb.loraTargets {
+            let (a, b) = bb.loraAdapter(k)
+            bb.setLoraAdapter(k, a, (MLXRandom.normal(b.shape) * 0.01).asType(b.dtype))
+        }
+        both("с адаптерами")
+    }
 }

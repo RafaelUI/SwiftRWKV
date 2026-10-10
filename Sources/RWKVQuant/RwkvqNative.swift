@@ -76,6 +76,15 @@ extension RwkvqSidecar {
     /// fp16 всегда, зажим обнуляется (так устроен эталон
     /// codec.sb6_to_mlx_affine; расхождение не больше 63·1e-8 на вес).
     public func nativeAffine(_ key: String, exactScales: Bool = true) throws -> RwkvqNativeWeight {
+        try nativeAffineBanded(key, exactScales: exactScales)
+    }
+
+    /// Потолок транзиента перекладки, байт: коды полосы строк, развёрнутые
+    /// в uint32. Меняется только тестом (одна полоса на весь тензор против
+    /// многих — результат обязан совпасть побитно).
+    nonisolated(unsafe) public static var nativeRepackBandBytes = 64 << 20
+
+    private func nativeAffineBanded(_ key: String, exactScales: Bool) throws -> RwkvqNativeWeight {
         guard let info = tensors[key] else {
             throw RwkvqError.missingBuffer(tensor: key, buffer: "manifest")
         }
@@ -91,22 +100,6 @@ extension RwkvqSidecar {
         let NB = IN / 32, NSB = NB / info.superBlock
         let xbits = info.xbits
         let bits = 4 + xbits
-
-        // ── коды ────────────────────────────────────────────────────
-        // qblk[row, blk] = 16Б нибблов [+4Б qh] [+4Б qh2]
-        let blk = qblk.reshaped([OUT, NB, 16 + 4 * xbits])
-        let cb = blk[0..., 0..., 0 ..< 16]
-        // блок-локальный split: младшие 16 колонок в low-нибблах,
-        // старшие 16 — в high (см. schema.py::pack_nib_block)
-        var q = concatenated([cb & 0xF, cb >> 4], axis: 2).asType(.uint32)
-        let shifts = MLXArray(Array(0 ..< 8).map { UInt8($0) })
-        for plane in 0 ..< xbits {
-            let off = 16 + 4 * plane
-            let hb = blk[0..., 0..., off ..< (off + 4)].reshaped([OUT, IN / 8])
-            let b = (hb.expandedDimensions(axis: -1) >> shifts) & 1
-            q = q + b.reshaped([OUT, NB, 32]).asType(.uint32)
-                * UInt32(16 << plane)
-        }
 
         // ── масштабы ────────────────────────────────────────────────
         let sm = qsqm.reshaped([OUT, NB, 2])
@@ -134,35 +127,69 @@ extension RwkvqSidecar {
         let scales16 = scales32.asType(.float16)
         let biases16 = biases32.asType(.float16)      // точно: значение уже fp16
 
-        // ── упаковка ────────────────────────────────────────────────
-        var words = [MLXArray](repeating: MLXArray.zeros([OUT, NB], dtype: .uint32),
-                               count: bits)
-        for p in 0 ..< 32 {
-            let start = p * bits
-            let w0 = start / 32, offset = start % 32
-            let lo = Swift.min(bits, 32 - offset)
-            let hi = bits - lo
-            let code = q[0..., 0..., p]
-            words[w0] = words[w0] | ((code & UInt32((1 << lo) - 1)) << UInt32(offset))
-            if hi > 0 {
-                words[w0 + 1] = words[w0 + 1]
-                    | ((code >> UInt32(lo)) & UInt32((1 << hi) - 1))
-            }
-        }
-        let wq = stacked(words, axis: -1).reshaped([OUT, NB * bits])
+        eval(scales32, biases32, scales16, biases16)
 
+        // ── коды и упаковка — ПОЛОСАМИ СТРОК ─────────────────────────
+        // Перекладка разворачивает каждый код в uint32: [R, NB, 32] слов,
+        // то есть 4 байта на вес против 4–6 бит в файле. Целым тензором это
+        // давало пик загрузки втрое выше самого файла (1.5B COMPRESSION:
+        // 3.4 ГБ при файле 0.95 ГиБ; одна голова 65536×2048 — 537 МБ
+        // транзиента, и ещё столько же на сверку зажима). Полосами транзиент
+        // ограничен ~64 МБ, результат тот же побитно (сверяется тестом).
+        let shifts = MLXArray(Array(0 ..< 8).map { UInt8($0) })
+        let bandRows = Swift.max(1, RwkvqSidecar.nativeRepackBandBytes / (NB * 32 * 4))
+        let clamped = exactScales
+            && !arrayEqual(scales16.asType(.float32), scales32).item(Bool.self)
         var useHalf = true
-        if exactScales, !arrayEqual(scales16.asType(.float32), scales32).item(Bool.self) {
-            // есть блоки на зажиме: fp16 законен, только если деквант тот же
-            let a = dequantized(wq, scales: scales16.asType(.float32), biases: biases32,
-                                groupSize: 32, bits: bits)
-            let b = dequantized(wq, scales: scales32, biases: biases32,
-                                groupSize: 32, bits: bits)
-            useHalf = arrayEqual(a, b).item(Bool.self)
+        var bands: [MLXArray] = []
+        var row = 0
+        while row < OUT {
+            let R = Swift.min(bandRows, OUT - row)
+            let rows = row ..< (row + R)
+            // qblk[row, blk] = 16Б нибблов [+4Б qh] [+4Б qh2]
+            let blk = qblk[rows].reshaped([R, NB, 16 + 4 * xbits])
+            let cb = blk[0..., 0..., 0 ..< 16]
+            // блок-локальный split: младшие 16 колонок в low-нибблах,
+            // старшие 16 — в high (см. schema.py::pack_nib_block)
+            var q = concatenated([cb & 0xF, cb >> 4], axis: 2).asType(.uint32)
+            for plane in 0 ..< xbits {
+                let off = 16 + 4 * plane
+                let hb = blk[0..., 0..., off ..< (off + 4)].reshaped([R, IN / 8])
+                let b = (hb.expandedDimensions(axis: -1) >> shifts) & 1
+                q = q + b.reshaped([R, NB, 32]).asType(.uint32) * UInt32(16 << plane)
+            }
+            var words = [MLXArray](repeating: MLXArray.zeros([R, NB], dtype: .uint32),
+                                   count: bits)
+            for p in 0 ..< 32 {
+                let start = p * bits
+                let w0 = start / 32, offset = start % 32
+                let lo = Swift.min(bits, 32 - offset)
+                let hi = bits - lo
+                let code = q[0..., 0..., p]
+                words[w0] = words[w0] | ((code & UInt32((1 << lo) - 1)) << UInt32(offset))
+                if hi > 0 {
+                    words[w0 + 1] = words[w0 + 1]
+                        | ((code >> UInt32(lo)) & UInt32((1 << hi) - 1))
+                }
+            }
+            let band = stacked(words, axis: -1).reshaped([R, NB * bits])
+            eval(band)
+            if clamped, useHalf {
+                // есть блоки на зажиме: fp16 законен, только если деквант тот же
+                let a = dequantized(band, scales: scales16[rows].asType(.float32),
+                                    biases: biases32[rows], groupSize: 32, bits: bits)
+                let b = dequantized(band, scales: scales32[rows], biases: biases32[rows],
+                                    groupSize: 32, bits: bits)
+                useHalf = arrayEqual(a, b).item(Bool.self)
+            }
+            bands.append(band)
+            row += R
         }
+        let wq = bands.count == 1 ? bands[0] : concatenated(bands, axis: 0)
         let scales = useHalf ? scales16 : scales32
         let biases = useHalf ? biases16 : biases32
         eval(wq, scales, biases)
+        bands.removeAll()
 
         return RwkvqNativeWeight(wq: wq, scales: scales, biases: biases,
                                  bits: bits, outFeatures: OUT, inFeatures: IN)

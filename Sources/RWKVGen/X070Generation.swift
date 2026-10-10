@@ -57,6 +57,14 @@ public struct RWKVState {
         vFirst = nil
     }
 
+    /// Состояние из готовых массивов (для собранного шага).
+    init(wkv: [MLXArray], tmixPrev: [MLXArray], cmixPrev: [MLXArray]) {
+        self.wkv = wkv
+        self.tmixPrev = tmixPrev
+        self.cmixPrev = cmixPrev
+        self.vFirst = nil
+    }
+
     /// Зафиксировать состояние (eval) — полезно между шагами генерации.
     public mutating func eval() {
         MLX.eval(wkv + tmixPrev + cmixPrev + (vFirst.map { [$0] } ?? []))
@@ -149,9 +157,15 @@ extension X070Backbone {
             xv = x + xx * gg(p+"x_v"); xa = x + xx * gg(p+"x_a"); xg = x + xx * gg(p+"x_g")
         }
 
-        let r = pj(xr, p+"r_proj.weight").reshaped([H, S])
-        let k0 = pj(xk, p+"k_proj.weight").reshaped([H, S])
-        var v = pj(xv, p+"v_proj.weight").reshaped([H, S])
+        let r, k0: MLXArray
+        var v: MLXArray
+        if let (fr, fk, fv) = decodeRKV(xr, xk, xv, layer: layer) {
+            r = fr.reshaped([H, S]); k0 = fk.reshaped([H, S]); v = fv.reshaped([H, S])
+        } else {
+            r = pj(xr, p+"r_proj.weight").reshaped([H, S])
+            k0 = pj(xk, p+"k_proj.weight").reshaped([H, S])
+            v = pj(xv, p+"v_proj.weight").reshaped([H, S])
+        }
 
         let gate = linear_(sigmoid(linear_(xg, gg(p+"g_lora_A.weight"))), gg(p+"g_lora_B.weight"))
 
@@ -230,10 +244,44 @@ extension X070Backbone {
     public func prefill(_ ids: [Int], state: inout RWKVState) -> MLXArray {
         precondition(!ids.isEmpty, "prefill: пустой промпт")
         let idsArray = MLXArray(ids.map { Int32($0) }, [1, ids.count])
+        if useCompiledPrefill, ids.count >= compiledPrefillMinTokens,
+           trainLayers.isEmpty, !useBlockCheckpoint, stepIsCompilable {
+            return prefillCompiled(idsArray, state: &state)
+        }
         let (lnOut, batch) = bodyWithState(idsArray)
         state = RWKVState(batch)
         let last = lnOut[0, ids.count - 1].reshaped([1, cfg.nEmbd])
         return pj(last, "head.weight").reshaped([cfg.vocab])
+    }
+
+    /// Префилл через `compile`: граф параллельного прохода трассируется один
+    /// раз НА ДЛИНУ промпта и дальше исполняется готовым, цепочки
+    /// поэлементных операций сливаются. Те же правила, что у собранного шага
+    /// (`useCompiledStep`): версия весов и запрет на bfloat16 в графе.
+    ///
+    /// Цена — трассировка на каждую новую длину. Кеш трасс MLX растёт с
+    /// числом разных длин, поэтому после `compiledPrefillMaxLengths` длин
+    /// функция пересоздаётся, и кеш начинается заново.
+    private func prefillCompiled(_ idsArray: MLXArray, state: inout RWKVState) -> MLXArray {
+        let T = idsArray.shape[1]
+        if compiledPrefillFn == nil || compiledPrefillVersion != stepVersion
+            || (!compiledPrefillLengths.contains(T)
+                && compiledPrefillLengths.count >= compiledPrefillMaxLengths) {
+            compiledPrefillFn = compile { [unowned self] ins in
+                let (lnOut, batch) = self.bodyWithState(ins[0])
+                let n = ins[0].shape[1]
+                let last = lnOut[0, n - 1].reshaped([1, self.cfg.nEmbd])
+                let logits = self.pj(last, "head.weight").reshaped([self.cfg.vocab])
+                return [logits, batch.wkv, batch.tmixShift, batch.cmixShift]
+            }
+            compiledPrefillVersion = stepVersion
+            compiledPrefillLengths = []
+        }
+        compiledPrefillLengths.insert(T)
+        compiledPrefillCalls += 1
+        let out = compiledPrefillFn!([idsArray])
+        state = RWKVState(RWKVBatchState(wkv: out[1], tmixShift: out[2], cmixShift: out[3]))
+        return out[0]
     }
 
     /// Тот же prefill, но токен за токеном через `step`.
@@ -299,6 +347,40 @@ extension X070Backbone {
     /// цикл генерации может держать токен на GPU и читать его назад
     /// реже, чем считает.
     public func step(_ id: MLXArray, state: inout RWKVState) -> MLXArray {
+        guard useCompiledStep, stepIsCompilable else { return stepEager(id, state: &state) }
+        let L = cfg.nLayer
+        compiledStepCalls += 1
+        // Пустое состояние заводится в bf16; в собранный граф bf16 не
+        // пускается (см. useCompiledStep) — нули приводятся снаружи.
+        let paramType = w["ln0.weight"]?.dtype ?? .float32
+        func clean(_ a: [MLXArray]) -> [MLXArray] {
+            a.map { $0.dtype == .bfloat16 ? $0.asType(paramType) : $0 }
+        }
+        if compiledStepFn == nil || compiledStepVersion != stepVersion {
+            // Замыкание читает веса и переключатели В МОМЕНТ ТРАССИРОВКИ и
+            // вшивает их в граф константами. Поэтому собранный шаг привязан
+            // к версии (см. stepVersion): любая запись в веса, адаптеры,
+            // базу или переключатель пути пересобирает его при следующем
+            // вызове — устаревший граф не исполняется никогда.
+            compiledStepFn = compile { [unowned self] ins in
+                var st = RWKVState(wkv: Array(ins[1 ..< 1 + L]),
+                                   tmixPrev: Array(ins[1 + L ..< 1 + 2 * L]),
+                                   cmixPrev: Array(ins[1 + 2 * L ..< 1 + 3 * L]))
+                let logits = self.stepEager(ins[0], state: &st)
+                return [logits] + st.wkv + st.tmixPrev + st.cmixPrev + [st.vFirst!]
+            }
+            compiledStepVersion = stepVersion
+        }
+        let out = compiledStepFn!([id] + state.wkv + clean(state.tmixPrev) + clean(state.cmixPrev))
+        state.wkv = Array(out[1 ..< 1 + L])
+        state.tmixPrev = Array(out[1 + L ..< 1 + 2 * L])
+        state.cmixPrev = Array(out[1 + 2 * L ..< 1 + 3 * L])
+        state.vFirst = out[1 + 3 * L]
+        return out[0]
+    }
+
+    /// Шаг покомандно, без `compile`: граф строится заново на каждый токен.
+    func stepEager(_ id: MLXArray, state: inout RWKVState) -> MLXArray {
         let D = cfg.nEmbd
         // Через общий путь: таблица может быть квантованной.
         let emb = embedForBlock(id).reshaped([1, D])
@@ -323,6 +405,9 @@ private func l2normLast(_ x: MLXArray) -> MLXArray {
 }
 private func layerNorm_(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
                         eps: Float = 1e-5) -> MLXArray {
+    // fp16 — штатным ядром MLX, как в параллельном пути (см. layerNorm в
+    // X070Backbone.swift): ручная формула в fp16 заметно грубее.
+    if x.dtype == .float16 { return MLX.layerNorm(x, weight: weight, bias: bias, eps: eps) }
     let mean = x.mean(axis: -1, keepDims: true)
     let varc = (x - mean).square().mean(axis: -1, keepDims: true)
     return (x - mean) / sqrt(varc + eps) * weight + bias
