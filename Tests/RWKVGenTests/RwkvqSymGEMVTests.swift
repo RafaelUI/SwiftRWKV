@@ -92,6 +92,12 @@ final class RwkvqSymGEMVTests: XCTestCase {
     func testStepGoesThroughTheKernelAndParallelPassDoesNot() throws {
         let f = try RwkvqModelTests.fixture("reduction")
         let bb = try X070Backbone.load(fromRwkvq: f.path)
+        // Короткий замороженный проход ядрами (shortPassKernelRows, с 12.10
+        // включён при загрузке) здесь ВЫКЛЮЧЕН: проверяется, что без него
+        // параллельный проход в ядро декода не уходит ни при какой длине.
+        // Сам короткий проход — ShortPassKernelTests.
+        XCTAssertGreaterThan(bb.shortPassKernelRows, 0)
+        bb.shortPassKernelRows = 0
         let ids = f.ref["input_ids"]!
         _ = bb(ids).sum().item(Float.self)
         let (_, st) = bb.bodyWithState(ids)

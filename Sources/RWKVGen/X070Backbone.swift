@@ -297,6 +297,33 @@ public final class X070Backbone {
         return fn([x])[0]
     }
 
+    /// Короткий замороженный параллельный проход — ядрами GEMV по сжатым
+    /// кодам, как рекуррентный шаг, а не «деквант + fp16-матмул»: когда
+    /// строк входа (B·T) не больше этого числа. 0 — выключено.
+    ///
+    /// Зачем. «Деквант + матмул» разворачивает КАЖДУЮ матрицу целиком,
+    /// сколько бы строк ни было на входе: на 1.5B это ~70 мс на проход,
+    /// даже если токенов два. Ядро читает коды прямо в произведении, его
+    /// цена растёт с числом строк, и на коротком входе оно быстрее; заодно
+    /// точнее (вес без округления в fp16, сумма в fp32). На длинном входе
+    /// быстрее матмул. Только норма и слои вне `trainLayers`: ядро
+    /// непрозрачно для автограда.
+    ///
+    /// Загрузка из .rwkvq ставит порог сама (`defaultShortPassRows`): он
+    /// зависит от размера модели и раскладки. Замерено префиллом
+    /// (`decode-bench --short-bench`), длина, на которой ядра сравниваются
+    /// с матмулом: 0.1B COMPRESSION — 6 токенов, 0.4B REDUCTION — 8, 1.5B
+    /// COMPRESSION — 9, 1.5B REDUCTION — 16. На 1.5B REDUCTION при T = 4
+    /// это 34 мс против 90, при T = 8 — 55 против 92.
+    public var shortPassKernelRows = 0 { didSet { stepVersion &+= 1 } }
+
+    /// Порог короткого прохода по умолчанию — с запасом ниже замеренной
+    /// точки равенства: sym берёт четыре строки за запуск и держится до
+    /// D / 128 строк, sb6 — по одной, до D / 256; не меньше четырёх.
+    static func defaultShortPassRows(nEmbd: Int, sym: Bool) -> Int {
+        max(4, nEmbd / (sym ? 128 : 256))
+    }
+
     /// Что на замороженном параллельном проходе считается слитно (см.
     /// `FrozenPassKernels`). Действует только в норме (`rwkvqBaseDType !=
     /// nil`) и только у слоёв вне `trainLayers`; прежний путь базы и плотная
@@ -556,7 +583,8 @@ public final class X070Backbone {
 
     // База проекции: если есть quant — x·Wᵀ с деквантизацией на лету
     // (веса [out,in] ⇒ transpose: true), иначе обычный linear.
-    private func baseProj(_ x: MLXArray, _ wKey: String, decode: Bool = false) -> MLXArray {
+    private func baseProj(_ x: MLXArray, _ wKey: String, decode: Bool = false,
+                          shortKernel: Bool = false) -> MLXArray {
         if let q = quant[wKey] {
             return quantizedMM(x, q.wq, scales: q.scales, biases: q.biases,
                                transpose: true, groupSize: q.groupSize, bits: q.bits)
@@ -583,14 +611,27 @@ public final class X070Backbone {
             }
             return matmul(x, wv(wKey).transposed())
         }
-        if decode, let world = rwkvqKeys[wKey], let sc = rwkvqSidecar {
+        if decode || shortKernel, let world = rwkvqKeys[wKey], let sc = rwkvqSidecar {
             let lead = Array(x.shape.dropLast())
             let x2d = x.reshaped([-1, x.shape[x.ndim - 1]])
-            if rwkvqSymDecodeKernel, let y = sc.symGEMV(world, x2d) {
+            // Ядро берёт несколько строк входа за запуск (sym — до четырёх,
+            // sb6 — одну); больше — несколькими запусками. На рекуррентном
+            // шаге строка одна, на коротком параллельном проходе их B·T.
+            func rows(_ maxRows: Int, _ kernel: (MLXArray) -> MLXArray?) -> MLXArray? {
+                let n = x2d.shape[0]
+                if n <= maxRows { return kernel(x2d) }
+                var parts: [MLXArray] = []
+                for start in stride(from: 0, to: n, by: maxRows) {
+                    guard let y = kernel(x2d[start ..< min(start + maxRows, n)]) else { return nil }
+                    parts.append(y)
+                }
+                return concatenated(parts, axis: 0)
+            }
+            if rwkvqSymDecodeKernel, let y = rows(rwkvqSymGEMVMaxRows, { sc.symGEMV(world, $0) }) {
                 rwkvqSymGEMVCalls += 1
                 return y.reshaped(lead + [y.shape[1]]).asType(x.dtype)
             }
-            if rwkvqSb6DecodeKernel, let y = sc.sb6GEMV(world, x2d) {
+            if rwkvqSb6DecodeKernel, let y = rows(1, { sc.sb6GEMV(world, $0) }) {
                 rwkvqSb6GEMVCalls += 1
                 return y.reshaped(lead + [y.shape[1]]).asType(x.dtype)
             }
@@ -612,8 +653,8 @@ public final class X070Backbone {
 
     // Проекция с опциональным LoRA: base + scale·(x·Aᵀ)·Bᵀ. target=nil ⇒ только база.
     private func proj(_ x: MLXArray, _ wKey: String, lora target: String?,
-                      decode: Bool = false) -> MLXArray {
-        let base = baseProj(x, wKey, decode: decode)
+                      decode: Bool = false, shortKernel: Bool = false) -> MLXArray {
+        let base = baseProj(x, wKey, decode: decode, shortKernel: shortKernel)
         guard let t = target, let a = loraA[t], let b = loraB[t] else { return base }
         let z = matmul(x, a.transposed())                       // [..., rank]
         return base + (loraScale[t] ?? 1.0) * matmul(z, b.transposed())
@@ -699,8 +740,8 @@ public final class X070Backbone {
     /// иначе снова разойдётся с параллельным путём.
     func embedForBlock(_ ids: MLXArray) -> MLXArray { embed(ids) }
     func projectForBlock(_ x: MLXArray, _ key: String, lora: String?,
-                         decode: Bool = false) -> MLXArray {
-        proj(x, key, lora: lora, decode: decode)
+                         decode: Bool = false, shortKernel: Bool = false) -> MLXArray {
+        proj(x, key, lora: lora, decode: decode, shortKernel: shortKernel)
     }
     func groupNormRaw(_ x: MLXArray) -> MLXArray { groupNorm(x) }
 

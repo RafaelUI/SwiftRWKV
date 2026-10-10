@@ -127,6 +127,9 @@ final class DecodeKernelTests: XCTestCase {
         let ids = f.ref["input_ids"]!
         let k3 = try X070Backbone.load(fromRwkvq: f.path, useNativeKernel: false)
         k3.useCompiledStep = false
+        // короткий проход ядрами выключен: здесь — шаг против параллельного
+        // прохода без него (сам короткий проход — ShortPassKernelTests)
+        k3.shortPassKernelRows = 0
         XCTAssertTrue(k3.isRawSidecarRetained)
         XCTAssertTrue(k3.rwkvqBackedKeys.allSatisfy { !k3.hasNativeRepack($0) })
         XCTAssertEqual(k3.rwkvqSidecar?.tensors.count, 72)

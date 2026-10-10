@@ -124,6 +124,8 @@ struct Args {
     var loadProfile: String? = nil
     /// Префилл T=512 по статьям: деквант, матмулы, WKV, остальное.
     var prefillProfile: String? = nil
+    /// Короткий параллельный проход: ядра GEMV против «деквант + матмул» по длинам.
+    var shortBench: String? = nil
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -165,6 +167,7 @@ func parseArgs() -> Args {
         case "--load-profile": a.loadProfile = it.next()
         case "--no-read-ahead": RwkvqContainer.readAheadEnabled = false
         case "--prefill-profile": a.prefillProfile = it.next()
+        case "--short-bench": a.shortBench = it.next()
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -1118,6 +1121,43 @@ func prefillProfile(_ path: String, _ args: Args) throws {
     print("префилл целиком (голова на 1 позиции), медиана 7:")
     for (a, t) in zip(arms, ts) { print(String(format: "   %@: %.1f мс", a.0, median(t))) }
     print(String(format: "остальное (умолчание - проекции тела - WKV): %.1f мс", median(ts[5]) - tLin - tWkv))
+}
+
+/// Короткий префилл: проекции ядрами GEMV (shortPassKernelRows) против
+/// «деквант + fp16-матмул», чередованием в одном процессе, по длинам.
+func shortBench(_ path: String, _ args: Args) throws {
+    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    let win = try loadArrays(url: URL(fileURLWithPath: expand(args.windows)))["ids"]!
+    let ids = win[0].asArray(Int32.self).map(Int.init)
+    func run(_ T: Int, _ kernels: Bool, recurrent: Bool = false) -> Double {
+        bb.shortPassKernelRows = kernels ? 1 << 20 : 0
+        defer { bb.shortPassKernelRows = 0 }
+        var st = RWKVState(cfg: bb.cfg)
+        let t = Date()
+        let lg = recurrent ? bb.prefillRecurrent(Array(ids[0 ..< T]), state: &st)
+                           : bb.prefill(Array(ids[0 ..< T]), state: &st)
+        eval(lg); st.eval()
+        return Date().timeIntervalSince(t) * 1e3
+    }
+    for T in [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64] {
+        var a: [Double] = [], b: [Double] = [], c: [Double] = []
+        for k in [true, false] { _ = run(T, k); _ = run(T, k) }
+        _ = run(T, false, recurrent: true)
+        for r in 0 ..< 7 {
+            for k in (r % 2 == 0 ? [true, false] : [false, true]) {
+                if k { a.append(run(T, true)) } else { b.append(run(T, false)) }
+            }
+            if T <= 16 { c.append(run(T, false, recurrent: true)) }
+        }
+        print(String(format: "T=%2d: ядра %.1f мс | матмул %.1f мс | отношение %.2f%@", T, median(a), median(b),
+                     median(a) / median(b), c.isEmpty ? "" : String(format: " | шагами %.1f мс", median(c))))
+        fflush(stdout)
+    }
+}
+
+if let path = args.shortBench {
+    try shortBench(path, args)
+    exit(0)
 }
 
 if let path = args.loadProfile {

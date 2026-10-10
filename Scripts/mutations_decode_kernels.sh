@@ -58,7 +58,7 @@ run "хвост: gate потерян" \
 echo
 echo "── где включаются ──"
 run "флаг ядра sb6 не читается" \
-    "$BB" 'if rwkvqSb6DecodeKernel, let y = sc.sb6GEMV(world, x2d) {' 'if let y = sc.sb6GEMV(world, x2d) {'
+    "$BB" 'if rwkvqSb6DecodeKernel, let y = rows(1, { sc.sb6GEMV(world, $0) }) {' 'if let y = rows(1, { sc.sb6GEMV(world, $0) }) {'
 run "ядра шага включаются у плотной модели" \
     "$GN" 'let fused = useStepKernels && rwkvqBaseDType != nil' 'let fused = useStepKernels'
 run "ядра шага включаются при приведении выхода WKV" \

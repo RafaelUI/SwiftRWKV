@@ -206,6 +206,12 @@ extension X070Backbone {
         eval(Array(bb.w.values))
         GPU.clearCache()
 
+        // короткий параллельный проход — ядрами GEMV; порог по раскладке базы
+        if baseDType != nil, !useNativeKernel,
+           let kind = sidecar.tensors["blocks.0.att.key.weight"]?.kind, kind == .sym || kind == .sb6 {
+            bb.shortPassKernelRows = X070Backbone.defaultShortPassRows(nEmbd: bb.cfg.nEmbd, sym: kind == .sym)
+        }
+
         // sb6, не переложившийся в родной контейнер, держит K3-буферы рядом
         // с native-буферами остальных. Печатаем ИМЕНА: «что-то не так»
         // бесполезно для диагностики. sym сюда не относится — у неё родного

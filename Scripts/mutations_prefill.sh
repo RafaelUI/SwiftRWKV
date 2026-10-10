@@ -1,7 +1,7 @@
 #!/bin/bash
 # Мутационная проверка префилла (12.10): замороженный WKV одним запуском на
-# всю длину и слитый счёт замороженного прохода (хвост tmix, нормировки,
-# cmix в типе базы).
+# всю длину, слитый счёт замороженного прохода (хвост tmix, нормировки,
+# cmix в типе базы) и короткий проход ядрами GEMV.
 #
 #   ./Scripts/mutations_prefill.sh [фильтр тестов]
 set -uo pipefail
@@ -12,8 +12,9 @@ WK=Sources/RWKVKernel/WKV7.swift
 DK=Sources/RWKVKernel/WKV7DecodeKernels.swift
 BK=Sources/RWKVGen/RWKVBlock.swift
 BB=Sources/RWKVGen/X070Backbone.swift
+LD=Sources/RWKVGen/RwkvqStandaloneLoad.swift
 
-FILTER="${1:-WKV7SequenceTests|FrozenPassKernelTests}"
+FILTER="${1:-WKV7SequenceTests|FrozenPassKernelTests|ShortPassKernelTests}"
 run() {
     local desc="$1"; shift
     printf '%-60s ' "$desc"
@@ -76,6 +77,34 @@ run "cmix с адаптером идёт слитно" \
           'guard quant[wKey] == nil, rwkvqNative[wKey] == nil, wOverride?[wKey] == nil else { return nil }'
 run "хвост на N строк: сетка на одну строку" \
     "$DK" 'grid: (N * H * 32, 1, 1),' 'grid: (H * 32, 1, 1),'
+
+echo
+echo "── короткий проход ядрами GEMV ──"
+run "короткий проход идёт и у обучаемого слоя" \
+    "$BK" '            && !backbone.trainLayers.contains(layer)
+            && x.shape.dropLast().reduce(1, *) <= backbone.shortPassKernelRows' \
+          '            && x.shape.dropLast().reduce(1, *) <= backbone.shortPassKernelRows'
+run "порог не действует: ядрами любая длина" \
+    "$BK" 'x.shape.dropLast().reduce(1, *) <= backbone.shortPassKernelRows' 'x.shape.dropLast().reduce(1, *) >= 0'
+run "порог считается по длине, а не по строкам батча" \
+    "$BK" 'x.shape.dropLast().reduce(1, *) <= backbone.shortPassKernelRows' \
+          'x.shape[x.ndim - 2] <= backbone.shortPassKernelRows'
+run "cmix на коротком проходе разворачивает матрицы" \
+    "$BK" 'isShort(xk) ? nil : backbone.cmixFrozen(xk, layer: layer)' 'backbone.cmixFrozen(xk, layer: layer)'
+run "все куски строк читают начало входа" \
+    "$BB" 'guard let y = kernel(x2d[start ..< min(start + maxRows, n)]) else { return nil }' \
+          'guard let y = kernel(x2d[0 ..< min(maxRows, n - start)]) else { return nil }'
+run "признак короткого прохода не доходит до проекции" \
+    "$BB" 'let base = baseProj(x, wKey, decode: decode, shortKernel: shortKernel)' \
+          'let base = baseProj(x, wKey, decode: decode, shortKernel: false)'
+run "порог при загрузке не ставится" \
+    "$LD" 'bb.shortPassKernelRows = X070Backbone.defaultShortPassRows(' '_ = X070Backbone.defaultShortPassRows('
+run "порог ставится и при родном контейнере" \
+    "$LD" 'if baseDType != nil, !useNativeKernel,
+           let kind' 'if baseDType != nil,
+           let kind'
+run "sb6 получает порог sym" \
+    "$LD" 'nEmbd: bb.cfg.nEmbd, sym: kind == .sym)' 'nEmbd: bb.cfg.nEmbd, sym: true)'
 
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

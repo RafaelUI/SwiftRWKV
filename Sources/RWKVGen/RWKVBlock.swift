@@ -373,7 +373,8 @@ final class BackboneBlockContext: RWKVBlockContext {
         // Имя LoRA-таргета — имя веса без ".weight": так они и заведены
         // (blocks.3.tmix.r_proj против blocks.3.tmix.r_proj.weight).
         precondition(full.hasSuffix(".weight"), "проекция \(full) не .weight")
-        return backbone.projectForBlock(x, full, lora: String(full.dropLast(7)))
+        return backbone.projectForBlock(x, full, lora: String(full.dropLast(7)),
+                                        shortKernel: isShort(x))
     }
 
     func groupNormHeads(_ x: MLXArray) -> MLXArray { backbone.groupNormRaw(x) }
@@ -384,7 +385,19 @@ final class BackboneBlockContext: RWKVBlockContext {
         backbone.rwkvqBaseDType != nil ? backbone.frozenPassKernels : []
     }
 
-    func cmixFrozen(_ xk: MLXArray) -> MLXArray? { backbone.cmixFrozen(xk, layer: layer) }
+    /// Короткий замороженный проход в норме — ядрами GEMV (см.
+    /// `X070Backbone.shortPassKernelRows`). Число строк входа — B·T.
+    private func isShort(_ x: MLXArray) -> Bool {
+        backbone.shortPassKernelRows > 0 && backbone.rwkvqBaseDType != nil
+            && !backbone.trainLayers.contains(layer)
+            && x.shape.dropLast().reduce(1, *) <= backbone.shortPassKernelRows
+    }
+
+    // На коротком проходе cmix идёт общим путём: слитый вариант разворачивает
+    // обе матрицы целиком, а это и есть то, чего короткий проход избегает.
+    func cmixFrozen(_ xk: MLXArray) -> MLXArray? {
+        isShort(xk) ? nil : backbone.cmixFrozen(xk, layer: layer)
+    }
 
     func wkvPath(_ T: Int) -> WKVKernelPath {
         // Намеренно БЕЗ ветки .step на T == 1: одношаговый путь численно
