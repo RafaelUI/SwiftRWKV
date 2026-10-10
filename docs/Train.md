@@ -483,16 +483,22 @@ legitimate training input.
   `RerankDataset` does this correctly and the code transfers by copying.
 - **No tokeniser for non-World vocabularies**, which limits pretraining on a
   custom vocabulary: Swift has no equivalent of HuggingFace `tokenizers`.
-- **Large backward passes can trip the GPU watchdog.** MLX packs up to 40 ops
-  into one Metal command buffer on this class of machine. With the WKV
-  backward kernel inside, a buffer can run long enough for the GPU to be reset
-  (`kIOGPUCommandBufferCallbackErrorHang`, then address faults or "innocent
-  victim" errors in the buffers that follow); the process either dies or
-  carries on with NaN gradients in the lowest layers. Reproduced on a *dense*
-  bf16 0.1B with LoRA at T = 48 without block checkpointing (NaN or a crash in
-  3 runs of 3) and on a 1.5B `.rwkvq` base at T = 64 with it (crash in 3 runs
-  of 4). `MLX_MAX_OPS_PER_BUFFER=4` in the environment removed it in every run
-  tried (0.1B: 18 rounds clean; 1.5B: 4 runs of 4) and made the 1.5B step 7%
-  faster (490 ms against 529). T = 16 was clean either way. Found 09.10 on
-  macOS 27 beta; whether a release OS behaves the same is not known. Until
-  that is settled, set the variable for training runs on real models.
+- **Fixed 10.10: NaN gradients and GPU faults on real models.** Training a
+  real model at T >= 32 used to fail intermittently — NaN in the gradients of
+  the lowest layers, or a dead process with a Metal command-buffer error
+  (Hang / PageFault / InnocentVictim). The cause was in the WKV backward
+  kernel's call, not in the data: MLX generates a custom kernel's source from
+  the *types of its inputs* but caches the library by *name*, and a call with
+  the same name and other types makes it drop the old library and pipeline at
+  once — while dispatches already encoded in the command buffer still use
+  them. The backward kernel received its primals as they came: layer 0 in the
+  parameter type (bf16 / fp16), the layers above in fp32, so in one backward
+  pass one layer kept pulling the pipeline from under another. The inputs are
+  now cast to fp32, as the forward kernel's always were; results are
+  bit-identical where they were correct. A second, independent defect went
+  with it: the kernel declared more threadgroup memory than Metal allows
+  (37376 bytes against 32768; Metal counts it double). Before the fix: NaN or
+  a crash in 3 runs of 3 on a dense 0.1B at T = 48, and a crash in 3 of 4 on a
+  1.5B at T = 64; after: 18 rounds and 5 runs clean. Any new custom kernel
+  must keep its input types fixed (the quantised-base kernels now assert
+  theirs).
