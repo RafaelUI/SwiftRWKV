@@ -225,6 +225,13 @@ public final class X070Backbone {
     /// Заполняется по `RwkvqAttachOptions.useNativeKernel`.
     public internal(set) var rwkvqNative: [String: RwkvqNativeWeight] = [:] { didSet { stepVersion &+= 1 } }
 
+    /// Таблица эмбеддинга, оставленная СЖАТОЙ: строки деквантуются выборкой
+    /// (см. RwkvqSymRows.swift). Задана — значит, плотного `emb.weight` в
+    /// словаре весов нет вовсе. Заводится загрузкой из .rwkvq, когда emb
+    /// лежит в sym при восьми битах (пресет REDUCTION), а плотные параметры
+    /// — fp16; выход побитно тот же, что у плотной таблицы.
+    public internal(set) var rwkvqEmbTable: RwkvqSymRowTable? = nil { didSet { stepVersion &+= 1 } }
+
     /// Тип квантованной базы: чем округляется деквант и в чём считается
     /// матмул проекции. Вход приводится к этому типу, выход — обратно к типу
     /// входа, так что fp32 из ядра WKV не тащит за собой fp32-копию матрицы.
@@ -592,6 +599,11 @@ public final class X070Backbone {
             // см. attachRwkvq.
             return dense.take(ids, axis: 0)
         }
+        // сжатая таблица: строки выборкой. Обучаемая подмена (wOverride) и
+        // плотная таблица, если она есть, имеют приоритет.
+        if wOverride?["emb.weight"] == nil, w["emb.weight"] == nil, let table = rwkvqEmbTable {
+            return table.rows(ids)
+        }
         return wv("emb.weight").take(ids, axis: 0)
     }
 
@@ -678,7 +690,7 @@ public final class X070Backbone {
 
     /// Есть ли вес ВООБЩЕ — плотный или в сайдкаре.
     public func hasAnyWeight(_ key: String) -> Bool {
-        w[key] != nil || isRwkvqBacked(key)
+        w[key] != nil || isRwkvqBacked(key) || (key == "emb.weight" && rwkvqEmbTable != nil)
     }
 
     /// Все имена весов модели, включая ушедшие в сайдкар.
@@ -688,7 +700,8 @@ public final class X070Backbone {
     /// `RWKVBlock.fromBase` строил блок без единой проекции — объект
     /// создавался успешно и падал потом, в `param()` посреди прохода.
     public var allWeightKeys: [String] {
-        Array(Set(w.keys).union(rwkvqKeys.keys)).sorted()
+        Array(Set(w.keys).union(rwkvqKeys.keys)
+            .union(rwkvqEmbTable == nil ? [] : ["emb.weight"])).sorted()
     }
 
     /// Плотное значение веса: своё, либо развёрнутое из сайдкара, либо nil.
@@ -700,6 +713,7 @@ public final class X070Backbone {
         if let v = w[key] { return v }
         let dtype = w["ln0.weight"]?.dtype ?? .bfloat16
         if let v = rwkvqWeight(key, dtype) { return v }
+        if key == "emb.weight", let table = rwkvqEmbTable { return table.dense().asType(dtype) }
         // Вес, оставшийся ТОЛЬКО в родном контейнере (сайдкар отпущен):
         // разворачивается штатной обратной функцией упаковки. Раньше здесь
         // был nil, и `weight(_:)` падал на базе, собранной с

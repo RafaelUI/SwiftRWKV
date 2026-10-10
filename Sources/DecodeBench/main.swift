@@ -120,7 +120,7 @@ struct Args {
     /// Разложение шага: сколько уходит на построение графа (вызов step на
     /// CPU) и сколько на исполнение (eval), собранным и покомандным путём.
     var stepProfile: String? = nil
-    /// Загрузка .rwkvq по этапам: память MLX и footprint после каждого.
+    /// Загрузка .rwkvq: время, память MLX и footprint процесса.
     var loadProfile: String? = nil
     /// Префилл T=512 по статьям: деквант, матмулы, WKV, остальное.
     var prefillProfile: String? = nil
@@ -1008,58 +1008,20 @@ func stepProfile(_ path: String, _ args: Args) throws {
     }
 }
 
-/// Загрузка по этапам: что лежит в памяти MLX и в footprint процесса после
-/// каждого шага `load(fromRwkvq:)`, повторённого здесь открытыми вызовами.
-/// Пик MLX сбрасывается перед каждым этапом.
+/// Загрузка `.rwkvq`: время, память MLX (активная, кеш, пик) и footprint
+/// процесса. Пик MLX обязан равняться рабочей памяти (см.
+/// `X070Backbone.loadStreaming`); холодный и прогретый кеш страниц
+/// меряются отдельными процессами.
 func loadProfile(_ path: String, _ args: Args) throws {
     func gb(_ x: Int) -> Double { Double(x) / 1e9 }
     let f0 = processFootprintGB()
-    var t = Date()
-    func mark(_ what: String) {
-        print(String(format: "%@: %.2f с | MLX активная %.2f, кеш %.2f, пик этапа %.2f ГБ | footprint +%.2f ГБ",
-                     what, Date().timeIntervalSince(t), gb(GPU.activeMemory), gb(GPU.cacheMemory),
-                     gb(GPU.peakMemory), processFootprintGB() - f0))
-        fflush(stdout)
-        GPU.resetPeakMemory(); t = Date()
-    }
     GPU.resetPeakMemory()
-    let sc = try RwkvqSidecar.open(expand(path))
-    mark("1. открыть файл, все буферы в MLX")
-    // что из поднятого нужно после сборки, а что разворачивается и бросается
-    var byKind: [String: Int] = [:]
-    var keep = 0, drop = 0, emb = 0
-    for (name, a) in sc.arrays {
-        guard let r = name.range(of: "::") else { continue }
-        let key = String(name[..<r.lowerBound])
-        let bytes = a.size * a.dtype.size
-        let kind = sc.tensors[key]?.kind.rawValue ?? "?"
-        byKind[kind, default: 0] += bytes
-        let is2d = sc.tensors[key]?.shape.count == 2
-        let quantBase = (kind == "sym" || kind == "sb6") && is2d && key != "emb.weight"
-            && RwkvqNaming.x070Key(forWorld: key) != nil
-        if key == "emb.weight" { emb += bytes } else if quantBase { keep += bytes } else { drop += bytes }
-    }
-    print("   буферы по раскладкам, ГБ: " + byKind.sorted { $0.key < $1.key }
-        .map { String(format: "%@ %.3f", $0.key, gb($0.value)) }.joined(separator: ", "))
-    print(String(format: "   остаются сжатыми %.3f ГБ | emb (коды) %.3f ГБ | прочее (разворачивается в плотное) %.3f ГБ",
-                 gb(keep), gb(emb), gb(drop)))
-    var weights = try sc.buildDenseWeights(computeDType: .float16)
-    eval(Array(weights.values))
-    mark("2. плотные параметры тела (нормы, миксы, ветки)")
-    print(String(format: "   плотные параметры тела: %.3f ГБ", gb(weights.values.reduce(0) { $0 + $1.size * $1.dtype.size })))
-    weights["emb.weight"] = try sc.dequantize("emb.weight", dtype: .float16)
-    eval(weights["emb.weight"]!)
-    mark("3. emb развёрнут в плотную fp16")
-    let cfg = X070Config(nLayer: sc.nLayer, nEmbd: sc.nEmbd, headSize: sc.headSize, vocab: sc.vocabSize)
-    let bb = X070Backbone(weights: weights, cfg: cfg, computeDType: .float16)
-    weights = [:]
-    _ = bb.attachRwkvq(sc, options: X070Backbone.RwkvqAttachOptions(
-        quantizeCmix: true, quantizeHead: true, quantizeEmbedding: false,
-        useNativeKernel: args.native, baseDType: .float16))
-    mark("4. бэкбон собран, база подключена (обрезка, фьюз r/k/v)")
-    GPU.clearCache()
-    mark("5. кеш MLX отпущен (исходная база ещё жива в этой функции)")
-    _ = bb
+    let t = Date()
+    let bb = try X070Backbone.load(fromRwkvq: expand(path), useNativeKernel: args.native)
+    let dt = Date().timeIntervalSince(t)
+    print(String(format: "загрузка %.2f с | MLX активная %.3f, кеш %.3f, пик %.3f ГБ | footprint +%.3f ГБ | emb %@",
+                 dt, gb(GPU.activeMemory), gb(GPU.cacheMemory), gb(GPU.peakMemory),
+                 processFootprintGB() - f0, bb.rwkvqEmbTable == nil ? "плотный" : "сжатый (строки выборкой)"))
 }
 
 /// Префилл T=512 по статьям, тем же способом, что эталон

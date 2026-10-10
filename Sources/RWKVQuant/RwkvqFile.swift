@@ -198,6 +198,30 @@ extension RwkvqSidecar {
 
     /// Прочитать `.rwkvq` напрямую. Сайдкар не нужен.
     public convenience init(rwkvq path: String) throws {
+        try self.init(rwkvq: path, only: nil)
+    }
+
+    /// Прочитать `.rwkvq` ЧАСТЯМИ — для загрузки без всплеска памяти.
+    ///
+    /// Манифест (`tensors`) разбирается и проверяется ВЕСЬ, а буферы
+    /// поднимаются в память только у тензоров, для которых `want` вернул
+    /// true (nil — у всех). У такой базы `contains(key)` верно для любого
+    /// тензора файла, а `dequantize` тензора без буферов бросает
+    /// `missingBuffer`: частичная база — деталь загрузчика, а не модель.
+    ///
+    /// - fusingSym: группы sym-тензоров (идентификатор → ключи), строки
+    ///   которых сводятся в один буфер СРАЗУ при чтении (см. `fusingSym`):
+    ///   читаются члены одной группы, склеиваются, и их отдельные буферы
+    ///   отпускаются до чтения следующей. Сведение готовой базы целиком
+    ///   держало бы обе копии всех групп разом — на 1.5B REDUCTION это
+    ///   +0.3 ГБ пика загрузки.
+    ///
+    /// Порядок чтения — от крупных тензоров к мелким. Тензор, которому при
+    /// чтении нужна перекладка (K3 у sb6, интерлив sym при шести битах),
+    /// на её время занимает вдвое больше своего размера; при таком порядке
+    /// самый большой транзиент приходится на начало, когда база ещё пуста.
+    public convenience init(rwkvq path: String, only want: ((String) -> Bool)?,
+                            fusingSym groups: [String: [String]] = [:]) throws {
         let p = (path as NSString).expandingTildeInPath
         let box = try RwkvqContainer(path: p)
         guard let text = box.metadata["rwkvq"], let raw = text.data(using: .utf8),
@@ -220,8 +244,8 @@ extension RwkvqSidecar {
         var arrays: [String: MLXArray] = [:]
         var infos: [String: RwkvqTensorInfo] = [:]
 
-        for (key, value) in tensorDict {
-            guard let m = value as? [String: Any],
+        func process(_ key: String) throws {
+            guard let m = tensorDict[key] as? [String: Any],
                   let shape = m["shape"] as? [Int],
                   let kindName = m["kind"] as? String else {
                 throw RwkvqError.malformedManifest("\(p): нет формы или раскладки у \(key)")
@@ -229,6 +253,7 @@ extension RwkvqSidecar {
             guard let kind = RwkvqKind(rawValue: kindName) else {
                 throw RwkvqError.malformedManifest("неизвестная раскладка \(kindName) у \(key)")
             }
+            let load = want?(key) ?? true
             let bits = m["bits"] as? Int ?? 16
             let gs = m["gw_gs"] as? Int ?? 0
             let sb = m["gw_sb"] as? Int ?? 0
@@ -241,6 +266,14 @@ extension RwkvqSidecar {
                 }
                 return a
             }
+            // Форма буфера по заголовку контейнера — проверки манифеста не
+            // зависят от того, поднимается ли сам буфер.
+            func dims(_ field: String) throws -> [Int] {
+                guard let s = box.shape("\(key)::\(field)") else {
+                    throw RwkvqError.missingBuffer(tensor: key, buffer: field)
+                }
+                return s
+            }
             func nBlocksCheck(_ got: Int, _ what: String) throws {
                 if let nb = m["n_blocks"] as? Int, nb > 0, nb != got {
                     throw RwkvqError.malformedManifest(
@@ -251,32 +284,40 @@ extension RwkvqSidecar {
             var xbits = 0, packed = false, outliers = 0
             switch kind {
             case .dense:
-                arrays["\(key)::dense"] = try need("dense")
+                _ = try dims("dense")
+                if load { arrays["\(key)::dense"] = try need("dense") }
 
             case .asym:
                 guard shape.count == 2, gs > 0 else {
                     throw RwkvqError.malformedManifest("неполная asym-запись для \(key)")
                 }
-                let scale = try need("gw_scale")
+                let scaleShape = try dims("gw_scale")
                 // блоков CEIL(IN/gs): хвостовой неполный блок имеет свой scale
                 let nb = (shape[1] + gs - 1) / gs
-                guard scale.shape.last == nb else {
+                guard scaleShape.last == nb else {
                     throw RwkvqError.shapeMismatch(tensor: key, expected: [shape[0], nb],
-                                                   got: scale.shape)
+                                                   got: scaleShape)
                 }
                 try nBlocksCheck(nb, "gw_scale")
-                arrays["\(key)::codes"] = try need("codes")
-                arrays["\(key)::gw_scale"] = scale
-                arrays["\(key)::gw_min"] = try need("gw_min")
+                _ = try dims("codes"); _ = try dims("gw_min")
+                if load {
+                    arrays["\(key)::codes"] = try need("codes")
+                    arrays["\(key)::gw_scale"] = try need("gw_scale")
+                    arrays["\(key)::gw_min"] = try need("gw_min")
+                }
 
             case .rtn:
-                if box.contains("\(key)::codes_packed") {
-                    packed = true
-                    arrays["\(key)::codes_packed"] = try need("codes_packed")
-                } else {
-                    arrays["\(key)::codes"] = try need("codes")
+                packed = box.contains("\(key)::codes_packed")
+                if !packed { _ = try dims("codes") }
+                _ = try dims("scale")
+                if load {
+                    if packed {
+                        arrays["\(key)::codes_packed"] = try need("codes_packed")
+                    } else {
+                        arrays["\(key)::codes"] = try need("codes")
+                    }
+                    arrays["\(key)::scale"] = try need("scale")
                 }
-                arrays["\(key)::scale"] = try need("scale")
                 outliers = box.shape("\(key)::outlier_indices")?.first ?? 0
 
             case .sb6:
@@ -287,27 +328,31 @@ extension RwkvqSidecar {
                         + "(в файле gw_gs=\(gs), gw_sb=\(sb), форма \(shape))")
                 }
                 try nBlocksCheck(shape[1] / gs, "sb6")
-                let qsqm = try need("gw_qsqm")
-                guard qsqm.shape == [shape[0], shape[1] / (gs * sb), 12] else {
+                let qsqmShape = try dims("gw_qsqm")
+                guard qsqmShape == [shape[0], shape[1] / (gs * sb), 12] else {
                     throw RwkvqError.shapeMismatch(
-                        tensor: key, expected: [shape[0], shape[1] / (gs * sb), 12], got: qsqm.shape)
+                        tensor: key, expected: [shape[0], shape[1] / (gs * sb), 12], got: qsqmShape)
                 }
-                let k3 = rwkvqSb6ToK3(
-                    codesPacked: try need("codes_packed"), qsqm: qsqm,
-                    d: try need("gw_d"), dm: try need("gw_dm"),
-                    qh: box.array("\(key)::gw_qh"), qh2: box.array("\(key)::gw_qh2"),
-                    shape: shape, groupSize: gs, superBlock: sb)
-                // eval на каждом тензоре обязателен: иначе граф ленив и
-                // канонические буферы всех тензоров доживают до конца
-                // загрузки рядом с интерливом.
-                eval(k3.qblk, k3.qsqm, k3.ddm)
-                arrays["\(key)::qblk"] = k3.qblk
-                arrays["\(key)::qsqm"] = k3.qsqm
-                arrays["\(key)::ddm"] = k3.ddm
-                xbits = k3.xbits
+                _ = try dims("codes_packed"); _ = try dims("gw_d"); _ = try dims("gw_dm")
+                xbits = (box.contains("\(key)::gw_qh") ? 1 : 0) + (box.contains("\(key)::gw_qh2") ? 1 : 0)
                 guard bits == 4 + xbits else {
                     throw RwkvqError.malformedManifest(
                         "\(key): bits=\(bits), а битплоскостей в файле \(xbits)")
+                }
+                if load {
+                    let k3 = rwkvqSb6ToK3(
+                        codesPacked: try need("codes_packed"), qsqm: try need("gw_qsqm"),
+                        d: try need("gw_d"), dm: try need("gw_dm"),
+                        qh: box.array("\(key)::gw_qh"), qh2: box.array("\(key)::gw_qh2"),
+                        shape: shape, groupSize: gs, superBlock: sb)
+                    // eval на каждом тензоре обязателен: иначе граф ленив и
+                    // канонические буферы всех тензоров доживают до конца
+                    // загрузки рядом с интерливом.
+                    eval(k3.qblk, k3.qsqm, k3.ddm)
+                    precondition(k3.xbits == xbits)
+                    arrays["\(key)::qblk"] = k3.qblk
+                    arrays["\(key)::qsqm"] = k3.qsqm
+                    arrays["\(key)::ddm"] = k3.ddm
                 }
 
             case .sym:
@@ -320,44 +365,74 @@ extension RwkvqSidecar {
                 guard IN % gs == 0 else {
                     throw RwkvqError.malformedManifest("\(key): sym, IN=\(IN) не кратен блоку 16")
                 }
-                let qs = try need("gw_qs", as: .uint8)
-                let d = try need("gw_d")
-                try nBlocksCheck(qs.shape.last ?? 0, "gw_qs")
-                guard qs.shape == [OUT, IN / gs], d.shape.count == 2,
-                      d.shape[1] * sb == IN / gs else {
+                let qsShape = try dims("gw_qs"), dShape = try dims("gw_d")
+                try nBlocksCheck(qsShape.last ?? 0, "gw_qs")
+                guard qsShape == [OUT, IN / gs], dShape.count == 2,
+                      dShape[1] * sb == IN / gs else {
                     throw RwkvqError.shapeMismatch(tensor: key, expected: [OUT, IN / gs],
-                                                   got: qs.shape)
+                                                   got: qsShape)
                 }
                 // Битность различается ПО ПРИСУТСТВИЮ БУФЕРОВ, как в codec:
                 // `codes` есть только при восьми битах, `codes_packed` —
                 // только при шести.
-                let qblk: MLXArray
-                if box.contains("\(key)::codes") {
+                let eight = box.contains("\(key)::codes")
+                if eight {
                     guard bits == 8 else {
                         throw RwkvqError.malformedManifest("\(key): sym с буфером codes при bits=\(bits)")
                     }
-                    qblk = try need("codes", as: .uint8)
                 } else {
                     guard bits == 6, IN % 32 == 0 else {
                         throw RwkvqError.malformedManifest(
                             "\(key): sym с codes_packed при bits=\(bits), IN=\(IN)")
                     }
-                    let NP = IN / 32
-                    qblk = concatenated([
-                        try need("codes_packed").reshaped([OUT, NP, 16]),
-                        try need("gw_qh").reshaped([OUT, NP, 4]),
-                        try need("gw_qh2").reshaped([OUT, NP, 4]),
-                    ], axis: 2).reshaped([OUT, NP * 24])
-                    eval(qblk)
+                    _ = try dims("codes_packed"); _ = try dims("gw_qh"); _ = try dims("gw_qh2")
                 }
-                arrays["\(key)::qblk"] = qblk
-                arrays["\(key)::qs"] = qs
-                arrays["\(key)::d"] = d
+                if load {
+                    let qblk: MLXArray
+                    if eight {
+                        qblk = try need("codes", as: .uint8)
+                    } else {
+                        let NP = IN / 32
+                        qblk = concatenated([
+                            try need("codes_packed").reshaped([OUT, NP, 16]),
+                            try need("gw_qh").reshaped([OUT, NP, 4]),
+                            try need("gw_qh2").reshaped([OUT, NP, 4]),
+                        ], axis: 2).reshaped([OUT, NP * 24])
+                        eval(qblk)
+                    }
+                    arrays["\(key)::qblk"] = qblk
+                    arrays["\(key)::qs"] = try need("gw_qs", as: .uint8)
+                    arrays["\(key)::d"] = try need("gw_d")
+                }
             }
             infos[key] = RwkvqTensorInfo(kind: kind, shape: shape, bits: bits,
                                          xbits: xbits, groupSize: gs, superBlock: sb,
                                          packed: packed, outlierCount: outliers,
                                          transposed: transposed)
+        }
+
+        func elements(_ key: String) -> Int {
+            (((tensorDict[key] as? [String: Any])?["shape"] as? [Int]) ?? []).reduce(1, *)
+        }
+        var groupOf: [String: String] = [:]
+        for (id, keys) in groups { for k in keys { groupOf[k] = id } }
+        var fused: [String: RwkvqSymFusedGroup] = [:]
+        var done = Set<String>()
+        // от крупных к мелким; имя — второй ключ, чтобы порядок был один
+        let ordered = tensorDict.keys.sorted {
+            let a = elements($0), b = elements($1)
+            return a != b ? a > b : $0 < $1
+        }
+        for key in ordered where !done.contains(key) {
+            guard let id = groupOf[key], let members = groups[id],
+                  members.allSatisfy({ tensorDict[$0] != nil && (want?($0) ?? true) }) else {
+                try process(key); done.insert(key)
+                continue
+            }
+            for k in members where !done.contains(k) { try process(k); done.insert(k) }
+            if let g = RwkvqSidecar.fuseSymGroup(members, tensors: infos, arrays: &arrays) {
+                fused[id] = g
+            }
         }
         eval(Array(arrays.values))
 
@@ -365,6 +440,7 @@ extension RwkvqSidecar {
                   nLayer: root["n_layer"] as? Int ?? 0,
                   nEmbd: root["n_embd"] as? Int ?? 0,
                   headSize: root["head_size"] as? Int ?? 64,
-                  vocabSize: root["vocab_size"] as? Int ?? 0)
+                  vocabSize: root["vocab_size"] as? Int ?? 0,
+                  symFused: fused)
     }
 }

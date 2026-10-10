@@ -298,35 +298,44 @@ extension RwkvqSidecar {
     public func fusingSym(_ groups: [String: [String]]) -> RwkvqSidecar {
         var a = arrays
         var fused = symFused
-        for (id, keys) in groups {
-            guard keys.count >= 2, let first = tensors[keys[0]], first.kind == .sym,
-                  keys.allSatisfy({
-                      guard let t = tensors[$0] else { return false }
-                      return t.kind == .sym && t.shape == first.shape && t.bits == first.bits
-                          && arrays["\($0)::qblk"] != nil && arrays["\($0)::qs"] != nil
-                          && arrays["\($0)::d"] != nil
-                  }),
-                  rwkvqSymGEMVApplies(outFeatures: first.outFeatures * keys.count,
-                                      inFeatures: first.inFeatures, bits: first.bits, rows: 1),
-                  first.outFeatures % symGemvRS == 0 else { continue }
-            let OUT = first.outFeatures
-            let qblk = concatenated(keys.map { arrays["\($0)::qblk"]! }, axis: 0)
-            let qs = concatenated(keys.map { arrays["\($0)::qs"]! }, axis: 0)
-            let d = concatenated(keys.map { arrays["\($0)::d"]! }, axis: 0)
-            eval(qblk, qs, d)
-            for (i, key) in keys.enumerated() {
-                let rows = (i * OUT) ..< ((i + 1) * OUT)
-                a["\(key)::qblk"] = qblk[rows]
-                a["\(key)::qs"] = qs[rows]
-                a["\(key)::d"] = d[rows]
-            }
-            fused[id] = RwkvqSymFusedGroup(keys: keys, qblk: qblk, qs: qs, d: d, outPer: OUT,
-                                           inFeatures: first.inFeatures, bits: first.bits)
+        // группа, сведённая ещё при чтении файла, второй раз не сводится:
+        // её буферы уже срезы общего, а повторная склейка была бы копией
+        for (id, keys) in groups where fused[id] == nil {
+            if let g = RwkvqSidecar.fuseSymGroup(keys, tensors: tensors, arrays: &a) { fused[id] = g }
         }
         eval(Array(a.values))
         return RwkvqSidecar(arrays: a, tensors: tensors, naming: naming, nLayer: nLayer,
                             nEmbd: nEmbd, headSize: headSize, vocabSize: vocabSize,
                             symFused: fused)
+    }
+
+    /// Свести одну группу: буферы её тензоров в `arrays` заменяются срезами
+    /// строк общего буфера. nil — группа не годится, `arrays` не тронут.
+    static func fuseSymGroup(_ keys: [String], tensors: [String: RwkvqTensorInfo],
+                             arrays: inout [String: MLXArray]) -> RwkvqSymFusedGroup? {
+        guard keys.count >= 2, let first = tensors[keys[0]], first.kind == .sym,
+              keys.allSatisfy({
+                  guard let t = tensors[$0] else { return false }
+                  return t.kind == .sym && t.shape == first.shape && t.bits == first.bits
+                      && arrays["\($0)::qblk"] != nil && arrays["\($0)::qs"] != nil
+                      && arrays["\($0)::d"] != nil
+              }),
+              rwkvqSymGEMVApplies(outFeatures: first.outFeatures * keys.count,
+                                  inFeatures: first.inFeatures, bits: first.bits, rows: 1),
+              first.outFeatures % symGemvRS == 0 else { return nil }
+        let OUT = first.outFeatures
+        let qblk = concatenated(keys.map { arrays["\($0)::qblk"]! }, axis: 0)
+        let qs = concatenated(keys.map { arrays["\($0)::qs"]! }, axis: 0)
+        let d = concatenated(keys.map { arrays["\($0)::d"]! }, axis: 0)
+        eval(qblk, qs, d)
+        for (i, key) in keys.enumerated() {
+            let rows = (i * OUT) ..< ((i + 1) * OUT)
+            arrays["\(key)::qblk"] = qblk[rows]
+            arrays["\(key)::qs"] = qs[rows]
+            arrays["\(key)::d"] = d[rows]
+        }
+        return RwkvqSymFusedGroup(keys: keys, qblk: qblk, qs: qs, d: d, outPer: OUT,
+                                  inFeatures: first.inFeatures, bits: first.bits)
     }
 
     /// K проекций одним запуском: xstack — [K, IN], по строке входа на

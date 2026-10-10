@@ -95,7 +95,9 @@ public enum LoRA {
     public static func add(to bb: X070Backbone, spec: LoRASpec) -> LoRAInfo {
         let nLayer = bb.cfg.nLayer
         let sel = spec.layers ?? (0 ..< nLayer)
-        var baseDType = bb.w["emb.weight"]?.dtype
+        // ln0 — запасной: у модели из .rwkvq таблица эмбеддинга может лежать
+        // сжатой (rwkvqEmbTable), и плотного emb.weight в словаре нет
+        var baseDType = bb.w["emb.weight"]?.dtype ?? bb.w["ln0.weight"]?.dtype
             ?? bb.w.values.first?.dtype ?? .bfloat16
         // Адаптеры в fp16 не заводятся никогда: у fp16 узкая экспонента, и
         // на слое 0 fp16-модели (.rwkvq в норме), где вход ещё fp16, цепочка
@@ -207,7 +209,7 @@ public enum LoRA {
             } else { continue }
             let delta = scale * matmul(b, a)                  // [out,rank]·[rank,in]=[out,in]
             let fromRwkvq = bb.isRwkvqBacked(wKey) || bb.rwkvqDenseTargets.contains(wKey)
-            let outType: DType = fromRwkvq ? (bb.w["emb.weight"]?.dtype ?? bf) : bf
+            let outType: DType = fromRwkvq ? (bb.w["emb.weight"]?.dtype ?? bb.w["ln0.weight"]?.dtype ?? bf) : bf
             bb.w[wKey] = (baseW.asType(.float32) + delta.asType(.float32)).asType(outType)
             if fromRwkvq { bb.releaseRwkvqBacking(wKey) }
             bb.loraA[t] = nil; bb.loraB[t] = nil; bb.loraScale[t] = nil
