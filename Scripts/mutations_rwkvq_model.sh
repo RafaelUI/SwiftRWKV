@@ -66,7 +66,7 @@ run "родное ядро получает вход в fp16" \
     "$BB" '?? (rwkvqBaseDType == nil ? DType.float16 : DType.float32)' \
           '?? DType.float16'
 run "нормировка fp16 идёт ручной формулой" \
-    "$BB" 'if x.dtype == .float16 { return MLX.layerNorm' 'if x.dtype == .float64 { return MLX.layerNorm'
+    "$BB" 'if x.dtype == .float16 || (fast && x.dtype == .float32) {' 'if x.dtype == .float64 || (fast && x.dtype == .float32) {'
 run "зажим scale обнуляется всегда (fp16)" \
     "$NA" 'if exactScales, !arrayEqual' 'if false, !arrayEqual'
 run "зажим scale: тип решает не сверка декванта" \

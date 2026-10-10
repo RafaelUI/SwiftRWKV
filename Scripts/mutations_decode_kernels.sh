@@ -65,10 +65,10 @@ run "ядра шага включаются при приведении выхо
     "$GN" '            && !castWKVOutputToComputeDType && wkvTailApplies(headSize: S)' \
           '            && wkvTailApplies(headSize: S)'
 run "умолчание загрузки — родной контейнер" \
-    "$LD" 'useNativeKernel: Bool = false) throws -> X070Backbone {
-        try load(fromSidecar: try RwkvqSidecar.open(path)' \
-          'useNativeKernel: Bool = true) throws -> X070Backbone {
-        try load(fromSidecar: try RwkvqSidecar.open(path)'
+    "$LD" 'useNativeKernel: Bool = false,
+                            denseEmbedding: Bool = false) throws -> X070Backbone {' \
+          'useNativeKernel: Bool = true,
+                            denseEmbedding: Bool = false) throws -> X070Backbone {'
 
 run "ветки шага считаются с повышением матрицы до fp32" \
     "$GN" 'guard narrow, y.dtype != m.dtype else { return matmul(y, m.transposed()) }' \
