@@ -115,17 +115,91 @@ final class GeneratePipelineTests: XCTestCase {
         XCTAssertEqual(p.0, s.0); XCTAssertEqual(p.1, s.1)
     }
 
-    /// Сэмплер с температурой или штрафами живёт на CPU — конвейер для него
-    /// не включается, сколько ни проси.
-    func testPipelineIsOnlyForPlainGreedy() throws {
+    /// С температурой, top-k / top-p и штрафами конвейер идёт на GPU-сэмплере
+    /// и выдаёт побитно то же, что СИНХРОННЫЙ цикл с тем же сэмплером: меняется
+    /// расписание, не счёт. Seed воспроизводит текст; `pipelined: false` —
+    /// прежний CPU-сэмплер со своим потоком случайных чисел.
+    func testPipelineWithTemperatureEqualsSynchronousLoopWithTheSameSampler() throws {
+        let tok = try Self.tokenizer()
+        let prompt = tok.encode("Once upon a time")
+        let sampling = SamplingConfig(temperature: 0.9, topK: 60, topP: 0.92, repetitionPenalty: 1.15,
+                                      presencePenalty: 0.1, penaltyDecay: 0.95, seed: 2026)
+        for (name, bb) in try models() {
+            let config = GenerationConfig(maxTokens: 20, penalizePrompt: true, sampling: sampling)
+            let piped = Self.run(bb, tok, prompt, config)
+            XCTAssertEqual(piped.calls, 20, "\(name): конвейер с температурой не включился")
+
+            // тот же сэмплер, но по токену за раз, с чтением на каждом шаге
+            var st = RWKVState(cfg: bb.cfg)
+            var logits = bb.prefill(prompt, state: &st)
+            var history = PenaltyState()
+            for id in prompt { history.observe(id, decay: sampling.penaltyDecay) }
+            var sampler = GPUSampler(config: sampling, vocab: bb.cfg.vocab, history: history)
+            var ids: [Int] = []
+            for _ in 0 ..< 20 {
+                let id = sampler.next(logits).item(Int.self)
+                ids.append(id)
+                logits = bb.step(id, state: &st)
+            }
+            st.eval()
+            XCTAssertEqual(piped.result.tokens, ids, "\(name): конвейер разошёлся с синхронным циклом")
+            func bad(_ x: [MLXArray], _ y: [MLXArray]) -> Int {
+                zip(x, y).map { RwkvqFileTests.mismatches($0.asType(.float32), $1.asType(.float32)) }.reduce(0, +)
+            }
+            XCTAssertEqual(bad(piped.state.wkv, st.wkv), 0, "\(name): состояние wkv")
+            XCTAssertEqual(bad(piped.state.cmixPrev, st.cmixPrev), 0, "\(name): сдвиг cmix")
+
+            // seed воспроизводит; другой seed — другой текст
+            XCTAssertEqual(Self.run(bb, tok, prompt, config).result.tokens, ids, "\(name): seed не воспроизводит")
+            var other = sampling; other.seed = 7
+            XCTAssertNotEqual(Self.run(bb, tok, prompt, GenerationConfig(maxTokens: 20, penalizePrompt: true,
+                                                                         sampling: other)).result.tokens, ids)
+            XCTAssertGreaterThan(Set(ids).count, 5, "\(name): сэмплер выдаёт один токен")
+        }
+    }
+
+    /// `pipelined: false` — прежний путь целиком: CPU-сэмплер, конвейер не зовётся.
+    func testNonPipelinedGenerationKeepsTheCPUSampler() throws {
         let tok = try Self.tokenizer()
         let bb = try X070Backbone.load(fromRwkvq: try RwkvqModelTests.fixture("reduction").path)
         let prompt = tok.encode("Hello")
-        let hot = Self.run(bb, tok, prompt, GenerationConfig(maxTokens: 6, sampling: SamplingConfig(temperature: 0.8, seed: 3)))
-        XCTAssertEqual(hot.calls, 0, "сэмплер с температурой пошёл конвейером")
-        let pen = Self.run(bb, tok, prompt, GenerationConfig(maxTokens: 6, sampling: SamplingConfig(repetitionPenalty: 1.2)))
-        XCTAssertEqual(pen.calls, 0, "жадный выбор со штрафом пошёл конвейером")
-        let plain = Self.run(bb, tok, prompt, GenerationConfig(maxTokens: 6))
-        XCTAssertEqual(plain.calls, 6, "конвейер по умолчанию выключен")
+        let sampling = SamplingConfig(temperature: 0.8, seed: 3)
+        let off = Self.run(bb, tok, prompt, GenerationConfig(maxTokens: 8, sampling: sampling, pipelined: false))
+        XCTAssertEqual(off.calls, 0, "при pipelined: false конвейер всё равно пошёл")
+        // те же токены, что даёт Sampler в ручном цикле
+        var st = RWKVState(cfg: bb.cfg)
+        var logits = bb.prefill(prompt, state: &st)
+        var cpu = Sampler(config: sampling)
+        var ids: [Int] = []
+        for _ in 0 ..< 8 { let id = cpu.next(logits); ids.append(id); logits = bb.step(id, state: &st) }
+        XCTAssertEqual(off.result.tokens, ids)
+        XCTAssertEqual(Self.run(bb, tok, prompt, GenerationConfig(maxTokens: 8, sampling: sampling)).calls, 8,
+                       "конвейер по умолчанию выключен")
+    }
+
+    /// `penalizePrompt` доходит до GPU-сэмплера: история промпта передаётся
+    /// ему при создании. Промпт — повторяющийся счёт, жадное продолжение
+    /// которого лежит В САМОМ ПРОМПТЕ; штраф обязан его сбить. Без передачи
+    /// истории первый токен конвейера остался бы прежним — на длинной
+    /// генерации с мягким штрафом это не видно ничем (мутация не ловилась).
+    func testPromptHistoryReachesTheGPUSampler() throws {
+        let tok = try Self.tokenizer()
+        let bb = try X070Backbone.load(fromRwkvq: try RwkvqModelTests.fixture("reduction").path)
+        let prompt = tok.encode("1 2 3 4 1 2 3 4 1 2 3 4 1 2 3 4 1 2 3")
+        let sampling = SamplingConfig(repetitionPenalty: 4, presencePenalty: 8)
+        func first(penalizePrompt: Bool, pipelined: Bool) -> Int {
+            let r = Self.run(bb, tok, prompt, GenerationConfig(maxTokens: 1, penalizePrompt: penalizePrompt,
+                                                               sampling: sampling, pipelined: pipelined))
+            XCTAssertEqual(r.calls, pipelined ? 1 : 0)
+            return r.result.tokens[0]
+        }
+        let free = first(penalizePrompt: false, pipelined: true)
+        XCTAssertTrue(prompt.contains(free), "промпт теста не годится: жадное продолжение \(free) не из промпта")
+        let penalized = first(penalizePrompt: true, pipelined: true)
+        XCTAssertNotEqual(penalized, free, "история промпта не дошла до GPU-сэмплера")
+        XCTAssertFalse(prompt.contains(penalized), "штраф не увёл выбор от токенов промпта")
+        XCTAssertEqual(penalized, first(penalizePrompt: true, pipelined: false),
+                       "жадный выбор со штрафами: GPU- и CPU-сэмплер разошлись")
+        XCTAssertEqual(free, first(penalizePrompt: false, pipelined: false))
     }
 }

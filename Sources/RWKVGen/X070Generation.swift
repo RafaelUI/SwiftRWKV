@@ -75,7 +75,7 @@ public struct RWKVState {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-//  Конвейерный жадный декод.
+//  Конвейерный декод.
 //
 //  При `eval` на каждом токене GPU простаивает, пока CPU читает выбранный
 //  токен, строит граф следующего шага и кодирует его запуски. Конвейер
@@ -83,40 +83,47 @@ public struct RWKVState {
 //  токен остаётся МАССИВОМ на GPU, граф шага t+1 строится от него и ставится
 //  в очередь `asyncEval`, ПОКА GPU считает токен t; ждём только готовности t.
 //
-//  Граф и его входы те же, что у синхронного пути, поэтому токены, логиты и
-//  состояние обязаны совпасть ПОБИТНО — меняется расписание, не счёт.
+//  Граф и его входы те же, что у синхронного цикла с тем же сэмплером,
+//  поэтому токены, логиты и состояние обязаны совпасть ПОБИТНО — меняется
+//  расписание, не счёт.
 //
 //  Цена: один шаг всегда посчитан «вперёд». При досрочной остановке его
 //  токен выбрасывается, а состояние как раз то, что нужно: оно уже включает
 //  последний выданный токен.
 //
-//  Только жадный выбор без штрафов: сэмплер с температурой и штрафами живёт
-//  на CPU (свой воспроизводимый генератор случайных чисел), и следующий
-//  токен до чтения текущего там неизвестен.
+//  Токен выбирает `GPUSampler` — и жадно, и с температурой, top-k / top-p и
+//  штрафами: всё на GPU, без чтения логитов на CPU.
 // ───────────────────────────────────────────────────────────────────────
 
-public struct GreedyDecodePipeline {
+public struct DecodePipeline {
     private var token: MLXArray          // токен, который будет выдан следующим; уже в очереди
+    private var sampler: GPUSampler
 
     /// - logits: логиты `[vocab]`, по которым выбирается первый токен
     ///   (например, результат `prefill`); `state` — состояние после них.
-    public init(logits: MLXArray, state: RWKVState) {
-        token = argMax(logits, axis: -1).reshaped([1]).asType(.int32)
-        asyncEval([token] + state.arrays)
+    /// - sampler: чем выбирать; по умолчанию жадно.
+    public init(logits: MLXArray, state: RWKVState, sampler: GPUSampler? = nil) {
+        var s = sampler ?? GPUSampler(vocab: logits.shape[logits.ndim - 1])
+        token = s.next(logits)
+        self.sampler = s
+        asyncEval([token] + state.arrays + s.arrays)
     }
 
     /// Выдать очередной токен. К возврату `state` уже включает его (шаг по
     /// нему поставлен в очередь), а следующий токен считается на GPU.
     public mutating func next(_ model: X070Backbone, state: inout RWKVState) -> Int {
         let logits = model.step(token, state: &state)
-        let upcoming = argMax(logits, axis: -1).reshaped([1]).asType(.int32)
-        asyncEval([upcoming] + state.arrays)
+        let upcoming = sampler.next(logits)
+        asyncEval([upcoming] + state.arrays + sampler.arrays)
         let id = token.item(Int.self)    // ждём только готовности текущего
         token = upcoming
         model.pipelinedSteps += 1
         return id
     }
 }
+
+/// Прежнее имя конвейера (11.10 он умел только жадный выбор).
+public typealias GreedyDecodePipeline = DecodePipeline
 
 extension X070Backbone {
 

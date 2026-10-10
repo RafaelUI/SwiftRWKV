@@ -926,6 +926,33 @@ func appBench(_ path: String, _ args: Args) throws {
     }
     print(String(format: "жадная генерация: синхронно %.2f мс/ток | конвейером %.2f мс/ток (%.1f ток/с) | отношение %.3f; токены %@",
                  median(msync), median(mp), 1e3 / median(mp), median(mp) / median(msync), same ? "совпали" : "РАЗОШЛИСЬ"))
+
+    // с температурой: CPU-сэмплер синхронно против GPU-сэмплера конвейером
+    let sampling = SamplingConfig(temperature: 0.8, topP: 0.9, repetitionPenalty: 1.1, penaltyDecay: 0.99, seed: 1)
+    func sampled(_ pipelined: Bool) -> Double {
+        var st = after
+        let t = Date()
+        if pipelined {
+            var pipe = DecodePipeline(logits: startLogits, state: st,
+                                      sampler: GPUSampler(config: sampling, vocab: bb.cfg.vocab))
+            for _ in 0 ..< 64 { _ = pipe.next(bb, state: &st) }
+        } else {
+            var cpu = Sampler(config: sampling)
+            var lg = startLogits
+            for _ in 0 ..< 64 { lg = bb.step(cpu.next(lg), state: &st) }
+        }
+        st.eval()
+        return Date().timeIntervalSince(t) * 1e3 / 64
+    }
+    _ = sampled(true); _ = sampled(false)
+    var sp: [Double] = [], ssync: [Double] = []
+    for r in 0 ..< 6 {
+        for p in (r % 2 == 0 ? [true, false] : [false, true]) {
+            if p { sp.append(sampled(true)) } else { ssync.append(sampled(false)) }
+        }
+    }
+    print(String(format: "генерация с температурой: CPU-сэмплер синхронно %.2f мс/ток | GPU-сэмплер конвейером %.2f мс/ток (%.1f ток/с) | отношение %.3f",
+                 median(ssync), median(sp), 1e3 / median(sp), median(sp) / median(ssync)))
 }
 
 /// Все проекции одного токена ядрами GEMV, без остального шага.

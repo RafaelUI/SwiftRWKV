@@ -1,6 +1,7 @@
 #!/bin/bash
 # Мутационная проверка ядер декода 11.10: GEMV sb6, шаг WKV и хвост tmix
-# одним запуском, ветки шага в типе матриц, конвейерный декод -- и того, где
+# одним запуском, ветки шага в типе матриц, конвейерный декод и сэмплер на GPU --
+# и того, где
 # они включаются.
 #
 #   ./Scripts/mutations_decode_kernels.sh [фильтр тестов]
@@ -14,7 +15,7 @@ BB=Sources/RWKVGen/X070Backbone.swift
 GN=Sources/RWKVGen/X070Generation.swift
 LD=Sources/RWKVGen/RwkvqStandaloneLoad.swift
 
-FILTER="${1:-RwkvqSb6GEMVTests|DecodeKernelTests|RwkvqModelTests|GeneratePipelineTests}"
+FILTER="${1:-RwkvqSb6GEMVTests|DecodeKernelTests|RwkvqModelTests|GeneratePipelineTests|GPUSamplerTests}"
 run() {
     local desc="$1"; shift
     printf '%-60s ' "$desc"
@@ -83,15 +84,42 @@ run "после конвейера состояние догоняется вт�
                 fed = produced.count
             } else {' '                produced.append(id)
             } else {'
-run "конвейер включается при штрафах" \
-    "$GE" 'config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes' \
-          'config.pipelined && config.sampling.isGreedy'
-run "конвейер включается при температуре" \
-    "$GE" 'config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes' \
-          'config.pipelined && !config.sampling.penalizes'
 run "флаг pipelined не читается" \
-    "$GE" 'config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes' \
-          'config.sampling.isGreedy && !config.sampling.penalizes'
+    "$GE" 'var pipeline: DecodePipeline? = config.pipelined
+            ? DecodePipeline(' 'var pipeline: DecodePipeline? = true
+            ? DecodePipeline('
+run "история промпта не доходит до GPU-сэмплера" \
+    "$GE" 'history: sampler.penalty))' 'history: PenaltyState()))'
+
+echo
+echo "── сэмплер на GPU ──"
+SM=Sources/RWKVGen/GPUSampler.swift
+run "top-p режет по накопленной массе вместе с кандидатом" \
+    "$SM" 'var keep = (cum - p) .< config.topP' 'var keep = cum .< config.topP'
+run "top-k не действует" \
+    "$SM" 'if config.topK > 0, config.topK < V {' 'if config.topK > 0, config.topK < 0 {'
+run "u не масштабируется на уцелевшую массу" \
+    "$SM" 'let scaledU = u.reshaped([]) * mass' 'let scaledU = u.reshaped([])'
+run "температура не делит логиты" \
+    "$SM" 'let scaled = l / config.temperature' 'let scaled = l'
+run "повтор: отрицательный логит делится, а не умножается" \
+    "$SM" 'let lowered = MLX.where(out .> 0, out / config.repetitionPenalty,
+                                    out * config.repetitionPenalty)' \
+          'let lowered = out / config.repetitionPenalty'
+run "штраф применяется ко всему словарю, а не к встреченным" \
+    "$SM" 'out = out - MLX.where(seen, sub, MLXArray(Float(0)))' 'out = out - sub'
+run "история: текущий токен затухает вместе с прежними" \
+    "$SM" 'occurrence = occ + hit.asType(.float32)' 'occurrence = (occ + hit.asType(.float32)) * config.penaltyDecay'
+run "мелкие веса истории не отсекаются" \
+    "$SM" 'occ = MLX.where(d .< 1e-6, MLXArray(Float(0)), d)' 'occ = d'
+run "ключ генератора не расщепляется" \
+    "$SM" 'key = carry' '_ = carry'
+run "жадный выбор расщепляет ключ" \
+    "$SM" '        if config.isGreedy {
+            token = pick(logits, uniform: MLXArray([Float(0)]))
+        } else {' '        if false {
+            token = pick(logits, uniform: MLXArray([Float(0)]))
+        } else {'
 
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

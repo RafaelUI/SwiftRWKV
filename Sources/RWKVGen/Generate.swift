@@ -70,10 +70,13 @@ public struct GenerationConfig: Sendable {
     /// сгенерировала, а не то, что ей дали.
     public var penalizePrompt: Bool
     public var sampling: SamplingConfig
-    /// Конвейерный декод (см. `GreedyDecodePipeline`): следующий шаг
-    /// считается на GPU, пока CPU обрабатывает текущий токен. Действует
-    /// только при жадном выборе без штрафов; токены, текст и состояние те же
-    /// побитно, меняется только время.
+    /// Конвейерный декод (см. `DecodePipeline`): следующий шаг считается на
+    /// GPU, пока CPU обрабатывает текущий токен, а токен выбирает
+    /// `GPUSampler`. При жадном выборе без штрафов результат побитно тот же,
+    /// что без конвейера. С температурой алгоритм выбора тот же, но ПОТОК
+    /// СЛУЧАЙНЫХ ЧИСЕЛ другой: при равном seed текст конвейера и текст
+    /// `pipelined: false` (CPU-сэмплер `Sampler`, SplitMix64) различаются;
+    /// каждый из них своим seed воспроизводится.
     public var pipelined: Bool
 
     public init(maxTokens: Int = 128,
@@ -117,9 +120,11 @@ extension X070Backbone {
         if config.penalizePrompt { for id in prompt { sampler.observe(id) } }
 
         var logits = prefill(prompt, state: &state)
-        var pipeline: GreedyDecodePipeline? =
-            config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes
-            ? GreedyDecodePipeline(logits: logits, state: state) : nil
+        var pipeline: DecodePipeline? = config.pipelined
+            ? DecodePipeline(logits: logits, state: state,
+                             sampler: GPUSampler(config: config.sampling, vocab: cfg.vocab,
+                                                 history: sampler.penalty))
+            : nil
 
         var produced: [Int] = []
         var fed = 0                      // сколько выданных токенов поглотило state
@@ -136,7 +141,6 @@ extension X070Backbone {
             if pipeline != nil {
                 // токен t выдан, шаг по нему уже в очереди: state его включает
                 id = pipeline!.next(self, state: &state)
-                sampler.observe(id)
                 produced.append(id)
                 fed = produced.count
             } else {
