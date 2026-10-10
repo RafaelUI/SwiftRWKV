@@ -103,6 +103,46 @@ final class RwkvqBackwardTests: XCTestCase {
         }
     }
 
+    /// Адаптеры только на части слоёв. Градиент к ним идёт сквозь все слои
+    /// ВЫШЕ, поэтому дифференцируемое ядро WKV обязано стоять от нижнего
+    /// слоя с адаптером до верха; ниже — замороженный проход. До правки
+    /// 12.10 обучаемыми помечались только слои с адаптерами, и адаптеры на
+    /// нижних слоях роняли процесс на первом градиенте.
+    func testAdaptersOnLowerLayersGetAGradient() throws {
+        let f = try RwkvqModelTests.fixture("reduction")
+        let (x, y) = Self.batch(f)
+        for (layers, expected) in [(0 ..< 3, 0 ..< 12), (4 ..< 6, 4 ..< 12), (9 ..< 12, 9 ..< 12)] {
+            let bb = try X070Backbone.load(fromRwkvq: f.path)
+            MLXRandom.seed(11)
+            LoRA.add(to: bb, spec: LoRASpec(rank: 8, alpha: 16, layers: layers))
+            XCTAssertEqual(bb.trainLayers, Set(expected), "адаптеры на слоях \(layers)")
+            for k in bb.loraB.keys.sorted() {
+                bb.loraB[k] = (MLXRandom.normal(bb.loraB[k]!.shape) * 0.001).asType(bb.loraB[k]!.dtype)
+            }
+            eval(Array(bb.loraB.values))
+            let before = bb.cmixFrozenCalls
+            let g = Self.adapterGrads(bb, x, y)
+            let n = sqrt(g.square().sum()).item(Float.self)
+            XCTAssertTrue(n.isFinite && n > 0, "слои \(layers): норма градиента адаптеров \(n)")
+            // слои ниже первого адаптера идут замороженным (слитым) проходом
+            XCTAssertEqual(bb.cmixFrozenCalls - before, layers.lowerBound, "слои \(layers)")
+        }
+        // эталон для нижних слоёв: тот же градиент при всех слоях, помеченных вручную
+        let bb = try X070Backbone.load(fromRwkvq: f.path)
+        MLXRandom.seed(11)
+        LoRA.add(to: bb, spec: LoRASpec(rank: 8, alpha: 16, layers: 4 ..< 6))
+        for k in bb.loraB.keys.sorted() {
+            bb.loraB[k] = (MLXRandom.normal(bb.loraB[k]!.shape) * 0.001).asType(bb.loraB[k]!.dtype)
+        }
+        eval(Array(bb.loraB.values))
+        let got = Self.adapterGrads(bb, x, y)
+        bb.trainLayers = Set(0 ..< bb.cfg.nLayer)
+        let ref = Self.adapterGrads(bb, x, y)
+        let cos = ((got * ref).sum() / (sqrt(got.square().sum()) * sqrt(ref.square().sum()))).item(Float.self)
+        print("ЧАСТИЧНЫЕ АДАПТЕРЫ: косинус градиента к «все слои обучаемые» \(cos)")
+        XCTAssertGreaterThan(cos, 0.999, "замороженные нижние слои изменили градиент верхних адаптеров")
+    }
+
     // ── Свой VJP ─────────────────────────────────────────────────────
 
     /// Прямой проход от типа обратного не зависит — побитно.

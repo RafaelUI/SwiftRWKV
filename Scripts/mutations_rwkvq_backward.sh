@@ -49,5 +49,10 @@ run "слияние не снимает квантованную подложк�
 run "слияние пропускает квантованные цели" \
     "$LR" '} else if let dq = bb.denseWeight(wKey) {' '} else if wKey.isEmpty, let dq = bb.denseWeight(wKey) {'
 
+run "обучаемыми помечены только слои с адаптерами" \
+    "$LR" 'bb.trainLayers = sel.isEmpty ? [] : Set(sel.lowerBound ..< nLayer)' 'bb.trainLayers = Set(sel)'
+run "обучаемыми помечены все слои, а не от нижнего адаптера" \
+    "$LR" 'bb.trainLayers = sel.isEmpty ? [] : Set(sel.lowerBound ..< nLayer)' 'bb.trainLayers = Set(0 ..< nLayer)'
+
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."
