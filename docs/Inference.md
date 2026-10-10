@@ -502,6 +502,27 @@ on one model unless stated):
   bit-equal to three launches and free of extra memory. No measurable gain
   here (22.69 → 22.56 ms at 1.5B).
 
+**Greedy generation is pipelined** (`GenerationConfig.pipelined`, on by
+default; `GreedyDecodePipeline` for a hand-written loop) — a port of
+rwkv-quant's `generate_step`. With an `eval` per token the GPU idles while the
+CPU reads the chosen token, builds the next step and encodes it. The pipeline
+keeps the token on the GPU as an array, builds step t+1 from it and queues it
+with `asyncEval` *while* the GPU computes token t, then waits only for t. The
+graph and its inputs are the same, so tokens, text, stop reason and the state
+left behind are bit-identical to the synchronous loop, for every stop reason;
+one step is always computed ahead and is dropped on an early stop. Free greedy
+generation, synchronous against pipelined, alternating in one process:
+
+| ms per token | 0.1B `compression` | 1.5B `compression` | 1.5B `reduction` | 2.9B `compression` |
+|---|---|---|---|---|
+| synchronous | 2.89 | 13.86 | 17.26 | 25.40 |
+| pipelined | 2.28 | 12.77 | 15.99 | 23.37 |
+
+It applies to plain greedy choice only: a sampler with temperature or
+penalties lives on the CPU (its own reproducible random stream), and there the
+next token is not known before the current one is read. The decode table above
+is the synchronous path — the same protocol as the reference's.
+
 How the time of one 1.5B `compression` token divides now (`decode-bench
 --step-profile`, `--gemv-micro`): 0.5 ms building the graph on the CPU, 13.3 ms
 executing it, of which 9.1 ms is the 144 GEMV launches themselves.
