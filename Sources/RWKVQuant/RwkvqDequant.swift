@@ -162,6 +162,14 @@ public func rwkvqDequantDense(qblk: MLXArray, qsqm: MLXArray, ddm: MLXArray,
                               superBlock gwSb: Int, xbits: Int,
                               dtype: DType = .float32) -> MLXArray {
     let NB = IN / 32
+    // Типы входов и суперблок фиксированы НАМЕРЕННО: MLX строит исходник
+    // ядра из типов входов, а кеширует по имени (в имени — форма, битность
+    // и тип выхода). Вызов того же ядра с другими типами или суперблоком
+    // освободил бы конвейер из-под ещё не исполненных запусков
+    // (см. WKV7Train.swift).
+    precondition(qblk.dtype == .uint8 && qsqm.dtype == .uint8 && ddm.dtype == .float16,
+                 "sb6-деквант: типы буферов \(qblk.dtype)/\(qsqm.dtype)/\(ddm.dtype), нужны uint8/uint8/float16")
+    precondition(gwSb == 8, "sb6-деквант: суперблок \(gwSb), ядро собрано под 8")
     let kern = dequantKernel(inFeatures: IN, outFeatures: OUT,
                              xbits: xbits, superBlock: gwSb, dtype: dtype)
     let threadgroup = 256
@@ -405,6 +413,12 @@ public func rwkvqDequantSym(qblk: MLXArray, qs: MLXArray, d: MLXArray,
         return rwkvqDequantSymReference(qblk: qblk, qs: qs, d: d, outFeatures: OUT,
                                         inFeatures: IN, bits: bits).asType(dtype)
     }
+    // Типы входов ядра фиксированы НАМЕРЕННО: MLX строит исходник ядра из
+    // типов входов, а кеширует по имени, и вызов того же ядра с другими
+    // типами освобождает конвейер из-под ещё не исполненных запусков
+    // (см. WKV7Train.swift). Чужой тип — ошибка вызывающего, и громкая.
+    precondition(qblk.dtype == .uint8 && qs.dtype == .uint8 && d.dtype == .float16,
+                 "sym-деквант: типы буферов \(qblk.dtype)/\(qs.dtype)/\(d.dtype), нужны uint8/uint8/float16")
     let kern = symDequantKernel(inFeatures: IN, outFeatures: OUT, bits: bits, dtype: dtype)
     let threadgroup = 256
     let total = OUT * (IN / (bits == 8 ? 16 : 32))

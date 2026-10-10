@@ -83,16 +83,31 @@ private func ckptBwdKernel(H: Int, T: Int) -> MLXFastKernel {
     constant uint N_CHUNKS_C  = \(N);
     constant uint H_C         = \(H);
     """
-    // дословно из _get_ckpt_bwd
+    // Из _get_ckpt_bwd (wkv7_checkpoint.py), с одним отличием: общих на
+    // threadgroup копий входов шага (k_sh, v_sh, r_sh, w_sh, a_sh, b_sh,
+    // dy_sh, sa_sh, dsa_sh) здесь НЕТ.
+    //
+    // Почему. Память threadgroup у Metal ограничена 32768 байтами, и считает
+    // он её вдвое против объявленного (4096 float — уже предел, проверено
+    // валидацией). Одна матрица обмена accum[64][64] занимает предел
+    // целиком; девять векторов поверх давали 37376. Без валидации ядро
+    // при этом ЗАПУСКАЕТСЯ и обычно считает верно, а портит память рядом —
+    // отсюда срывы GPU на обучении настоящих моделей (CommandBuffer Hang /
+    // PageFault, NaN в градиентах нижних слоёв; найдено 10.10 прогоном с
+    // MTL_SHADER_VALIDATION=1).
+    //
+    // Чем заменены. Копии были не нужны по существу: k, v, r, w, a, b,
+    // d_out, sa_fwd — входные буферы, их читает любой поток напрямую, а
+    // dsa каждый поток читал только свой — это локальная переменная.
+    // Значения и порядок операций те же, поэтому выход ПОБИТНО прежний
+    // (сверено снимком до и после на четырёх формах). Заодно ушли два
+    // барьера на шаг.
     let source = """
         uint dv = thread_position_in_threadgroup.x;
         uint bhi = threadgroup_position_in_grid.x;
         uint bi = bhi / H_C, hi = bhi % H_C;
 
         threadgroup float accum[HEAD_SIZE_C][HEAD_SIZE_C];
-        threadgroup float k_sh[HEAD_SIZE_C], v_sh[HEAD_SIZE_C], r_sh[HEAD_SIZE_C];
-        threadgroup float w_sh[HEAD_SIZE_C], a_sh[HEAD_SIZE_C], b_sh[HEAD_SIZE_C];
-        threadgroup float dy_sh[HEAD_SIZE_C], sa_sh[HEAD_SIZE_C], dsa_sh[HEAD_SIZE_C];
 
         float C_row[HEAD_SIZE_C], h_row[HEAD_SIZE_C];
         uint hb = (bi*H_C+hi)*HEAD_SIZE_C*HEAD_SIZE_C + dv*HEAD_SIZE_C;
@@ -104,22 +119,16 @@ private func ckptBwdKernel(H: Int, T: Int) -> MLXFastKernel {
 
             for (int t=(int)CHUNK_C-1; t>=0; t--) {
                 uint base = ((bi*T_C+(uint)c*CHUNK_C+(uint)t)*H_C+hi)*HEAD_SIZE_C;
-                k_sh[dv]=k[base+dv]; v_sh[dv]=v[base+dv]; r_sh[dv]=r[base+dv];
-                w_sh[dv]=w[base+dv]; a_sh[dv]=a[base+dv]; b_sh[dv]=b[base+dv];
-                dy_sh[dv]=d_out[base+dv]; sa_sh[dv]=sa_fwd[base+dv];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                float dy_dv = dy_sh[dv];
-                for (uint dk=0; dk<HEAD_SIZE_C; dk++) C_row[dk] += dy_dv*r_sh[dk];
+                float dy_dv = d_out[base+dv];
+                for (uint dk=0; dk<HEAD_SIZE_C; dk++) C_row[dk] += dy_dv*r[base+dk];
 
                 float dsa_dv=0, dv_val=0;
                 for (uint dk=0; dk<HEAD_SIZE_C; dk++) {
-                    dsa_dv += C_row[dk]*b_sh[dk];
-                    dv_val += C_row[dk]*k_sh[dk];
+                    dsa_dv += C_row[dk]*b[base+dk];
+                    dv_val += C_row[dk]*k[base+dk];
                 }
                 dv_out[base+dv] = dv_val;
-                dsa_sh[dv] = dsa_dv;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk] = dy_dv*h_row[dk];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -127,9 +136,9 @@ private func ckptBwdKernel(H: Int, T: Int) -> MLXFastKernel {
                 dr_out[base+dv] = dr_val;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                float sa_dv=sa_sh[dv], v_dv=v_sh[dv];
+                float sa_dv=sa_fwd[base+dv], v_dv=v[base+dv];
                 for (uint dk=0; dk<HEAD_SIZE_C; dk++) {
-                    float hp=(h_row[dk]-v_dv*k_sh[dk]-sa_dv*b_sh[dk])/w_sh[dk];
+                    float hp=(h_row[dk]-v_dv*k[base+dk]-sa_dv*b[base+dk])/w[base+dk];
                     accum[dv][dk]=C_row[dk]*hp; h_row[dk]=hp;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -143,21 +152,20 @@ private func ckptBwdKernel(H: Int, T: Int) -> MLXFastKernel {
                 dk_out[base+dv] = dk_val;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk]=dsa_sh[dv]*h_row[dk];
+                for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk]=dsa_dv*h_row[dk];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 float da_val=0; for (uint s=0; s<HEAD_SIZE_C; s++) da_val+=accum[s][dv];
                 da_out[base+dv] = da_val;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk]=sa_sh[dv]*C_row[dk];
+                for (uint dk=0; dk<HEAD_SIZE_C; dk++) accum[dv][dk]=sa_dv*C_row[dk];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 float db_val=0; for (uint s=0; s<HEAD_SIZE_C; s++) db_val+=accum[s][dv];
                 db_out[base+dv] = db_val;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 for (uint dk=0; dk<HEAD_SIZE_C; dk++)
-                    C_row[dk] = C_row[dk]*w_sh[dk] + dsa_dv*a_sh[dk];
-        threadgroup_barrier(mem_flags::mem_threadgroup); // fix: race — next timestep overwrites w_sh/a_sh
+                    C_row[dk] = C_row[dk]*w[base+dk] + dsa_dv*a[base+dk];
             }
         }
         for (uint dk=0; dk<HEAD_SIZE_C; dk++) dh_in_out[hb+dk] = C_row[dk];
@@ -235,8 +243,26 @@ public func wkv7TrainWithState(
             let dHOut = cotangents.count > 1
                 ? cotangents[1].asType(.float32)
                 : MLXArray.zeros([B, H, D, D], dtype: .float32)
+            // ВХОДЫ ОБРАТНОГО ЯДРА — СТРОГО fp32, как у прямого.
+            //
+            // MLX строит исходник пользовательского ядра из ТИПОВ входов, а
+            // кеширует библиотеку по ИМЕНИ. Одно имя с другими типами — для
+            // него «исходник сменился»: старая библиотека и её конвейер
+            // освобождаются НЕМЕДЛЕННО (Device::clear_library), хотя уже
+            // закодированные, но ещё не исполненные запуски в командном
+            // буфере на них ссылаются. Здесь именно это и происходило:
+            // примелы слоя 0 приходят в типе параметров (bf16 / fp16), а слоёв
+            // выше — в fp32 (выход WKV), и на обратном проходе ядро слоя 0
+            // выбивало конвейер из-под ядра слоя 1. Отсюда недетерминированные
+            // NaN в градиентах r/k/v слоя 1 и всего слоя 0 и срывы GPU
+            // (Hang / PageFault / InnocentVictim) — и отсюда же их исчезновение
+            // при малых командных буферах, под валидацией Metal и при
+            // однотипных параметрах (найдено 10.10).
+            // Значения те же: ядро и раньше читало bf16 с неявным
+            // приведением к float.
             let g = ckptBwdKernel(H: H, T: T)(
-                [r,w,k,v,a,b,hCkpts,saFwd,dOut.asType(.float32),dHOut],
+                [r,w,k,v,a,b].map { $0.asType(.float32) }
+                    + [hCkpts,saFwd,dOut.asType(.float32),dHOut],
                 grid: (B*H*D, 1, 1), threadGroup: (D, 1, 1),
                 outputShapes: Array(repeating: [B,T,H,D], count: 6) + [[B,H,D,D]],
                 outputDTypes: Array(repeating: DType.float32, count: 7)
