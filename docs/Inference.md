@@ -172,11 +172,17 @@ let out = base.generate(prompt: tok.encode("Once upon a time"),
 print(out.stopReason)
 ```
 
-**The same seed gives the same text.** Randomness comes from a local
-SplitMix64, not from `MLXRandom` — the latter is process-global state shared
-with weight initialisation and training, so a sampler that drew from it would
-make generation depend on whatever ran before it, and would perturb a training
-run happening alongside. Reproducibility could not be claimed at all.
+**The same seed gives the same text.** Randomness never comes from MLX's
+process-global generator — that state is shared with weight initialisation and
+training, so a sampler that drew from it would make generation depend on
+whatever ran before it, and would perturb a training run happening alongside.
+There are two samplers, each with its own explicit stream: `generate` by
+default pipelines the decode and samples on the GPU (`GPUSampler`: an MLX
+*key* derived from the seed and split once per token — keyed draws do not
+touch the global state), and `pipelined: false` selects the CPU `Sampler`
+(a local SplitMix64). Same algorithm, different streams: a seed reproduces its
+text within one of them, not across the two. See "Generation is pipelined"
+below.
 
 Two degenerate configurations are worth knowing because they are the ones
 people reach for to check that the knobs are wired up at all:
@@ -502,26 +508,36 @@ on one model unless stated):
   bit-equal to three launches and free of extra memory. No measurable gain
   here (22.69 → 22.56 ms at 1.5B).
 
-**Greedy generation is pipelined** (`GenerationConfig.pipelined`, on by
-default; `GreedyDecodePipeline` for a hand-written loop) — a port of
-rwkv-quant's `generate_step`. With an `eval` per token the GPU idles while the
-CPU reads the chosen token, builds the next step and encodes it. The pipeline
-keeps the token on the GPU as an array, builds step t+1 from it and queues it
-with `asyncEval` *while* the GPU computes token t, then waits only for t. The
-graph and its inputs are the same, so tokens, text, stop reason and the state
-left behind are bit-identical to the synchronous loop, for every stop reason;
-one step is always computed ahead and is dropped on an early stop. Free greedy
-generation, synchronous against pipelined, alternating in one process:
+**Generation is pipelined** (`GenerationConfig.pipelined`, on by default;
+`DecodePipeline` for a hand-written loop) — a port of rwkv-quant's
+`generate_step`. With an `eval` per token the GPU idles while the CPU reads the
+chosen token, builds the next step and encodes it. The pipeline keeps the token
+on the GPU as an array, builds step t+1 from it and queues it with `asyncEval`
+*while* the GPU computes token t, then waits only for t. One step is always
+computed ahead and is dropped on an early stop; the state left behind already
+includes the last token returned.
 
-| ms per token | 0.1B `compression` | 1.5B `compression` | 1.5B `reduction` | 2.9B `compression` |
-|---|---|---|---|---|
-| synchronous | 2.89 | 13.86 | 17.26 | 25.40 |
-| pipelined | 2.28 | 12.77 | 15.99 | 23.37 |
+The token is chosen by `GPUSampler`, entirely on the GPU: greedy, or
+temperature with top-k, top-p and repetition / presence / frequency penalties.
+It is the same algorithm as the CPU `Sampler`, step for step — checked by
+feeding both the *same* uniform number — with one difference in behaviour:
+**the random stream is different.** `Sampler` draws from SplitMix64; the GPU
+sampler from MLX's keyed generator, split once per token. Each reproduces its
+own text from a seed, but for the same seed the pipelined text and the
+`pipelined: false` text differ. Greedy generation is bit-identical either way —
+tokens, text, stop reason and state, for every stop reason.
 
-It applies to plain greedy choice only: a sampler with temperature or
-penalties lives on the CPU (its own reproducible random stream), and there the
-next token is not known before the current one is read. The decode table above
-is the synchronous path — the same protocol as the reference's.
+Free generation, alternating in one process, ms per token:
+
+| | 0.1B `compression` | 1.5B `compression` | 1.5B `reduction` |
+|---|---|---|---|
+| greedy, synchronous | 2.78 | 13.91 | 17.54 |
+| greedy, pipelined | 2.18 | 12.78 | 16.15 |
+| temperature + top-p + penalty, CPU sampler, synchronous | 3.15 | 14.23 | 17.92 |
+| temperature + top-p + penalty, GPU sampler, pipelined | 2.50 | 13.07 | 16.48 |
+
+The decode table above is the synchronous greedy path — the same protocol as
+the reference's.
 
 How the time of one 1.5B `compression` token divides now (`decode-bench
 --step-profile`, `--gemv-micro`): 0.5 ms building the graph on the CPU, 13.3 ms
