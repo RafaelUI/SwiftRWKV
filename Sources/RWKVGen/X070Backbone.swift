@@ -294,6 +294,24 @@ public final class X070Backbone {
     /// Числа у ядра другие (точный вес, сумма в fp32), см. RwkvqSymGEMV.swift.
     /// Переключается на живом объекте — A/B в одном процессе.
     public var rwkvqSymDecodeKernel = true { didSet { stepVersion &+= 1 } }
+    /// Шаг WKV и хвост tmix на рекуррентном шаге — по одному ядру вместо
+    /// двух десятков поэлементных операций на слой (см. WKV7Step.swift).
+    /// Числа те же в допуске порядка суммирования (не побитно). Действует
+    /// только у модели из .rwkvq в норме (`rwkvqBaseDType != nil`): у
+    /// плотной модели шаг остаётся прежним — под ним сняты эталоны декода.
+    public var useStepKernels = true { didSet { stepVersion &+= 1 } }
+    /// Сколько слоёв прошло ядрами шага (счётчик для тестов).
+    public internal(set) var stepKernelCalls = 0
+
+    /// Декод sb6 ядром GEMV (без плотной матрицы и без родного контейнера
+    /// MLX) — порт ядра k3 из rwkv-quant, см. RwkvqSb6GEMV.swift. Те же
+    /// правила, что у sym: только рекуррентный шаг, только норма. Работает,
+    /// когда база собрана БЕЗ родного контейнера (`useNativeKernel: false`):
+    /// ядро читает K3-интерлив, а при родном контейнере он отпущен.
+    public var rwkvqSb6DecodeKernel = true { didSet { stepVersion &+= 1 } }
+    /// Сколько проекций прошло ядром GEMV sb6 (счётчик для тестов).
+    public internal(set) var rwkvqSb6GEMVCalls = 0
+
     /// Декод r/k/v слоя ОДНИМ запуском ядра (фьюз, порт SymQuantLinearFused):
     /// бит-в-бит равен трём отдельным запускам, памяти не добавляет
     /// (см. RwkvqSymGEMV.swift). Действует там же, где ядро GEMV.
@@ -511,11 +529,15 @@ public final class X070Backbone {
             }
             return matmul(x, wv(wKey).transposed())
         }
-        if decode, rwkvqSymDecodeKernel, let world = rwkvqKeys[wKey], let sc = rwkvqSidecar {
+        if decode, let world = rwkvqKeys[wKey], let sc = rwkvqSidecar {
             let lead = Array(x.shape.dropLast())
             let x2d = x.reshaped([-1, x.shape[x.ndim - 1]])
-            if let y = sc.symGEMV(world, x2d) {
+            if rwkvqSymDecodeKernel, let y = sc.symGEMV(world, x2d) {
                 rwkvqSymGEMVCalls += 1
+                return y.reshaped(lead + [y.shape[1]]).asType(x.dtype)
+            }
+            if rwkvqSb6DecodeKernel, let y = sc.sb6GEMV(world, x2d) {
+                rwkvqSb6GEMVCalls += 1
                 return y.reshaped(lead + [y.shape[1]]).asType(x.dtype)
             }
         }

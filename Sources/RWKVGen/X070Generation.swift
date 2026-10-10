@@ -167,21 +167,37 @@ extension X070Backbone {
             v = pj(xv, p+"v_proj.weight").reshaped([H, S])
         }
 
-        let gate = linear_(sigmoid(linear_(xg, gg(p+"g_lora_A.weight"))), gg(p+"g_lora_B.weight"))
+        // Низкоранговые ветки (gate, v, a, w) — плотные матрицы в типе
+        // параметров. Когда x уже fp32 (все слои после первого WKV), обычный
+        // матмул повышал бы МАТРИЦУ до fp32 на каждый вызов: на 1.5B это
+        // ~2 млн элементов на слой на токен, то есть сотни мегабайт трафика
+        // ради восьми умножений на вектор. В норме .rwkvq приводится вход:
+        // (x в типе матрицы) · Wᵀ, результат — обратно в тип x. Так же
+        // считает Metal-бэкенд rwkv-quant (`_mm`). У плотной модели счёт
+        // прежний — под ним сняты эталоны декода.
+        let narrow = useStepKernels && rwkvqBaseDType != nil
+        func lin(_ y: MLXArray, _ m: MLXArray) -> MLXArray {
+            narrow && y.dtype != m.dtype
+                ? matmul(y.asType(m.dtype), m.transposed()).asType(y.dtype)
+                : matmul(y, m.transposed())
+        }
+        func lin(_ y: MLXArray, _ m: MLXArray, _ bias: MLXArray) -> MLXArray { lin(y, m) + bias }
+
+        let gate = lin(sigmoid(lin(xg, gg(p+"g_lora_A.weight"))), gg(p+"g_lora_B.weight"))
 
         if layer == 0 {
             state.vFirst = v.reshaped([1, H, S])
         } else {
-            let vv = sigmoid(linear_(linear_(xv, gg(p+"v_lora_A.weight")),
+            let vv = sigmoid(lin(lin(xv, gg(p+"v_lora_A.weight")),
                                      gg(p+"v_lora_B.weight"), gg(p+"v_lora_B.bias"))).reshaped([H, S])
             let vf = state.vFirst!.reshaped([H, S])
             v = v + (vf - v) * vv
         }
 
-        let a = sigmoid(linear_(linear_(xa, gg(p+"a_lora_A.weight")),
+        let a = sigmoid(lin(lin(xa, gg(p+"a_lora_A.weight")),
                                 gg(p+"a_lora_B.weight"), gg(p+"a_lora_B.bias"))).reshaped([H, S])
 
-        var ww = linear_(tanh(linear_(xw, gg(p+"w_lora_A.weight"))),
+        var ww = lin(tanh(lin(xw, gg(p+"w_lora_A.weight"))),
                          gg(p+"w_lora_B.weight"), gg(p+"w_lora_B.bias"))
         ww = exp(-0.606531 * sigmoid(ww.asType(.float32))).asType(x.dtype).reshaped([H, S])
 
@@ -189,6 +205,18 @@ extension X070Backbone {
         let k = k0 * (1.0 + (a - 1.0) * gg(p+"k_a"))
 
         // WKV-шаг (fp32)
+        let fused = useStepKernels && rwkvqBaseDType != nil
+            && !castWKVOutputToComputeDType && wkvTailApplies(headSize: S)
+        if fused {
+            // один запуск на шаг WKV и один на хвост: group_norm + bonus + gate
+            let (outK, hK) = wkv7StepForward(r, ww, k, v, -kk, kk * a, state.wkv[layer])
+            state.wkv[layer] = hK
+            stepKernelCalls += 1
+            let tail = wkvTail(outK, r: r, k: k, v: v, rK: gg(p+"r_k"),
+                               lnWeight: gg(p+"ln_x.weight"), lnBias: gg(p+"ln_x.bias"),
+                               gate: gate, nHead: H, headSize: S)
+            return pj(tail, p+"o_proj.weight")
+        }
         var (outHD, hNew) = wkvStep(r, ww, k, v, -kk, kk * a, state.wkv[layer])
         state.wkv[layer] = hNew
         // Та же точка течи, что в параллельном пути (см. `castWKVOutput` в

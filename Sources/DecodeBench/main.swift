@@ -112,6 +112,14 @@ struct Args {
     /// декод — скорость и память. Протокол общий с эталоном (Metal-бэкенд
     /// rwkv-quant, /tmp/swr_1010/ref_bench.py): те же окна текста.
     var appBench: String? = nil
+    /// --app-bench: собрать sb6 без родного контейнера MLX (K3 + ядро GEMV).
+    var noNative = false
+    /// Сколько из шага занимают сами проекции: все GEMV одного токена
+    /// (sym или sb6) на постоянных входах под одним eval.
+    var gemvMicro: String? = nil
+    /// Разложение шага: сколько уходит на построение графа (вызов step на
+    /// CPU) и сколько на исполнение (eval), собранным и покомандным путём.
+    var stepProfile: String? = nil
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -147,6 +155,9 @@ func parseArgs() -> Args {
         case "--truth": a.truth = it.next()
         case "--knob-ab": a.knob = it.next(); a.knobPath = it.next()
         case "--app-bench": a.appBench = it.next()
+        case "--no-native": a.noNative = true
+        case "--gemv-micro": a.gemvMicro = it.next()
+        case "--step-profile": a.stepProfile = it.next()
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -745,6 +756,12 @@ func knobSpeedAB(_ knob: String, _ path: String, _ args: Args) throws {
     case "compiled":
         labels = ("покомандный шаг", "собранный шаг")
         set = { bb.useCompiledStep = !$0 }
+    case "step-kernels":
+        labels = ("шаг WKV и хвост операциями", "шаг WKV и хвост ядрами")
+        set = { bb.useStepKernels = !$0 }
+    case "sb6-gemv":
+        labels = ("sb6: деквант + матмул", "sb6: ядро GEMV")
+        set = { bb.rwkvqSb6DecodeKernel = !$0 }
     case "fuse-rkv":
         labels = ("r/k/v по одной", "фьюз r/k/v")
         set = { bb.rwkvqSymFuseRKV = !$0 }
@@ -833,8 +850,11 @@ func appBench(_ path: String, _ args: Args) throws {
     let dec = win[8].asArray(Int32.self).prefix(72).map(Int.init)                       // sr
     let f0 = processFootprintGB()
     let t0 = Date()
-    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    let bb = args.native ? try X070Backbone.load(fromRwkvq: expand(path), useNativeKernel: true)
+        : args.noNative ? try X070Backbone.load(fromRwkvq: expand(path), useNativeKernel: false)
+        : try X070Backbone.load(fromRwkvq: expand(path))
     GPU.clearCache()
+    print("sb6: \(bb.rwkvqBackedKeys.contains { bb.hasNativeRepack($0) } ? "родной контейнер MLX" : "K3 (ядро GEMV на шаге)")")
     print(String(format: "загрузка %.1f с; footprint +%.2f ГБ; MLX активная %.2f ГБ, пик %.2f ГБ",
                  Date().timeIntervalSince(t0), processFootprintGB() - f0,
                  Double(GPU.activeMemory) / 1e9, Double(GPU.peakMemory) / 1e9))
@@ -870,6 +890,63 @@ func appBench(_ path: String, _ args: Args) throws {
     print(String(format: "декод: медиана %.2f мс/ток = %.1f ток/с (раунды %@); MLX активная %.2f, пик %.2f ГБ; footprint %.2f ГБ",
                  median(ms), 1e3 / median(ms), ms.map { String(format: "%.2f", $0) }.joined(separator: " "),
                  Double(GPU.activeMemory) / 1e9, Double(GPU.peakMemory) / 1e9, processFootprintGB()))
+}
+
+/// Все проекции одного токена ядрами GEMV, без остального шага.
+func gemvMicro(_ path: String, _ args: Args) throws {
+    let sc = try RwkvqSidecar.open(expand(path))
+    var jobs: [(String, MLXArray)] = []
+    for key in sc.keys {
+        guard let info = sc.tensors[key], info.shape.count == 2, key != "emb.weight",
+              info.kind == .sym || info.kind == .sb6 else { continue }
+        let x = MLXRandom.normal([1, info.inFeatures]); eval(x)
+        jobs.append((key, x))
+    }
+    func once() -> Double {
+        let t = Date()
+        let outs = jobs.compactMap { sc.symGEMV($0.0, $0.1) ?? sc.sb6GEMV($0.0, $0.1) }
+        eval(outs)
+        return Date().timeIntervalSince(t) * 1e3
+    }
+    for _ in 0 ..< 8 { _ = once() }
+    let ms = (0 ..< 40).map { _ in once() }
+    print(String(format: "проекций %d; все GEMV одного токена под одним eval: медиана %.2f мс (мин %.2f)",
+                 jobs.count, median(ms), ms.min()!))
+}
+
+/// Построение графа шага против его исполнения.
+func stepProfile(_ path: String, _ args: Args) throws {
+    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    let (ids, _) = inputIds(args.steps + args.warmup, vocab: bb.cfg.vocab, vocabPath: args.vocab)
+    for compiled in [true, false, true, false] {
+        bb.useCompiledStep = compiled
+        var st = RWKVState(cfg: bb.cfg)
+        var build: [Double] = [], run: [Double] = []
+        for (i, id) in ids.enumerated() {
+            let t0 = Date()
+            let lg = bb.step(id, state: &st)
+            let next = argMax(lg, axis: -1)
+            let t1 = Date()
+            eval(next); st.eval()
+            _ = next.item(Int.self)
+            let t2 = Date()
+            if i >= args.warmup {
+                build.append(t1.timeIntervalSince(t0) * 1e3); run.append(t2.timeIntervalSince(t1) * 1e3)
+            }
+        }
+        print(String(format: "%@ шаг: построение графа %.2f мс, исполнение %.2f мс, всего %.2f мс/ток",
+                     compiled ? "собранный  " : "покомандный", median(build), median(run), median(build) + median(run)))
+    }
+}
+
+if let path = args.stepProfile {
+    try stepProfile(path, args)
+    exit(0)
+}
+
+if let path = args.gemvMicro {
+    try gemvMicro(path, args)
+    exit(0)
 }
 
 if let path = args.appBench {

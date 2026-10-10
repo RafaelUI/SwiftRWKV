@@ -46,6 +46,13 @@ final class RwkvqModelTests: XCTestCase {
                        klRefMetalDecode: Float(js["kl_ref_metal_decode"] as! Double))
     }
 
+    /// Модель в той конфигурации, под которой снят эталон rwkv-metal: у
+    /// COMPRESSION это родной контейнер MLX (умолчание порта — K3 и ядро
+    /// GEMV, оно проверяется отдельно, см. testK3BaseIsTheDefault…).
+    static func loadAsRwkvMetal(_ f: Fixture, _ preset: String) throws -> X070Backbone {
+        try X070Backbone.load(fromRwkvq: f.path, useNativeKernel: preset == "compression")
+    }
+
     /// KL(p‖q) по строкам логитов, среднее.
     static func kl(_ p: MLXArray, _ q: MLXArray) -> Float {
         let lp = p.asType(.float32) - logSumExp(p.asType(.float32), axis: -1, keepDims: true)
@@ -85,9 +92,16 @@ final class RwkvqModelTests: XCTestCase {
             XCTAssertFalse(bb.hasWeight("blocks.1.tmix.o_proj.weight"))
             XCTAssertFalse(bb.hasWeight("head.weight"))
             if preset == "compression" {
-                // sb6 целиком в родном контейнере, сырые буферы отпущены
-                XCTAssertFalse(bb.isRawSidecarRetained)
-                XCTAssertTrue(bb.rwkvqBackedKeys.allSatisfy { bb.hasNativeRepack($0) })
+                // умолчание: K3 в памяти как есть (декод ядром GEMV), родного
+                // контейнера нет — и буферы держатся только свои
+                XCTAssertTrue(bb.isRawSidecarRetained)
+                XCTAssertTrue(bb.rwkvqBackedKeys.allSatisfy { !bb.hasNativeRepack($0) })
+                XCTAssertEqual(bb.rwkvqSidecar?.tensors.count, 72)
+                XCTAssertNil(bb.rwkvqSidecar?.arrays["emb.weight::qblk"])
+                // по запросу — родной контейнер: sb6 переложен целиком, K3 отпущен
+                let native = try X070Backbone.load(fromRwkvq: f.path, useNativeKernel: true)
+                XCTAssertFalse(native.isRawSidecarRetained)
+                XCTAssertTrue(native.rwkvqBackedKeys.allSatisfy { native.hasNativeRepack($0) })
             } else {
                 // у sym родного контейнера нет: буферы держатся, но ТОЛЬКО свои
                 XCTAssertTrue(bb.isRawSidecarRetained)
@@ -114,7 +128,7 @@ final class RwkvqModelTests: XCTestCase {
     /// Вес, оставшийся только в родном контейнере, читается и равен декванту.
     func testWeightReadsBackFromNativeContainer() throws {
         let f = try Self.fixture("compression")
-        let bb = try X070Backbone.load(fromRwkvq: f.path)
+        let bb = try X070Backbone.load(fromRwkvq: f.path, useNativeKernel: true)
         let direct = try RwkvqFileTests.base("compression")
         for (x070, world) in [("blocks.5.tmix.k_proj.weight", "blocks.5.att.key.weight"),
                               ("blocks.5.cmix.value.weight", "blocks.5.ffn.value.weight")] {
@@ -131,7 +145,7 @@ final class RwkvqModelTests: XCTestCase {
     func testForwardMatchesRwkvMetal() throws {
         for preset in RwkvqFileTests.presets {
             let f = try Self.fixture(preset)
-            let bb = try X070Backbone.load(fromRwkvq: f.path)
+            let bb = try Self.loadAsRwkvMetal(f, preset)
             let ids = f.ref["input_ids"]!
             let logits = bb(ids)[0].asType(.float32)
             eval(logits)
@@ -168,7 +182,7 @@ final class RwkvqModelTests: XCTestCase {
     func testPrefillStateAndStreamingDecode() throws {
         for preset in RwkvqFileTests.presets {
             let f = try Self.fixture(preset)
-            let bb = try X070Backbone.load(fromRwkvq: f.path)
+            let bb = try Self.loadAsRwkvMetal(f, preset)
             let (_, st) = bb.bodyWithState(f.ref["input_ids"]!)
             let eW = Self.relErr(st.wkv[0..., 0], f.ref["state_wkv"]!)
             let eT = Self.relErr(st.tmixShift[0..., 0, 0], f.ref["state_tmix"]!)
@@ -201,7 +215,9 @@ final class RwkvqModelTests: XCTestCase {
                          preset, klRef, klMetal, klStep, f.klRefMetalDecode))
             XCTAssertLessThan(klRef, 1.25 * f.klRefMetalDecode, preset)
             XCTAssertLessThan(klMetal, f.klRefMetalDecode, preset)
-            XCTAssertLessThan(klStep, 3 * f.klRefMetalDecode, preset)
+            // шаг — другой путь, чем эталонный декод (свои ядра; у COMPRESSION под
+            // родным контейнером — ещё и fp16-вход): граница здравости, не паритет
+            XCTAssertLessThan(klStep, 1e-5, preset)
         }
     }
 
@@ -234,11 +250,7 @@ final class RwkvqModelTests: XCTestCase {
             let metalRef = Self.kl(f.ref["logits_ref"]![0 ..< 8], f.ref["logits_metal"]![0 ..< 8])
             print(String(format: "ШАГ С НУЛЯ %@: KL(ref‖шаг) %.3e, KL(metal‖шаг) %.3e, KL(ref‖metal) на тех же позициях %.3e",
                          preset, kl, klMetal, metalRef))
-            // COMPRESSION: шаг подаёт в родное ядро fp16 (решение 10.10), и
-            // на первых токенах с пустого состояния это заметнее всего:
-            // 7.1e-5 против 1.0e-5 при fp32-входе (после префилла разница
-            // 3.5e-6 против 2.4e-6). Граница — здравость, а не паритет.
-            XCTAssertLessThan(kl, preset == "compression" ? 2e-4 : 4 * metalRef, preset)
+            XCTAssertLessThan(kl, 4 * metalRef, preset)
             XCTAssertEqual((argMax(got, axis: -1) .== argMax(f.ref["logits_metal"]![0 ..< 8], axis: -1))
                 .asType(.int32).sum().item(Int.self), 8, "\(preset): top-1")
         }
@@ -248,7 +260,7 @@ final class RwkvqModelTests: XCTestCase {
     /// проходе (решение 10.10). Явное значение действует на оба пути.
     func testNativeInputIsHalfOnDecodeAndSingleOnParallelPass() throws {
         let f = try Self.fixture("compression")
-        let bb = try X070Backbone.load(fromRwkvq: f.path)
+        let bb = try X070Backbone.load(fromRwkvq: f.path, useNativeKernel: true)
         let ids = f.ref["input_ids"]!
         func parallel() -> MLXArray { let l = bb(ids[0..., 0 ..< 16])[0].asType(.float32); eval(l); return l }
         bb.useCompiledStep = false      // покомандный путь: сравнение побитное
@@ -295,6 +307,24 @@ final class RwkvqModelTests: XCTestCase {
                      + "всё bf16 %.3e", klNorm, klBaseBf, klAllBf))
         XCTAssertLessThan(klNorm, klBaseBf)
         XCTAssertLessThan(klNorm, klAllBf)
+    }
+
+    /// Умолчание порта для COMPRESSION — K3 без родного контейнера:
+    /// параллельный проход идёт деквантом и fp16-матмулом (как у REDUCTION и
+    /// как в Metal-бэкенде rwkv-quant). От rwkv-metal (родной контейнер,
+    /// fp32-вход) он стоит на шум fp16-матмула, и к точному счёту обязан
+    /// быть не дальше двух таких шумов.
+    func testK3BaseIsTheDefaultAndStaysCloseToExact() throws {
+        let f = try Self.fixture("compression")
+        let bb = try X070Backbone.load(fromRwkvq: f.path)
+        let logits = bb(f.ref["input_ids"]!)[0]
+        let klRef = Self.kl(f.ref["logits_ref"]!, logits)
+        let klMetal = Self.kl(f.ref["logits_metal"]!, logits)
+        print(String(format: "K3 (умолчание) compression: KL(ref‖порт) %.3e, KL(metal‖порт) %.3e, KL(ref‖metal) %.3e",
+                     klRef, klMetal, f.klRefMetal))
+        XCTAssertLessThan(klRef, 2 * f.klRefMetal)
+        XCTAssertLessThan(klMetal, f.klRefMetal)
+        XCTAssertGreaterThan(klMetal, 1e-7, "параллельный проход идёт родным контейнером, а не K3")
     }
 
     // ── Ранги не по формуле ──────────────────────────────────────────

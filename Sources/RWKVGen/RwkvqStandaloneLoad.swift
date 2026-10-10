@@ -28,13 +28,23 @@ extension X070Backbone {
     /// - paramDType: тип плотных параметров (emb, нормы, миксы, low-rank
     ///   ветки). fp16 по умолчанию; `.bfloat16` — прежнее.
     /// - baseDType: тип квантованной базы, см. `rwkvqBaseDType`.
-    /// - useNativeKernel: sb6 перекладывается в родной контейнер MLX
-    ///   (`quantizedMM`) и не разворачивается в плотный транзиент. У sym
-    ///   родного контейнера нет (блок 16): она деквантуется на каждый проход.
+    /// - useNativeKernel: как держать sb6 (пресет COMPRESSION). На sym не
+    ///   влияет: у неё родного контейнера нет (блок 16).
+    ///   • `false` (умолчание) — K3-интерлив, как в файле: декод ядром GEMV,
+    ///     параллельный проход деквантом и fp16-матмулом (так же считает
+    ///     Metal-бэкенд rwkv-quant). Загрузка без перекладки.
+    ///   • `true` — родной контейнер MLX (`quantizedMM`) на обоих путях; так
+    ///     считает rwkv-metal, и с ним параллельный проход совпадает до
+    ///     ~1e-8 KL. Цена — перекладка при загрузке.
+    ///   Замер на 1.5B (K3 против родного): загрузка 0.4 против 3.7 с, пик
+    ///   загрузки 1.50 против 2.39 ГБ, память 1.22 против 1.31 ГБ, префилл
+    ///   512 токенов 824 против 908 мс; KL декода к точному счёту на 0.1B
+    ///   2.0e-6 против 5.3e-6. Держать обе раскладки значило бы удвоить
+    ///   память модели, поэтому база собирается под одну.
     public static func load(fromRwkvq path: String,
                             paramDType: DType = .float16,
                             baseDType: DType? = .float16,
-                            useNativeKernel: Bool = true) throws -> X070Backbone {
+                            useNativeKernel: Bool = false) throws -> X070Backbone {
         try load(fromSidecar: try RwkvqSidecar.open(path), computeDType: paramDType,
                  baseDType: baseDType, useNativeKernel: useNativeKernel)
     }
@@ -43,7 +53,7 @@ extension X070Backbone {
     public static func load(fromSidecar sidecar: RwkvqSidecar,
                             computeDType: DType = .float16,
                             baseDType: DType? = .float16,
-                            useNativeKernel: Bool = true) throws -> X070Backbone {
+                            useNativeKernel: Bool = false) throws -> X070Backbone {
         // Каждая цель обязана лежать в файле в известной раскладке —
         // проверяется ДО сборки. Иначе «нет такого тензора» и «не умеем эту
         // раскладку» выглядели бы одинаково: строкой в `missing`, которую
