@@ -385,10 +385,31 @@ Both current rwkv-quant presets open this way:
 | `compression` | `sb6`, 4–6 bit, block 32 | decode: a GEMV kernel over the compressed codes, no dense matrix. Parallel pass: dequantised by one Metal kernel per call, then an fp16 matmul. With `useNativeKernel: true`: relayouted once into MLX's quantised container, `quantizedMM` on both paths |
 | `reduction` | `sym` (Q6_K-like), 6 and 8 bit, block 16 | decode: a GEMV kernel over the compressed codes, no dense matrix. Parallel pass: dequantised by one Metal kernel per call, then an fp16 matmul — MLX's quantised matmul has no block-16 group, and an inexact relayout would be a different base under the same name |
 
-Everything else in the file (norms, token-shift mixes, the low-rank branches,
-the embedding table) is unpacked once at load into dense parameters. A target
-the file keeps dense — the layer-0 output projection in both presets — stays a
-frozen dense base.
+Everything else in the file (norms, token-shift mixes, the low-rank branches)
+is unpacked once at load into dense parameters. A target the file keeps dense —
+the layer-0 output projection in both presets — stays a frozen dense base.
+
+**The embedding table of `reduction` is not unpacked at all.** It is stored as
+`sym` at 8 bits — one byte per element, a scale per block of 16 along the row —
+so a row can be read by gathering rows of three buffers. The model keeps the
+codes and dequantises the rows it is asked for (`rwkvqEmbTable`, a port of
+rwkv-quant's `SymGatherEmb`); the rows are bit-equal to those of the dense
+table, which was the largest single item of memory (268 MB at 1.5B against
+144 MB of codes). `denseEmbedding: true` builds the dense table instead — a
+packed table is not among `weightKeys`, so training the table needs it. The
+table of `compression` is `sb6`, whose codes are packed in bit planes with no
+row access; it stays dense. So does any table when `paramDType` is not fp16.
+
+**Loading does not spike.** MLX memory during `load(fromRwkvq:)` peaks at the
+memory the model keeps: 1.50 GB against 1.48 at 1.5B `reduction`, 2.85 against
+2.83 at 2.9B (before: 2.25 against 1.61, and 4.12 against 2.99 — and the
+process footprint stayed at the peak). The file is memory-mapped and read in
+parts: first everything that unpacks into dense parameters, releasing its
+source buffers while the base is not there yet; then the quantised base, each
+tensor straight into its final layout, largest first, with r/k/v of a layer
+read directly into their shared buffer. The buffers about to be read are
+announced to the system (`madvise(WILLNEED)`), so a cold file is read in large
+requests ahead of the copy instead of page fault by page fault.
 
 **The numeric norm is fp16**, for dense parameters and for the quantised base
 alike: dequantised weights are rounded to fp16 and the projection runs in fp16,
@@ -415,45 +436,97 @@ Decode, ms per token:
 
 | | 0.1B | 0.4B | 1.5B | 2.9B |
 |---|---|---|---|---|
-| `reduction`, this port | 3.00 | 6.69 | 17.6 | 34.2 |
-| `reduction`, rwkv-quant | 3.06 | 6.79 | 17.6 | 33.4 |
-| `compression`, this port | 2.79 | 5.79 | 13.9 | 25.7 |
-| `compression`, rwkv-quant | 2.65 | 5.48 | 13.4 | 25.0 |
+| `reduction`, this port | 2.95 | 6.54 | 16.6 | 32.9 |
+| `reduction`, rwkv-quant | 2.98 | 6.62 | 16.7 | 33.1 |
+| `compression`, this port | 2.69 | 5.62 | 13.6 | 25.4 |
+| `compression`, rwkv-quant | 2.58 | 5.31 | 12.8 | 24.5 |
 
 Prefill of 512 tokens, ms:
 
 | | 0.1B | 0.4B | 1.5B | 2.9B |
 |---|---|---|---|---|
-| `reduction`, this port | 124 | 338 | 831 | 1584 |
-| `reduction`, rwkv-quant | 99 | 254 | 723 | 1413 |
-| `compression`, this port | 130 | 337 | 824 | 1582 |
-| `compression`, rwkv-quant | 101 | 257 | 734 | 1456 |
+| `reduction`, this port | 76.7 | 220 | 666 | 1350 |
+| `reduction`, rwkv-quant | 98.2 | 250 | 708 | 1389 |
+| `compression`, this port | 76.0 | 218 | 660 | 1343 |
+| `compression`, rwkv-quant | 99.6 | 245 | 712 | 1434 |
+
+A caveat on this row: the reference script calls the model without
+`last_only`, so the reference computes the head at all 512 positions and the
+port at one. With `last_only=True` the reference takes 659 / 669 ms at 1.5B
+and 224 ms at 0.4B `reduction` — level with the port. The reference's prefill
+is compiled (`mx.compile`); the port's numbers here are not. With
+`useCompiledPrefill` the port takes 630 / 627 ms at 1.5B.
 
 Memory, GB — MLX memory live while decoding / MLX peak during the prefill:
 
 | | 0.1B | 0.4B | 1.5B | 2.9B |
 |---|---|---|---|---|
-| `reduction`, this port | 0.25 / 0.52 | 0.52 / 0.95 | 1.63 / 2.48 | 3.02 / 4.07 |
+| `reduction`, this port | 0.20 / 0.53 | 0.46 / 0.97 | 1.51 / 2.47 | 2.87 / 4.06 |
 | `reduction`, rwkv-quant | 0.20 / 0.93 | 0.46 / 1.49 | 1.50 / 2.82 | 2.86 / 4.36 |
-| `compression`, this port | 0.21 / 0.48 | 0.41 / 0.84 | 1.24 / 2.11 | 2.26 / 3.30 |
+| `compression`, this port | 0.21 / 0.54 | 0.41 / 0.92 | 1.24 / 2.20 | 2.26 / 3.45 |
 | `compression`, rwkv-quant | 0.21 / 0.86 | 0.42 / 1.29 | 1.29 / 2.33 | 2.35 / 4.08 |
 
-Loading — seconds / growth of the process footprint, GB (file size in brackets):
+Loading, memory, GB — MLX peak during the load / MLX memory live after it /
+growth of the process footprint:
 
 | | 0.1B | 0.4B | 1.5B | 2.9B |
 |---|---|---|---|---|
-| `reduction`, this port | 0.1 / 0.34 [0.19] | 0.2 / 0.69 [0.43] | 3.1 / 2.20 [1.44] | 6.0 / 3.99 [2.74] |
-| `reduction`, rwkv-quant | 0.1 / 0.20 | 0.2 / 0.44 | 0.5 / 1.46 | 2.0 / 2.80 |
-| `compression`, this port | 0.1 / 0.35 [0.13] | 0.2 / 0.54 [0.30] | 2.4 / 1.71 [1.00] | 4.3 / 2.89 [1.89] |
-| `compression`, rwkv-quant | 0.2 / 0.40 | 0.3 / 0.63 | 0.6 / 1.35 | 1.0 / 2.44 |
+| `reduction`, this port | 0.20 / 0.20 / 0.21 | 0.45 / 0.45 / 0.47 | 1.50 / 1.48 / 1.52 | 2.85 / 2.83 / 2.88 |
+| `reduction`, rwkv-quant | 0.20 / 0.20 / 0.20 | 0.45 / 0.45 / 0.44 | 1.49 / 1.49 / 1.46 | 2.86 / 2.84 / 2.80 |
+| `compression`, this port | 0.20 / 0.20 / 0.27 | 0.40 / 0.40 / 0.46 | 1.23 / 1.22 / 1.25 | 2.23 / 2.22 / 2.26 |
+| `compression`, rwkv-quant | 0.20 / 0.20 / 0.40 | 0.40 / 0.40 / 0.47 | 1.22 / 1.22 / 1.35 | 2.24 / 2.22 / 2.25 |
 
-Where the port stands. **Decode is level with the reference**: within 3% on
-`reduction` and 3–6% behind on `compression`. Steady-state memory is level
-(`compression` slightly below, `reduction` 6–9% above at 0.4B and up), and the
-prefill peak is lower throughout. Prefill is 9–33% slower. Loading large files
-is several times slower (the load time of a large file also depends heavily
-on whether the file is in the page cache: the same 1.5B `compression` loaded in
-0.4 s and in 2.4 s in different runs).
+Loading, seconds — a cold file / the file in the page cache. Each cold
+measurement is taken on a fresh copy of the file written past the page cache,
+port and reference in turn:
+
+| | 1.5B `reduction` | 1.5B `compression` | 2.9B `reduction` | 2.9B `compression` |
+|---|---|---|---|---|
+| this port | 1.2 / 0.52 | 1.04 / 0.47 | 2.40 / 0.81 | 1.85 / 0.83 |
+| rwkv-quant | 2.3 / 0.45 | 1.96 / 0.54 | 4.80 / 0.91 | 3.57 / 0.92 |
+
+Where the port stands. **Decode is level with the reference**: within 1% on
+`reduction` and 3–6% behind on `compression`. **Prefill is faster** by 3–23%
+on the protocol above and level with a reference that is asked for one
+position only. **Loading keeps to the memory of the model** and reads a cold
+file about twice as fast as the reference; with the file in the page cache the
+two are level. Steady-state memory is level, and the prefill peak is lower
+throughout. The page cache matters more than it looks: on this machine a
+multi-gigabyte file is evicted within minutes, so a cold file is the ordinary
+case for an application.
+
+What the prefill path is made of (512 tokens, alternating arms in one process):
+
+- **The frozen WKV runs as one kernel launch over the whole prompt**
+  (`wkv7SequenceForward`, a port of rwkv-metal's `wkv7_infer`) instead of
+  chunks of 16 with slices, padding and a concatenate. The length is an
+  *input* of the kernel, not a constant of its source, so there is one kernel
+  per head count and no shader build per prompt length. Bit-equal to the
+  chunked pass. 1.5B: 125 → 41 ms for the 24 layers; the prefill 840 → 774 ms,
+  0.4B 315 → 251, 0.1B 131 → 94. The trainable kernel still chunks — its
+  backward pass rebuilds the state chunk by chunk.
+- **The frozen pass is fused where the chains were longest**
+  (`frozenPassKernels`, all three on by default). After the first WKV the
+  stream is fp32 and every elementwise op of a block is a pass over
+  `[B·T, D]` — about 110 such passes a layer. Three pieces are fused, without
+  `compile` and so without a trace per prompt length: the tail of tmix (group
+  norm, bonus, gate) by the kernel the recurrent step already uses, over B·T
+  rows (−39 ms at 1.5B); the layer norms of the fp32 stream by MLX's own
+  kernel, as for fp16 and as `nn.LayerNorm` does in rwkv-metal (−20 ms); and
+  cmix, where relu and the square stay in fp16 between its two fp16 matmuls
+  (−20 ms). The cmix piece is bit-equal — the square of an fp16 number is
+  exact in fp32, so there is one rounding either way. The other two move the
+  numbers by the noise of the fp16 matmuls (KL 3e-6 to the per-op pass on
+  0.1B) and *towards* an exact evaluation: KL 4.80e-6 → 4.36e-6 on
+  `reduction`, 6.08e-6 → 5.18e-6 on `compression`. 1.5B: 742 → 668 ms.
+  Only layers outside `trainLayers` of a model loaded from `.rwkvq` take this
+  path; trained layers, a dense model and the older base path are bit-equal to
+  what they were.
+
+Where the time of a 1.5B `reduction` prefill goes now (`decode-bench
+--prefill-profile`): 545 ms in the quantised projections of the body (69 ms
+dequantising, 476 ms in fp16 matmuls — about 2.6 TFLOPS), 41 ms in WKV, 82 ms
+in everything else.
 
 What the decode path is made of, and what each piece bought (alternating arms
 on one model unless stated):
@@ -557,15 +630,15 @@ bootstrap, parallel pass:
 | 2.9B | — | — | — | −23.6% |
 
 **Prefill can be compiled too** (`useCompiledPrefill`), and is off by default:
-7–8% faster, but every *new* prompt length costs a trace (60–80 ms; the first
+5–6% faster on top of the fused pass (1.5B: 668 → 630 ms), but every *new*
+prompt length costs a trace (60–80 ms; the first
 in a process up to 0.8 s) and about 0.1 GB of peak. With a different prompt
 length every time that is a net loss; turn it on where lengths repeat.
 
-Open, in the order they matter for an application: **prefill** (9–33% behind;
-the reference compiles it and runs WKV for the whole prompt in one kernel,
-where this port chunks by 16 with slices and a concatenate — not profiled
-yet), and **loading `reduction`** (the dense unpacking of norms, branches and
-the embedding table).
+Open: the rest of the per-op work in the prefill (the six lerps, the casts
+around the r/k/v/o matmuls, the low-rank branches — two more fused kernels
+would take an estimated 25 ms off 668), and decode of `compression` (3–6%
+behind).
 
 The other decode numbers in this section were measured on the older path; see
 the note on `baseDType` below.
