@@ -120,6 +120,10 @@ struct Args {
     /// Разложение шага: сколько уходит на построение графа (вызов step на
     /// CPU) и сколько на исполнение (eval), собранным и покомандным путём.
     var stepProfile: String? = nil
+    /// Загрузка .rwkvq по этапам: память MLX и footprint после каждого.
+    var loadProfile: String? = nil
+    /// Префилл T=512 по статьям: деквант, матмулы, WKV, остальное.
+    var prefillProfile: String? = nil
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -158,6 +162,8 @@ func parseArgs() -> Args {
         case "--no-native": a.noNative = true
         case "--gemv-micro": a.gemvMicro = it.next()
         case "--step-profile": a.stepProfile = it.next()
+        case "--load-profile": a.loadProfile = it.next()
+        case "--prefill-profile": a.prefillProfile = it.next()
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -1000,6 +1006,134 @@ func stepProfile(_ path: String, _ args: Args) throws {
         print(String(format: "%@ шаг: построение графа %.2f мс, исполнение %.2f мс, всего %.2f мс/ток",
                      compiled ? "собранный  " : "покомандный", median(build), median(run), median(build) + median(run)))
     }
+}
+
+/// Загрузка по этапам: что лежит в памяти MLX и в footprint процесса после
+/// каждого шага `load(fromRwkvq:)`, повторённого здесь открытыми вызовами.
+/// Пик MLX сбрасывается перед каждым этапом.
+func loadProfile(_ path: String, _ args: Args) throws {
+    func gb(_ x: Int) -> Double { Double(x) / 1e9 }
+    let f0 = processFootprintGB()
+    var t = Date()
+    func mark(_ what: String) {
+        print(String(format: "%@: %.2f с | MLX активная %.2f, кеш %.2f, пик этапа %.2f ГБ | footprint +%.2f ГБ",
+                     what, Date().timeIntervalSince(t), gb(GPU.activeMemory), gb(GPU.cacheMemory),
+                     gb(GPU.peakMemory), processFootprintGB() - f0))
+        fflush(stdout)
+        GPU.resetPeakMemory(); t = Date()
+    }
+    GPU.resetPeakMemory()
+    let sc = try RwkvqSidecar.open(expand(path))
+    mark("1. открыть файл, все буферы в MLX")
+    // что из поднятого нужно после сборки, а что разворачивается и бросается
+    var byKind: [String: Int] = [:]
+    var keep = 0, drop = 0, emb = 0
+    for (name, a) in sc.arrays {
+        guard let r = name.range(of: "::") else { continue }
+        let key = String(name[..<r.lowerBound])
+        let bytes = a.size * a.dtype.size
+        let kind = sc.tensors[key]?.kind.rawValue ?? "?"
+        byKind[kind, default: 0] += bytes
+        let is2d = sc.tensors[key]?.shape.count == 2
+        let quantBase = (kind == "sym" || kind == "sb6") && is2d && key != "emb.weight"
+            && RwkvqNaming.x070Key(forWorld: key) != nil
+        if key == "emb.weight" { emb += bytes } else if quantBase { keep += bytes } else { drop += bytes }
+    }
+    print("   буферы по раскладкам, ГБ: " + byKind.sorted { $0.key < $1.key }
+        .map { String(format: "%@ %.3f", $0.key, gb($0.value)) }.joined(separator: ", "))
+    print(String(format: "   остаются сжатыми %.3f ГБ | emb (коды) %.3f ГБ | прочее (разворачивается в плотное) %.3f ГБ",
+                 gb(keep), gb(emb), gb(drop)))
+    var weights = try sc.buildDenseWeights(computeDType: .float16)
+    eval(Array(weights.values))
+    mark("2. плотные параметры тела (нормы, миксы, ветки)")
+    print(String(format: "   плотные параметры тела: %.3f ГБ", gb(weights.values.reduce(0) { $0 + $1.size * $1.dtype.size })))
+    weights["emb.weight"] = try sc.dequantize("emb.weight", dtype: .float16)
+    eval(weights["emb.weight"]!)
+    mark("3. emb развёрнут в плотную fp16")
+    let cfg = X070Config(nLayer: sc.nLayer, nEmbd: sc.nEmbd, headSize: sc.headSize, vocab: sc.vocabSize)
+    let bb = X070Backbone(weights: weights, cfg: cfg, computeDType: .float16)
+    weights = [:]
+    _ = bb.attachRwkvq(sc, options: X070Backbone.RwkvqAttachOptions(
+        quantizeCmix: true, quantizeHead: true, quantizeEmbedding: false,
+        useNativeKernel: args.native, baseDType: .float16))
+    mark("4. бэкбон собран, база подключена (обрезка, фьюз r/k/v)")
+    GPU.clearCache()
+    mark("5. кеш MLX отпущен (исходная база ещё жива в этой функции)")
+    _ = bb
+}
+
+/// Префилл T=512 по статьям, тем же способом, что эталон
+/// (/tmp/swr_1010_s2/ref_prefill_profile.py): каждая статья под своим eval.
+func prefillProfile(_ path: String, _ args: Args) throws {
+    let T = 512
+    let bb = try X070Backbone.load(fromRwkvq: expand(path))
+    let sc = try RwkvqSidecar.open(expand(path))
+    GPU.clearCache()
+    let win = try loadArrays(url: URL(fileURLWithPath: expand(args.windows)))["ids"]!
+    let pre = (win[0].asArray(Int32.self) + win[4].asArray(Int32.self)).map(Int.init)
+    func med(_ f: () -> Void) -> Double {
+        f()
+        return median((0 ..< 5).map { _ in let t = Date(); f(); return Date().timeIntervalSince(t) * 1e3 })
+    }
+    var body: [(String, MLXArray)] = []
+    var xs: [Int: MLXArray] = [:]
+    for key in sc.keys {
+        guard let info = sc.tensors[key], info.shape.count == 2, info.isQuantizedBase,
+              key != "emb.weight", key != "head.weight", RwkvqNaming.x070Key(forWorld: key) != nil else { continue }
+        if xs[info.inFeatures] == nil {
+            let x = MLXRandom.normal([T, info.inFeatures]); eval(x); xs[info.inFeatures] = x
+        }
+        body.append((key, xs[info.inFeatures]!))
+    }
+    let tDq = med { for (k, _) in body { eval(try! sc.dequantize(k, dtype: .float16)) } }
+    let tLin = med {
+        for (k, x) in body {
+            let w = try! sc.dequantize(k, dtype: .float16)
+            eval(matmul(x.asType(.float16), w.transposed()).asType(.float32))
+        }
+    }
+    let tLin32 = med {
+        for (k, x) in body {
+            let w = try! sc.dequantize(k, dtype: .float32)
+            eval(matmul(x, w.transposed()))
+        }
+    }
+    print("слоёв \(bb.cfg.nLayer), D \(bb.cfg.nEmbd); квантованных проекций тела \(body.count)")
+    print(String(format: "деквант всех матриц тела: %.1f мс | проекции тела целиком (деквант + fp16-матмул): %.1f мс | матмулы (разность): %.1f мс | то же в fp32: %.1f мс",
+                 tDq, tLin, tLin - tDq, tLin32))
+    fflush(stdout)
+    let H = bb.cfg.nHead, S = bb.cfg.headSize, L = bb.cfg.nLayer
+    var r = (0 ..< 6).map { _ in MLXRandom.normal([1, T, H, S]) * 0.1 }
+    r[1] = exp(-abs(r[1]))
+    eval(r)
+    let tWkv = med {
+        for _ in 0 ..< L {
+            let (o, h) = wkv7ForwardWithState(r[0], r[1], r[2], r[3], r[4], r[5], nil); eval(o, h)
+        }
+    }
+    print(String(format: "WKV по 16 токенов на весь промпт x %d слоёв: %.1f мс", L, tWkv))
+    fflush(stdout)
+    func whole(_ compiled: Bool) -> Double {
+        bb.useCompiledPrefill = compiled
+        return med {
+            var st = RWKVState(cfg: bb.cfg)
+            let lg = bb.prefill(pre, state: &st); eval(lg); st.eval()
+        }
+    }
+    var e: [Double] = [], c: [Double] = []
+    for _ in 0 ..< 2 { e.append(whole(false)); c.append(whole(true)) }
+    print(String(format: "префилл целиком (голова на 1 позиции): покомандно %.1f мс | собранный %.1f мс", e.min()!, c.min()!))
+    print(String(format: "остальное (покомандно - проекции тела - WKV): %.1f мс", e.min()! - tLin - tWkv))
+}
+
+if let path = args.loadProfile {
+    try loadProfile(path, args)
+    exit(0)
+}
+
+if let path = args.prefillProfile {
+    try prefillProfile(path, args)
+    exit(0)
 }
 
 if let path = args.stepProfile {
