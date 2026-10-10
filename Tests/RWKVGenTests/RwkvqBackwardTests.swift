@@ -110,6 +110,10 @@ final class RwkvqBackwardTests: XCTestCase {
         let f = try RwkvqModelTests.fixture("reduction")
         let bb = try X070Backbone.load(fromRwkvq: f.path)
         let ids = f.ref["input_ids"]!
+        // Считаются ВСЕ проекции: слитый cmix замороженного слоя идёт мимо
+        // обёртки со своим VJP (градиент через такой слой не идёт) — он
+        // проверен в конце.
+        bb.frozenPassKernels = []
         let before = bb.rwkvqWideBackwardCalls
         let a = bb(ids); eval(a)
         XCTAssertEqual(bb.rwkvqWideBackwardCalls - before, 73, "72 квантованные проекции и плотная цель")
@@ -120,6 +124,12 @@ final class RwkvqBackwardTests: XCTestCase {
         let c = bb(ids); eval(c)
         XCTAssertEqual(RwkvqFileTests.mismatches(a, b), 0)
         XCTAssertEqual(RwkvqFileTests.mismatches(a, c), 0)
+        // умолчание: cmix двенадцати замороженных слоёв (24 проекции) — без обёртки
+        bb.frozenPassKernels = .all
+        bb.rwkvqBackwardDType = .bfloat16
+        let n = bb.rwkvqWideBackwardCalls
+        let d = bb(ids); eval(d)
+        XCTAssertEqual(bb.rwkvqWideBackwardCalls - n, 49, "48 проекций tmix и плотная цель")
     }
 
     /// Обратный проход через одну проекцию побитно равен формуле

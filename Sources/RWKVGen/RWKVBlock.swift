@@ -66,6 +66,15 @@ public protocol RWKVBlockContext: AnyObject {
     /// Каким ядром считать WKV при данной длине.
     func wkvPath(_ T: Int) -> WKVKernelPath
 
+    /// Какие части замороженного прохода считать слитно (см.
+    /// `FrozenPassKernels`). Пусто — всё покомандно.
+    var frozenKernels: FrozenPassKernels { get }
+
+    /// cmix замороженного слоя целиком в типе базы: value(relu(key(xk))²).
+    /// nil — реализация этого не умеет для данного слоя (адаптеры, родной
+    /// контейнер, не fp16-база), тогда блок считает общим путём.
+    func cmixFrozen(_ xk: MLXArray) -> MLXArray?
+
     /// Приводить ли выход WKV обратно к типу входа блока.
     ///
     /// Рекуррентность WKV считается в fp32 и обязана — это условие
@@ -89,6 +98,36 @@ public extension RWKVBlockContext {
     /// Умолчание для всех реализаций, кроме бэкбона: не приводить.
     /// Голова реранкера живёт своей жизнью и в этот эксперимент не входит.
     var castWKVOutput: Bool { false }
+    /// Умолчание: замороженный проход считается покомандно, как обучаемый.
+    var frozenKernels: FrozenPassKernels { [] }
+    func cmixFrozen(_ xk: MLXArray) -> MLXArray? { nil }
+}
+
+/// Что на ЗАМОРОЖЕННОМ параллельном проходе (слой, через который не идёт
+/// градиент: `wkvPath == .forward`) считается слитно, а не цепочкой
+/// поэлементных операций MLX. Действует только у модели из .rwkvq в норме
+/// (см. `X070Backbone.frozenPassKernels`).
+///
+/// Зачем. После WKV поток идёт в fp32, и каждая поэлементная операция
+/// блока — проход по [B·T, D] в памяти: на 1.5B при T = 512 это ~110
+/// проходов по мегаэлементу на слой, 165–185 мс из 760–775 мс префилла.
+/// `compile` сливает такие цепочки сам, но платит трассировкой на каждую
+/// новую длину промпта; здесь слиты самые длинные, без трассировки.
+public struct FrozenPassKernels: OptionSet, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+    /// group_norm + bonus + gate после WKV — одним ядром (то же, что на
+    /// рекуррентном шаге, на B·T строк). Не побитно: порядок суммирования.
+    public static let tail = FrozenPassKernels(rawValue: 1)
+    /// Нормировка слоя fp32-потока — штатным ядром MLX (как у fp16 и как
+    /// nn.LayerNorm в rwkv-metal), а не ручной формулой из восьми операций.
+    /// Не побитно.
+    public static let layerNorm = FrozenPassKernels(rawValue: 2)
+    /// cmix: relu и квадрат — в fp16, между двумя fp16-матмулами, без
+    /// подъёма [B·T, 4D] в fp32 и обратно. ПОБИТНО то же: квадрат fp16-числа
+    /// точно представим в fp32, округление в fp16 одно в обоих путях.
+    public static let cmix = FrozenPassKernels(rawValue: 4)
+    public static let all: FrozenPassKernels = [.tail, .layerNorm, .cmix]
 }
 
 // ─────────────────── Арифметика блока (единственная копия) ───────────────────
@@ -216,6 +255,16 @@ func rwkvTmixForward(
         }
     }
 
+    // Замороженный слой в норме: group_norm + bonus + gate одним ядром.
+    // bonus — по НЕмаскированному k, как ниже.
+    if case .forward = ctx.wkvPath(T), ctx.frozenKernels.contains(.tail), !ctx.castWKVOutput,
+       wkvTailApplies(headSize: S) {
+        let tail = wkvTail(out, r: r, k: k, v: v, rK: g("r_k"),
+                           lnWeight: g("ln_x.weight"), lnBias: g("ln_x.bias"),
+                           gate: gate, nHead: H, headSize: S, rows: B * T)
+        return (pr(tail.reshaped([B, T, D]), "o_proj.weight"), vFirstOut, hOut)
+    }
+
     // ЕДИНСТВЕННАЯ точка, где fp32 входит в остаточный поток. Ядро считает
     // рекуррентность в fp32 и возвращает fp32; всё, что ниже, — ln_x, bonus,
     // o_proj, следующий слой, голова — наследует этот тип по умолчанию.
@@ -243,19 +292,28 @@ func rwkvCmixForward(_ x: MLXArray, _ ctx: RWKVBlockContext,
                      shiftPrev: MLXArray? = nil) -> MLXArray {
     let xx = rwkvTokenShift(x, shiftPrev)
     let xk = x + xx * ctx.param("cmix.x_k")
+    if case .forward = ctx.wkvPath(x.shape[1]), ctx.frozenKernels.contains(.cmix),
+       let y = ctx.cmixFrozen(xk) { return y }
     let h = relu(ctx.project(xk, "cmix.key.weight"))
     return ctx.project(h * h, "cmix.value.weight")
+}
+
+/// Нормировки слоя штатным ядром MLX — у замороженного слоя в норме.
+func rwkvFrozenLayerNorm(_ ctx: RWKVBlockContext, _ T: Int) -> Bool {
+    if case .forward = ctx.wkvPath(T) { return ctx.frozenKernels.contains(.layerNorm) }
+    return false
 }
 
 /// Полный блок без состояния: (x0, vFirst?) -> (x', vFirstOut).
 func rwkvBlockForward(_ x0: MLXArray, _ vFirst: MLXArray?,
                       _ ctx: RWKVBlockContext) -> (MLXArray, MLXArray) {
+    let fast = rwkvFrozenLayerNorm(ctx, x0.shape[1])
     let (h, vf, _) = rwkvTmixForward(
-        layerNorm(x0, ctx.param("ln1.weight"), ctx.param("ln1.bias")),
+        layerNorm(x0, ctx.param("ln1.weight"), ctx.param("ln1.bias"), fast: fast),
         vFirst, ctx)
     var x = x0 + h
     x = x + rwkvCmixForward(
-        layerNorm(x, ctx.param("ln2.weight"), ctx.param("ln2.bias")), ctx)
+        layerNorm(x, ctx.param("ln2.weight"), ctx.param("ln2.bias"), fast: fast), ctx)
     return (x, vf)
 }
 
@@ -270,11 +328,12 @@ func rwkvBlockForwardWithState(
     hIn: MLXArray?, mask: MLXArray?, tmixPrev: MLXArray?,
     cmixPrev: MLXArray?, endIdx: MLXArray?
 ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
-    let x1 = layerNorm(x0, ctx.param("ln1.weight"), ctx.param("ln1.bias"))
+    let fast = rwkvFrozenLayerNorm(ctx, x0.shape[1])
+    let x1 = layerNorm(x0, ctx.param("ln1.weight"), ctx.param("ln1.bias"), fast: fast)
     let (h, vf, hOut) = rwkvTmixForward(x1, vFirst, ctx, shiftPrev: tmixPrev,
                                         hIn: hIn, mask: mask, wantState: true)
     var x = x0 + h
-    let x2 = layerNorm(x, ctx.param("ln2.weight"), ctx.param("ln2.bias"))
+    let x2 = layerNorm(x, ctx.param("ln2.weight"), ctx.param("ln2.bias"), fast: fast)
     x = x + rwkvCmixForward(x2, ctx, shiftPrev: cmixPrev)
     return (x, vf, hOut!, gatherLast(x1, endIdx), gatherLast(x2, endIdx))
 }
@@ -320,6 +379,12 @@ final class BackboneBlockContext: RWKVBlockContext {
     func groupNormHeads(_ x: MLXArray) -> MLXArray { backbone.groupNormRaw(x) }
 
     var castWKVOutput: Bool { backbone.castWKVOutputToComputeDType }
+
+    var frozenKernels: FrozenPassKernels {
+        backbone.rwkvqBaseDType != nil ? backbone.frozenPassKernels : []
+    }
+
+    func cmixFrozen(_ xk: MLXArray) -> MLXArray? { backbone.cmixFrozen(xk, layer: layer) }
 
     func wkvPath(_ T: Int) -> WKVKernelPath {
         // Намеренно БЕЗ ветки .step на T == 1: одношаговый путь численно

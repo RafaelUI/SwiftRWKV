@@ -45,7 +45,7 @@ func l2norm(_ x: MLXArray) -> MLXArray {
 }
 
 func layerNorm(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
-               eps: Float = 1e-5) -> MLXArray {
+               eps: Float = 1e-5, fast: Bool = false) -> MLXArray {
     // fp16 — норма квантованной базы (.rwkvq): там нормировка идёт штатным
     // ядром MLX, тем же, что у nn.LayerNorm в rwkv-metal. Ручная формула ниже
     // в fp16 копит среднее и дисперсию заметно грубее: на 0.1B это +1.1e-6 KL
@@ -53,7 +53,12 @@ func layerNorm(_ x: MLXArray, _ weight: MLXArray, _ bias: MLXArray,
     // порт встаёт с ним вровень (COMPRESSION: KL между ними ~1e-8).
     // Остальные типы считаются по-прежнему: под ручной формулой сняты все
     // эталоны паритета плотной модели, и сдвигать их незачем.
-    if x.dtype == .float16 { return MLX.layerNorm(x, weight: weight, bias: bias, eps: eps) }
+    // `fast` — то же штатное ядро для fp32-потока (замороженный проход в
+    // норме, см. FrozenPassKernels.layerNorm): один запуск вместо восьми
+    // проходов по [B·T, D]. Числа сдвигаются в пределах порядка суммирования.
+    if x.dtype == .float16 || (fast && x.dtype == .float32) {
+        return MLX.layerNorm(x, weight: weight, bias: bias, eps: eps)
+    }
     let mean = x.mean(axis: -1, keepDims: true)
     let varc = (x - mean).square().mean(axis: -1, keepDims: true)
     let normed = (x - mean) / sqrt(varc + eps)
@@ -290,6 +295,40 @@ public final class X070Backbone {
             }
         }
         return fn([x])[0]
+    }
+
+    /// Что на замороженном параллельном проходе считается слитно (см.
+    /// `FrozenPassKernels`). Действует только в норме (`rwkvqBaseDType !=
+    /// nil`) и только у слоёв вне `trainLayers`; прежний путь базы и плотная
+    /// модель считают как раньше — под ними сняты эталоны. Переключается на
+    /// живом объекте — A/B в одном процессе.
+    public var frozenPassKernels: FrozenPassKernels = .all { didSet { stepVersion &+= 1 } }
+    /// Сколько раз cmix замороженного слоя посчитан в типе базы (счётчик
+    /// для тестов: выход побитно тот же).
+    public internal(set) var cmixFrozenCalls = 0
+
+    /// cmix замороженного слоя: оба матмула и relu² между ними — в fp16.
+    /// nil — когда у key или value есть адаптер, обучаемая подмена, родной
+    /// контейнер или стоковый квант, либо база не fp16.
+    func cmixFrozen(_ xk: MLXArray, layer: Int) -> MLXArray? {
+        guard rwkvqBaseDType == .float16 else { return nil }
+        let keys = ["blocks.\(layer).cmix.key.weight", "blocks.\(layer).cmix.value.weight"]
+        var weights: [() -> MLXArray] = []
+        for wKey in keys {
+            guard quant[wKey] == nil, rwkvqNative[wKey] == nil, wOverride?[wKey] == nil,
+                  loraA[String(wKey.dropLast(7))] == nil else { return nil }
+            if rwkvqKeys[wKey] != nil, rwkvqSidecar != nil {
+                weights.append { [unowned self] in self.rwkvqWeight(wKey, .float16)! }
+            } else if rwkvqDenseTargets.contains(wKey) {
+                weights.append { [unowned self] in self.denseTarget(wKey, .float16) }
+            } else {
+                return nil
+            }
+        }
+        cmixFrozenCalls += 1
+        let h = matmul(xk.asType(.float16), weights[0]().transposed())
+        let s = maximum(h, MLXArray(Float(0)).asType(.float16))
+        return matmul(s * s, weights[1]().transposed()).asType(xk.dtype)
     }
 
     /// Декод sym ядром GEMV (без плотной матрицы) вместо «деквант + матмул».
@@ -797,7 +836,8 @@ public final class X070Backbone {
             x = xo
             vFirst = vf
         }
-        return layerNorm(x, g("ln_out.weight"), g("ln_out.bias"))
+        return layerNorm(x, g("ln_out.weight"), g("ln_out.bias"),
+                         fast: rwkvFrozenLayerNorm(context(cfg.nLayer - 1), ids.shape[1]))
     }
 
     /// Полный forward в логиты: ids [B,T] → logits [B,T,vocab].
@@ -856,7 +896,10 @@ public final class X070Backbone {
             wkvs.append(hOut); tshifts.append(ts); cshifts.append(cs)
         }
 
-        let lnOut = layerNorm(x, g("ln_out.weight"), g("ln_out.bias"))
+        // ln_out — как нормировки последнего слоя: штатным ядром, когда тот
+        // заморожен и считается в норме
+        let lnOut = layerNorm(x, g("ln_out.weight"), g("ln_out.bias"),
+                              fast: rwkvFrozenLayerNorm(context(cfg.nLayer - 1), ids.shape[1]))
         return (lnOut, RWKVBatchState.stacked(wkv: wkvs, tmix: tshifts, cmix: cshifts))
     }
 

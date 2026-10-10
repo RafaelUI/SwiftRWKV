@@ -1094,18 +1094,30 @@ func prefillProfile(_ path: String, _ args: Args) throws {
         let lg = bb.prefill(pre, state: &st); eval(lg); st.eval()
         return Date().timeIntervalSince(t) * 1e3
     }
-    let arms: [(String, Bool, Bool)] = [("нарезка, покомандно", false, false), ("один запуск, покомандно", true, false),
-                                        ("один запуск, собранный", true, true)]
+    let arms: [(String, Bool, Bool, FrozenPassKernels)] = [
+        ("нарезка, покомандно, без слитых", false, false, []),
+        ("один запуск, без слитых", true, false, []),
+        ("+ хвост", true, false, [.tail]),
+        ("+ нормировки", true, false, [.layerNorm]),
+        ("+ cmix", true, false, [.cmix]),
+        ("все слитые (умолчание)", true, false, .all),
+        ("все слитые, собранный", true, true, .all),
+    ]
     var ts = [[Double]](repeating: [], count: arms.count)
-    for (_, s, c) in arms { _ = whole(s, c); _ = whole(s, c) }
+    func arm(_ i: Int) -> Double {
+        bb.frozenPassKernels = arms[i].3
+        defer { bb.frozenPassKernels = .all }
+        return whole(arms[i].1, arms[i].2)
+    }
+    for i in 0 ..< arms.count { _ = arm(i); _ = arm(i) }
     for round in 0 ..< 7 {
         for i in (round % 2 == 0 ? Array(0 ..< arms.count) : Array((0 ..< arms.count).reversed())) {
-            ts[i].append(whole(arms[i].1, arms[i].2))
+            ts[i].append(arm(i))
         }
     }
-    print("префилл целиком (голова на 1 позиции), медиана 7: "
-        + zip(arms, ts).map { String(format: "%@ %.1f мс", $0.0.0, median($0.1)) }.joined(separator: " | "))
-    print(String(format: "остальное (один запуск, покомандно - проекции тела - WKV): %.1f мс", median(ts[1]) - tLin - tWkv))
+    print("префилл целиком (голова на 1 позиции), медиана 7:")
+    for (a, t) in zip(arms, ts) { print(String(format: "   %@: %.1f мс", a.0, median(t))) }
+    print(String(format: "остальное (умолчание - проекции тела - WKV): %.1f мс", median(ts[5]) - tLin - tWkv))
 }
 
 if let path = args.loadProfile {

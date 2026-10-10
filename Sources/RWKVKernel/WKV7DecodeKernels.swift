@@ -101,10 +101,12 @@ public func wkvTailApplies(headSize S: Int) -> Bool { S % 32 == 0 }
 ///
 /// wkv, r, k, v — [H, S]; g — [1, D]; r_k, ln_w, ln_b — любой формы на
 /// D = H·S элементов. Возвращает [1, D] fp32 — готовый вход o_proj.
+/// При `rows: N` всё то же на N строк: wkv, r, k, v, g — по N·D элементов,
+/// выход [N, D].
 public func wkvTail(
     _ wkv: MLXArray, r: MLXArray, k: MLXArray, v: MLXArray,
     rK: MLXArray, lnWeight: MLXArray, lnBias: MLXArray, gate: MLXArray,
-    nHead H: Int, headSize S: Int, eps: Float = 64e-5
+    nHead H: Int, headSize S: Int, rows N: Int = 1, eps: Float = 64e-5
 ) -> MLXArray {
     precondition(wkvTailApplies(headSize: S), "хвост: S=\(S) не кратен ширине simd-группы")
     let D = H * S
@@ -162,12 +164,15 @@ public func wkvTail(
         )
         tailKernelCache[key] = kern
     }
-    let inputs = [wkv.reshaped([1, D]), r.reshaped([1, D]), k.reshaped([1, D]), v.reshaped([1, D]),
+    // N строк (токенов) одним запуском: группа потоков на пару (строка,
+    // голова), ядро то же. На рекуррентном шаге N = 1, на параллельном
+    // проходе N = B·T.
+    let inputs = [wkv.reshaped([N, D]), r.reshaped([N, D]), k.reshaped([N, D]), v.reshaped([N, D]),
                   rK.reshaped([D]), lnWeight.reshaped([D]), lnBias.reshaped([D]),
-                  gate.reshaped([1, D])].map { $0.asType(.float32) }
+                  gate.reshaped([N, D])].map { $0.asType(.float32) }
     return kern(inputs,
-                grid: (H * 32, 1, 1),
+                grid: (N * H * 32, 1, 1),
                 threadGroup: (32, 1, 1),
-                outputShapes: [[1, D]],
+                outputShapes: [[N, D]],
                 outputDTypes: [.float32])[0]
 }
