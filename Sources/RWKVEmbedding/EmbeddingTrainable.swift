@@ -83,8 +83,27 @@ public enum EmbeddingTrainable {
     /// градиент до весов базы просто не дотечёт, а лосс при этом будет
     /// исправно убывать за счёт одной головы. Связывать это с выбором
     /// режима в одном месте безопаснее, чем оставлять вызывающему.
+    /// Почему режим к ЭТОЙ базе неприменим; nil — применим.
+    ///
+    /// У базы из `.rwkvq` проекции — сжатые коды, а не веса: в обучаемое
+    /// множество они не входят. `.full` и `.topLayers` на ней молча обучали
+    /// бы одни нормы и смешивания (в fp16), называясь при этом «вся база», —
+    /// лосс убывает, а обещанного режима нет. Квантованной базе подходят
+    /// `.frozen` и `.lora` (QLoRA: база остаётся сжатой).
+    public static func unsupportedReason(model: EmbeddingModel,
+                                         mode: BaseTrainingMode) -> String? {
+        guard !model.backbone.rwkvqBackedKeys.isEmpty else { return nil }
+        switch mode {
+        case .frozen, .lora: return nil
+        case .topLayers, .full:
+            return "режим \(mode) на квантованной базе: проекции — сжатые коды и в обучаемое "
+                + "множество не входят; квантованной базе — .frozen либо .lora"
+        }
+    }
+
     public static func make(model: EmbeddingModel,
                             mode: BaseTrainingMode) -> TrainableSet {
+        if let why = unsupportedReason(model: model, mode: mode) { preconditionFailure(why) }
         let bb = model.backbone
         let headSet = EmbeddingHeadTrainableSet(model.head)
 

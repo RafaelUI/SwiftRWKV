@@ -94,16 +94,8 @@ func runBench(inputPath: String, modelPath: String, vocabPath: String,
     let inp = try JSONDecoder().decode(BenchInput.self, from: raw)
 
     var t = Date()
-    let weights = try loadArrays(url: URL(fileURLWithPath: expand(modelPath)))
-    let nLayer = weights.keys.compactMap { k -> Int? in
-        guard k.hasPrefix("blocks.") else { return nil }
-        return Int(k.split(separator: ".")[1])
-    }.max().map { $0 + 1 } ?? 0
-    let cfg = X070Config(nLayer: nLayer,
-                         nEmbd: weights["ln_out.weight"]!.shape[0],
-                         headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
-                         vocab: weights["head.weight"]!.shape[0])
-    let backbone = X070Backbone(weights: weights, cfg: cfg)
+    let backbone = try loadBase(modelPath)
+    let cfg = backbone.cfg
     guard let tok = WorldTokenizer(
             vocabURL: URL(fileURLWithPath: expand(vocabPath))) else {
         print("не удалось прочитать словарь"); exit(2)

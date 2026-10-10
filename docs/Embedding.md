@@ -334,6 +334,35 @@ it.
 
 The last row is causality, and it is exact rather than approximate.
 
+### On a quantised base (`.rwkvq`)
+
+`EmbeddingModel(backbone:)` takes a backbone opened with
+`X070Backbone.load(fromRwkvq:)`. Two modes apply: `.frozen` and `.lora`
+(QLoRA — the base stays compressed, gradients reach the adapters through the
+quantised projections). `.full` and `.topLayers` are refused: the projections
+are codes, not weights (`EmbeddingTrainable.unsupportedReason`).
+
+`embed-run` measures one stage end to end. 0.1B, LitRetrieval retrieval rows:
+2000 train, 300 held out (a pool of 600 candidates), 200 steps of 8 triplets,
+256 tokens, rank-8 adapters on every layer, lr 5e-4, **single run**:
+
+| base | MRR before | MRR after | recall@10 | s / step | MLX peak |
+|---|---|---|---|---|---|
+| dense + LoRA | 0.014 | 0.614 | 0.800 | 3.59 | 7.80 GB |
+| REDUCTION + QLoRA | 0.022 | 0.645 | 0.847 | 3.52 | 6.93 GB |
+| COMPRESSION + QLoRA | 0.029 | 0.693 | 0.873 | 3.47 | 6.93 GB |
+
+What this establishes is that a quantised base fine-tunes no worse than the
+dense one; one seed does not order the three rows. Training the head alone on
+a frozen base does not move the metric in 300 steps on either base.
+
+Vectors from the quantised path stay at cosine 0.9999 to the same weights run
+densely.
+
+Evaluation and serving always take the forward path, whatever is being
+trained (`X070Backbone.withoutGradientPath`): the differentiable kernel needs
+a length that is a multiple of 16, and a text has whatever length it has.
+
 Two things worth knowing before benchmarking anything here:
 
 **Batch length alignment is not a bitwise identity.** Training batches are

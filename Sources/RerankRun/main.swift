@@ -117,6 +117,43 @@ func parseArgs() -> Args {
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
 
+/// База реранкера: плотная модель (.safetensors, имена x070) либо
+/// квантованная — `.rwkvq` нынешних пресетов rwkv-quant.
+func loadBase(_ path: String) throws -> X070Backbone {
+    let p = expand(path)
+    if p.hasSuffix(".rwkvq") {
+        let bb = try X070Backbone.load(fromRwkvq: p)
+        // RERANK_BASE_PLAIN=1 — база без слитого замороженного прохода и без
+        // короткого прохода ядрами: плечо сравнения «только квантование».
+        if ProcessInfo.processInfo.environment["RERANK_BASE_PLAIN"] == "1" {
+            bb.frozenPassKernels = []
+            bb.shortPassKernelRows = 0
+        }
+        // RERANK_BASE_DEQUANT=1 — те же КВАНТОВАННЫЕ веса, развёрнутые в плотную
+        // bf16-модель: плечо «цена самого квантования при плотном счёте».
+        if ProcessInfo.processInfo.environment["RERANK_BASE_DEQUANT"] == "1" {
+            var w: [String: MLXArray] = [:]
+            for key in bb.allWeightKeys { w[key] = bb.weight(key).asType(.bfloat16) }
+            eval(Array(w.values))
+            print("база из .rwkvq, развёрнутая в плотную bf16 (\(w.count) весов)")
+            return X070Backbone(weights: w, cfg: bb.cfg)
+        }
+        print("база из .rwkvq: emb \(bb.rwkvqEmbTable == nil ? "плотный" : "сжатый"), "
+              + "короткий проход ядрами до \(bb.shortPassKernelRows) строк")
+        return bb
+    }
+    let weights = try loadArrays(url: URL(fileURLWithPath: p))
+    let nLayer = weights.keys.compactMap { k -> Int? in
+        guard k.hasPrefix("blocks.") else { return nil }
+        return Int(k.split(separator: ".")[1])
+    }.max().map { $0 + 1 } ?? 0
+    let cfg = X070Config(nLayer: nLayer,
+                         nEmbd: weights["ln_out.weight"]!.shape[0],
+                         headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                         vocab: weights["head.weight"]!.shape[0])
+    return X070Backbone(weights: weights, cfg: cfg)
+}
+
 // ── Отчёт ───────────────────────────────────────────────────────────────
 
 final class Report {
@@ -269,16 +306,8 @@ report.set("data", ["rows": rows.count, "pool": pool.count,
                     "languages": langs.count])
 
 print("\n── модель ──")
-let weights = try loadArrays(url: URL(fileURLWithPath: expand(args.model)))
-let nLayer = weights.keys.compactMap { k -> Int? in
-    guard k.hasPrefix("blocks.") else { return nil }
-    return Int(k.split(separator: ".")[1])
-}.max().map { $0 + 1 } ?? 0
-let cfg = X070Config(nLayer: nLayer,
-                     nEmbd: weights["ln_out.weight"]!.shape[0],
-                     headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
-                     vocab: weights["head.weight"]!.shape[0])
-let backbone = X070Backbone(weights: weights, cfg: cfg)
+let backbone = try loadBase(args.model)
+let cfg = backbone.cfg
 guard let tokenizer = WorldTokenizer(
         vocabURL: URL(fileURLWithPath: expand(args.vocab))) else {
     print("не удалось прочитать словарь \(args.vocab)")

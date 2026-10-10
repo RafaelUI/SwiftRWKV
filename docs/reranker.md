@@ -474,6 +474,33 @@ The spread for layer 11 is four times that of layer 5. The worse
 configuration is also the noisier one — exactly the case where a single run
 misleads the most.
 
+### On a quantised base (`.rwkvq`)
+
+`rerank-run --model m.rwkvq` takes the REDUCTION and COMPRESSION presets of
+rwkv-quant directly; the base stays compressed. Another corpus than above
+(LitRetrieval, Russian literature), 400 queries × 8 candidates, 120 held out,
+256 document tokens, **four seeds**, MRR:
+
+| base | layer 5, 32 epochs | layer 11, 32 epochs | layer 11, 16 epochs |
+|---|---|---|---|
+| dense | 0.949 ± 0.004 | 0.865 ± 0.009 | 0.876 |
+| REDUCTION | 0.942 ± 0.007 | 0.847 ± 0.016 | 0.813 |
+| COMPRESSION | 0.945 ± 0.006 | 0.854 ± 0.018 | 0.818 |
+
+The head on a quantised base **learns more slowly** and ends up in the same
+place: within one spread on layer 5, about one spread on layer 11. With a
+short schedule the gap is large (one seed, 8 epochs, layer 11: 0.59 against
+0.89), so an epoch count tuned on the dense base does not carry over.
+
+The cost is that of quantisation, not of the quantised arithmetic: the same
+quantised weights run as a dense model score 0.803 where the compressed path
+scores 0.813 (layer 11, 16 epochs).
+
+Scores are less reproducible across batch sizes than on a dense base: about
+1% of the score range between batch 1 and batch 8, against 1e-4. The
+quantised path multiplies in fp16 with fp16 accumulation; a dense model, even
+with fp16 weights, multiplies in fp32. Trained-head quality does not see it.
+
 ### Serving versus training
 
 The head trained on **states** from a cache and is applied to **text**. 80

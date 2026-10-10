@@ -47,6 +47,9 @@ let package = Package(
         // Замер декодирования: плотная база против .rwkvq, чередованием.
         //   swift run -c release decode-bench
         .executable(name: "decode-bench", targets: ["DecodeBench"]),
+        // Прогон эмбеддера: оценка и одна стадия дообучения на плотной базе
+        // либо на базе из .rwkvq.
+        .executable(name: "embed-run", targets: ["EmbedRun"]),
     ],
     dependencies: [
         .package(
@@ -133,6 +136,11 @@ let package = Package(
         // собирает в debug, а замер производительности в debug — это
         // замер отладочной сборки, не кода. Здесь запуск возможен только
         // как `swift run -c release decode-bench`.
+        .executableTarget(
+            name: "EmbedRun",
+            dependencies: ["RWKVEmbedding", "RWKVGen",
+                           .product(name: "MLX", package: "mlx-swift")]
+        ),
         .executableTarget(
             name: "DecodeBench",
             dependencies: ["RWKVGen", "RWKVQuant",
