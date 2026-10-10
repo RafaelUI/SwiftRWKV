@@ -41,6 +41,11 @@ run "порядок чтения от мелких к крупным" \
 run "сведённая группа сводится повторно" \
     "$SG" 'for (id, keys) in groups where fused[id] == nil {' 'for (id, keys) in groups {'
 
+run "чтение вперёд просится для всего файла" \
+    "$RF" 'return want?(String(name[..<r.lowerBound])) ?? true' 'return true'
+run "чтение вперёд не просится" \
+    "$RF" 'guard RwkvqContainer.readAheadEnabled else { return }' 'guard false else { return }'
+
 echo
 echo "── порядок загрузки ──"
 run "r/k/v при чтении не сводятся (копия при подключении)" \

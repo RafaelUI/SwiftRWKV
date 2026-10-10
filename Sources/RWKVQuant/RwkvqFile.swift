@@ -110,6 +110,37 @@ public struct RwkvqContainer {
 
     public var names: [String] { entries.keys.sorted() }
 
+    /// Просить ли ядро системы читать буферы ВПЕРЁД (см. `readAhead(where:)`).
+    /// Выключатель — для замера в обе стороны.
+    nonisolated(unsafe) public static var readAheadEnabled = true
+    /// Скольким буферам подсказка дана (счётчик для тестов: ускорение
+    /// холодного чтения не видно ничем, кроме замера времени).
+    nonisolated(unsafe) public internal(set) static var readAheadBuffers = 0
+
+    /// Подсказка системе: эти буферы сейчас будут прочитаны целиком.
+    ///
+    /// Файл отображён в память, и без подсказки холодный файл читается
+    /// страничными отказами — мелкими порциями, по мере того как копия в MLX
+    /// до них доходит: 1.44 ГБ за 2.6–2.9 с, то есть ~0.5 ГБ/с на диске,
+    /// который отдаёт в разы больше. С подсказкой система читает диапазон
+    /// крупными запросами и заранее, пока идёт сборка. На прогретом кеше
+    /// страниц вызов ничего не стоит. Память процесса не растёт: страницы
+    /// файла — кеш системы, а не footprint.
+    public func readAhead(where want: (String) -> Bool) {
+        guard RwkvqContainer.readAheadEnabled else { return }
+        let page = Int(getpagesize())
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            for (name, e) in entries where !e.range.isEmpty && want(name) {
+                let lo = (e.range.lowerBound / page) * page
+                if madvise(UnsafeMutableRawPointer(mutating: base + lo), e.range.upperBound - lo,
+                           MADV_WILLNEED) == 0 {
+                    RwkvqContainer.readAheadBuffers += 1
+                }
+            }
+        }
+    }
+
     public func contains(_ name: String) -> Bool { entries[name] != nil }
 
     public func shape(_ name: String) -> [Int]? { entries[name]?.shape }
@@ -244,6 +275,20 @@ extension RwkvqSidecar {
         var arrays: [String: MLXArray] = [:]
         var infos: [String: RwkvqTensorInfo] = [:]
 
+        // буферы запрошенных тензоров ("<ключ>::<поле>") — читать вперёд
+        box.readAhead { name in
+            guard let r = name.range(of: "::") else { return false }
+            return want?(String(name[..<r.lowerBound])) ?? true
+        }
+
+        // Перекладка оставляет исходные буферы тензора в кеше MLX. Буферы
+        // одного размера (слои одной формы) оттуда же и переиспользуются, а
+        // крупные одиночные (голова, cmix) лежали бы до конца загрузки:
+        // на 1.5B COMPRESSION это +0.2 ГБ footprint в момент окончания.
+        func releaseTransients(_ bytes: Int) {
+            if bytes >= 8 << 20 { GPU.clearCache() }
+        }
+
         func process(_ key: String) throws {
             guard let m = tensorDict[key] as? [String: Any],
                   let shape = m["shape"] as? [Int],
@@ -350,6 +395,7 @@ extension RwkvqSidecar {
                     // загрузки рядом с интерливом.
                     eval(k3.qblk, k3.qsqm, k3.ddm)
                     precondition(k3.xbits == xbits)
+                    releaseTransients(k3.qblk.size)
                     arrays["\(key)::qblk"] = k3.qblk
                     arrays["\(key)::qsqm"] = k3.qsqm
                     arrays["\(key)::ddm"] = k3.ddm
@@ -399,6 +445,7 @@ extension RwkvqSidecar {
                             try need("gw_qh2").reshaped([OUT, NP, 4]),
                         ], axis: 2).reshaped([OUT, NP * 24])
                         eval(qblk)
+                        releaseTransients(qblk.size)
                     }
                     arrays["\(key)::qblk"] = qblk
                     arrays["\(key)::qs"] = try need("gw_qs", as: .uint8)

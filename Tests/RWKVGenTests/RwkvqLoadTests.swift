@@ -114,6 +114,27 @@ final class RwkvqLoadTests: XCTestCase {
         }
     }
 
+    /// Чтение вперёд просится ровно для буферов запрошенных тензоров — и не
+    /// просится при выключателе. Само ускорение (холодный файл 1.5B: 2.2–2.9
+    /// → 1.2 с) меряется замером; тест стережёт, что подсказка не потеряна.
+    func testReadAheadCoversExactlyTheAskedBuffers() throws {
+        let path = try RwkvqFileTests.sourcePath("compression")
+        let box = try RwkvqContainer(path: path)
+        let want: Set<String> = ["head.weight", "blocks.3.att.key.weight", "blocks.0.att.w1"]
+        let expected = box.names.filter { name in
+            want.contains(String(name[..<name.range(of: "::")!.lowerBound])) && box.shape(name)!.reduce(1, *) > 0
+        }.count
+        XCTAssertGreaterThan(expected, 8)
+        var before = RwkvqContainer.readAheadBuffers
+        _ = try RwkvqSidecar(rwkvq: path, only: { want.contains($0) })
+        XCTAssertEqual(RwkvqContainer.readAheadBuffers - before, expected)
+        before = RwkvqContainer.readAheadBuffers
+        RwkvqContainer.readAheadEnabled = false
+        defer { RwkvqContainer.readAheadEnabled = true }
+        _ = try RwkvqSidecar(rwkvq: path, only: { want.contains($0) })
+        XCTAssertEqual(RwkvqContainer.readAheadBuffers, before, "выключатель чтения вперёд не действует")
+    }
+
     /// Сведение r/k/v при чтении даёт те же буферы, что сведение готовой
     /// базы, и повторно не сводится.
     func testFusingAtReadEqualsFusingAfter() throws {

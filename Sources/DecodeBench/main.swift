@@ -163,6 +163,7 @@ func parseArgs() -> Args {
         case "--gemv-micro": a.gemvMicro = it.next()
         case "--step-profile": a.stepProfile = it.next()
         case "--load-profile": a.loadProfile = it.next()
+        case "--no-read-ahead": RwkvqContainer.readAheadEnabled = false
         case "--prefill-profile": a.prefillProfile = it.next()
         default:
             print("неизвестный аргумент \(k)")
@@ -1022,6 +1023,9 @@ func loadProfile(_ path: String, _ args: Args) throws {
     print(String(format: "загрузка %.2f с | MLX активная %.3f, кеш %.3f, пик %.3f ГБ | footprint +%.3f ГБ | emb %@",
                  dt, gb(GPU.activeMemory), gb(GPU.cacheMemory), gb(GPU.peakMemory),
                  processFootprintGB() - f0, bb.rwkvqEmbTable == nil ? "плотный" : "сжатый (строки выборкой)"))
+    // освобождённое при загрузке Metal возвращает системе не сразу
+    Thread.sleep(forTimeInterval: 1.0)
+    print(String(format: "через 1 с: footprint +%.3f ГБ", processFootprintGB() - f0))
 }
 
 /// Префилл T=512 по статьям, тем же способом, что эталон
