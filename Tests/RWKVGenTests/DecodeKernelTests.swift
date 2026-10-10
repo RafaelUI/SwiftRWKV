@@ -99,6 +99,11 @@ final class DecodeKernelTests: XCTestCase {
             bb.useStepKernels = true
             let fused = Self.steps(bb, ids)
             XCTAssertEqual(bb.stepKernelCalls, ids.count * 12, "\(preset): ядра шага на каждом слое")
+            // Ветки gate / v / a / w при fp32-входе считаются с приведением
+            // ВХОДА: 8 матмулов на слой, кроме слоя 0 (вход ещё в типе матриц,
+            // приводить нечего; ветки v у него нет). Числа от этого не выходят
+            // за допуск, поэтому стережёт ускорение только этот счётчик.
+            XCTAssertEqual(bb.narrowBranchCalls, ids.count * 11 * 8, "\(preset): ветки считаются с повышением матрицы")
             let kl = RwkvqModelTests.kl(plain, fused)
             let same = (argMax(plain, axis: -1) .== argMax(fused, axis: -1)).asType(.int32).sum().item(Int.self)
             print(String(format: "ЯДРА ШАГА %@: KL(покомандный‖ядра) %.3e, top-1 %d из %d", preset, kl, same, ids.count))

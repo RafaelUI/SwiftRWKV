@@ -70,12 +70,19 @@ public struct GenerationConfig: Sendable {
     /// сгенерировала, а не то, что ей дали.
     public var penalizePrompt: Bool
     public var sampling: SamplingConfig
+    /// Конвейерный декод (см. `GreedyDecodePipeline`): следующий шаг
+    /// считается на GPU, пока CPU обрабатывает текущий токен. Действует
+    /// только при жадном выборе без штрафов; токены, текст и состояние те же
+    /// побитно, меняется только время.
+    public var pipelined: Bool
 
     public init(maxTokens: Int = 128,
                 stopStrings: [String] = [],
                 stopTokens: Set<Int> = [],
                 penalizePrompt: Bool = false,
-                sampling: SamplingConfig = .greedy) {
+                sampling: SamplingConfig = .greedy,
+                pipelined: Bool = true) {
+        self.pipelined = pipelined
         precondition(maxTokens > 0, "maxTokens обязан быть > 0")
         precondition(!stopStrings.contains(""),
                      "пустая стоп-строка остановила бы генерацию на первом же токене")
@@ -110,6 +117,9 @@ extension X070Backbone {
         if config.penalizePrompt { for id in prompt { sampler.observe(id) } }
 
         var logits = prefill(prompt, state: &state)
+        var pipeline: GreedyDecodePipeline? =
+            config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes
+            ? GreedyDecodePipeline(logits: logits, state: state) : nil
 
         var produced: [Int] = []
         var fed = 0                      // сколько выданных токенов поглотило state
@@ -122,8 +132,17 @@ extension X070Backbone {
         let holdBack = config.stopStrings.map { $0.utf8.count }.max().map { $0 - 1 } ?? 0
 
         loop: for _ in 0 ..< config.maxTokens {
-            let id = sampler.next(logits)
-            produced.append(id)
+            let id: Int
+            if pipeline != nil {
+                // токен t выдан, шаг по нему уже в очереди: state его включает
+                id = pipeline!.next(self, state: &state)
+                sampler.observe(id)
+                produced.append(id)
+                fed = produced.count
+            } else {
+                id = sampler.next(logits)
+                produced.append(id)
+            }
 
             if config.stopTokens.contains(id) {
                 reason = .stopToken(id)
@@ -155,8 +174,10 @@ extension X070Backbone {
                 }
             }
 
-            logits = step(id, state: &state)
-            fed = produced.count
+            if pipeline == nil {
+                logits = step(id, state: &state)
+                fed = produced.count
+            }
         }
 
         // Догнать состояние: выход по break пропускает step последнего токена.

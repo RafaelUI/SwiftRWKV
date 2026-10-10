@@ -890,6 +890,42 @@ func appBench(_ path: String, _ args: Args) throws {
     print(String(format: "декод: медиана %.2f мс/ток = %.1f ток/с (раунды %@); MLX активная %.2f, пик %.2f ГБ; footprint %.2f ГБ",
                  median(ms), 1e3 / median(ms), ms.map { String(format: "%.2f", $0) }.joined(separator: " "),
                  Double(GPU.activeMemory) / 1e9, Double(GPU.peakMemory) / 1e9, processFootprintGB()))
+    // конвейер против синхронного жадного декода, чередованием: свободная
+    // генерация от одного и того же состояния, 64 токена на раунд
+    let start = state
+    let startLogits = bb.step(dec[71], state: &state); eval(startLogits); state.eval()
+    let after = state
+    func greedy(_ pipelined: Bool) -> (Double, [Int]) {
+        var st = after
+        var out: [Int] = []
+        let t = Date()
+        if pipelined {
+            var pipe = GreedyDecodePipeline(logits: startLogits, state: st)
+            for _ in 0 ..< 64 { out.append(pipe.next(bb, state: &st)) }
+        } else {
+            var lg = startLogits
+            for _ in 0 ..< 64 {
+                let id = argMax(lg, axis: -1).item(Int.self)
+                out.append(id)
+                lg = bb.step(id, state: &st)
+            }
+        }
+        st.eval()
+        return (Date().timeIntervalSince(t) * 1e3 / 64, out)
+    }
+    _ = start
+    _ = greedy(true); _ = greedy(false)
+    var mp: [Double] = [], msync: [Double] = []
+    var same = true
+    for r in 0 ..< 6 {
+        for p in (r % 2 == 0 ? [true, false] : [false, true]) {
+            let (t, toks) = greedy(p)
+            if p { mp.append(t) } else { msync.append(t) }
+            if r == 0, p { same = toks == greedy(false).1 }
+        }
+    }
+    print(String(format: "жадная генерация: синхронно %.2f мс/ток | конвейером %.2f мс/ток (%.1f ток/с) | отношение %.3f; токены %@",
+                 median(msync), median(mp), 1e3 / median(mp), median(mp) / median(msync), same ? "совпали" : "РАЗОШЛИСЬ"))
 }
 
 /// Все проекции одного токена ядрами GEMV, без остального шага.

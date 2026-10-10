@@ -69,6 +69,53 @@ public struct RWKVState {
     public mutating func eval() {
         MLX.eval(wkv + tmixPrev + cmixPrev + (vFirst.map { [$0] } ?? []))
     }
+
+    /// Все массивы состояния (для постановки в очередь вычисления).
+    var arrays: [MLXArray] { wkv + tmixPrev + cmixPrev + (vFirst.map { [$0] } ?? []) }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+//  Конвейерный жадный декод.
+//
+//  При `eval` на каждом токене GPU простаивает, пока CPU читает выбранный
+//  токен, строит граф следующего шага и кодирует его запуски. Конвейер
+//  (порт rwkv_quant/backends/metal/generate.py, как generate_step в mlx_lm):
+//  токен остаётся МАССИВОМ на GPU, граф шага t+1 строится от него и ставится
+//  в очередь `asyncEval`, ПОКА GPU считает токен t; ждём только готовности t.
+//
+//  Граф и его входы те же, что у синхронного пути, поэтому токены, логиты и
+//  состояние обязаны совпасть ПОБИТНО — меняется расписание, не счёт.
+//
+//  Цена: один шаг всегда посчитан «вперёд». При досрочной остановке его
+//  токен выбрасывается, а состояние как раз то, что нужно: оно уже включает
+//  последний выданный токен.
+//
+//  Только жадный выбор без штрафов: сэмплер с температурой и штрафами живёт
+//  на CPU (свой воспроизводимый генератор случайных чисел), и следующий
+//  токен до чтения текущего там неизвестен.
+// ───────────────────────────────────────────────────────────────────────
+
+public struct GreedyDecodePipeline {
+    private var token: MLXArray          // токен, который будет выдан следующим; уже в очереди
+
+    /// - logits: логиты `[vocab]`, по которым выбирается первый токен
+    ///   (например, результат `prefill`); `state` — состояние после них.
+    public init(logits: MLXArray, state: RWKVState) {
+        token = argMax(logits, axis: -1).reshaped([1]).asType(.int32)
+        asyncEval([token] + state.arrays)
+    }
+
+    /// Выдать очередной токен. К возврату `state` уже включает его (шаг по
+    /// нему поставлен в очередь), а следующий токен считается на GPU.
+    public mutating func next(_ model: X070Backbone, state: inout RWKVState) -> Int {
+        let logits = model.step(token, state: &state)
+        let upcoming = argMax(logits, axis: -1).reshaped([1]).asType(.int32)
+        asyncEval([upcoming] + state.arrays)
+        let id = token.item(Int.self)    // ждём только готовности текущего
+        token = upcoming
+        model.pipelinedSteps += 1
+        return id
+    }
 }
 
 extension X070Backbone {
@@ -177,9 +224,9 @@ extension X070Backbone {
         // прежний — под ним сняты эталоны декода.
         let narrow = useStepKernels && rwkvqBaseDType != nil
         func lin(_ y: MLXArray, _ m: MLXArray) -> MLXArray {
-            narrow && y.dtype != m.dtype
-                ? matmul(y.asType(m.dtype), m.transposed()).asType(y.dtype)
-                : matmul(y, m.transposed())
+            guard narrow, y.dtype != m.dtype else { return matmul(y, m.transposed()) }
+            narrowBranchCalls += 1
+            return matmul(y.asType(m.dtype), m.transposed()).asType(y.dtype)
         }
         func lin(_ y: MLXArray, _ m: MLXArray, _ bias: MLXArray) -> MLXArray { lin(y, m) + bias }
 

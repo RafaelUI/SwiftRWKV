@@ -1,6 +1,7 @@
 #!/bin/bash
 # Мутационная проверка ядер декода 11.10: GEMV sb6, шаг WKV и хвост tmix
-# одним запуском, и того, где они включаются.
+# одним запуском, ветки шага в типе матриц, конвейерный декод -- и того, где
+# они включаются.
 #
 #   ./Scripts/mutations_decode_kernels.sh [фильтр тестов]
 set -uo pipefail
@@ -13,7 +14,7 @@ BB=Sources/RWKVGen/X070Backbone.swift
 GN=Sources/RWKVGen/X070Generation.swift
 LD=Sources/RWKVGen/RwkvqStandaloneLoad.swift
 
-FILTER="${1:-RwkvqSb6GEMVTests|DecodeKernelTests|RwkvqModelTests}"
+FILTER="${1:-RwkvqSb6GEMVTests|DecodeKernelTests|RwkvqModelTests|GeneratePipelineTests}"
 run() {
     local desc="$1"; shift
     printf '%-60s ' "$desc"
@@ -68,11 +69,29 @@ run "умолчание загрузки — родной контейнер" \
           'useNativeKernel: Bool = true) throws -> X070Backbone {
         try load(fromSidecar: try RwkvqSidecar.open(path)'
 
+run "ветки шага считаются с повышением матрицы до fp32" \
+    "$GN" 'guard narrow, y.dtype != m.dtype else { return matmul(y, m.transposed()) }' \
+          'guard false, y.dtype != m.dtype else { return matmul(y, m.transposed()) }'
+
+echo
+echo "── конвейерный декод ──"
+GE=Sources/RWKVGen/Generate.swift
+run "конвейер выдаёт токен на шаг вперёд" \
+    "$GN" 'let id = token.item(Int.self)    // ждём только готовности текущего' 'let id = upcoming.item(Int.self)'
+run "после конвейера состояние догоняется второй раз" \
+    "$GE" '                produced.append(id)
+                fed = produced.count
+            } else {' '                produced.append(id)
+            } else {'
+run "конвейер включается при штрафах" \
+    "$GE" 'config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes' \
+          'config.pipelined && config.sampling.isGreedy'
+run "конвейер включается при температуре" \
+    "$GE" 'config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes' \
+          'config.pipelined && !config.sampling.penalizes'
+run "флаг pipelined не читается" \
+    "$GE" 'config.pipelined && config.sampling.isGreedy && !config.sampling.penalizes' \
+          'config.sampling.isGreedy && !config.sampling.penalizes'
+
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."
-echo
-echo "ЗАМЕЧАНИЕ. Мутация «низкоранговые ветки шага считаются с повышением"
-echo "матрицы до fp32» (narrow = false в tmixStep) здесь намеренно ОТСУТСТВУЕТ:"
-echo "она возвращает счёт до правки, числа остаются в допусках (KL порядка"
-echo "1e-6), меняется только время — 1.5B COMPRESSION 16.8 -> 13.7 мс/ток."
-echo "Тесты скорость не меряют; её стережёт decode-bench --step-profile."
