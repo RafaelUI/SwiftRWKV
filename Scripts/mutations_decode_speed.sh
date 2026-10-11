@@ -65,8 +65,8 @@ run "голова на генерации считается в fp16" \
 echo
 echo "── обратное ядро WKV ──"
 run "примелы идут в обратное ядро в своих типах" \
-    "$WK" '[r,w,k,v,a,b].map { $0.asType(.float32) }
-                    + [hCkpts,saFwd,dOut.asType(.float32),dHOut],' '[r,w,k,v,a,b,hCkpts,saFwd,dOut.asType(.float32),dHOut],'
+    "$WK" 'primals[0 ..< 6].map { $0.asType(.float32) } + [hCkpts, saFwd, dOut.asType(.float32), dH],' \
+          'Array(primals[0 ..< 6]) + [hCkpts, saFwd, dOut.asType(.float32), dH],'
 
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

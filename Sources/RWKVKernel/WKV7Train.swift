@@ -34,11 +34,25 @@ private func ckptFwdKernel(H: Int, T: Int) -> MLXFastKernel {
     constant uint N_CHUNKS_C  = \(N);
     constant uint H_C         = \(H);
     """
-    // дословно из _get_ckpt_fwd
+    // Из _get_ckpt_fwd (wkv7_checkpoint.py), нынешняя редакция:
+    //  • a / w / k / b / r одинаковы для всех 64 потоков группы — читаются из
+    //    глобальной памяти один раз и раздаются через threadgroup (без этого
+    //    каждое значение читалось 64 раза; в rwkv-metal это стоило половины
+    //    времени ядра, здесь замерено 58 → 28 мс на 24 слоя 1.5B при T = 512);
+    // Порядок сложения НЕ тронут (в rwkv-metal суммы ещё и разорваны на восемь
+    // аккумуляторов, ~4e-8 сдвига): выход обязан остаться ПОБИТНО равным
+    // замороженному ядру — на этом стоит согласие кэша состояний с обучением
+    // (WKV7StateTests.testForwardAndTrainAgreeOnState). Разрыв сумм мерился:
+    // см. NEXT_SESSION.
+    // Память threadgroup: 5 × 64 float = 1280 байт (Metal считает вдвое —
+    // 2560 при пределе 32768).
     let source = """
-        uint dv = thread_position_in_grid.y;
-        uint bhi = thread_position_in_grid.x;
-        uint bi = bhi / H_C, hi = bhi % H_C;
+        uint dv  = thread_position_in_threadgroup.y;
+        uint bhi = threadgroup_position_in_grid.x;
+        uint bi  = bhi / H_C, hi = bhi % H_C;
+
+        threadgroup float a_sh[HEAD_SIZE_C], w_sh[HEAD_SIZE_C], k_sh[HEAD_SIZE_C];
+        threadgroup float b_sh[HEAD_SIZE_C], r_sh[HEAD_SIZE_C];
 
         float h_row[HEAD_SIZE_C];
         uint hb = (bi*H_C+hi)*HEAD_SIZE_C*HEAD_SIZE_C + dv*HEAD_SIZE_C;
@@ -47,15 +61,25 @@ private func ckptFwdKernel(H: Int, T: Int) -> MLXFastKernel {
         for (uint c=0; c<N_CHUNKS_C; c++) {
             for (uint t=0; t<CHUNK_C; t++) {
                 uint base = ((bi*T_C + c*CHUNK_C + t)*H_C + hi)*HEAD_SIZE_C;
+
+                a_sh[dv]=a[base+dv]; w_sh[dv]=w[base+dv]; k_sh[dv]=k[base+dv];
+                b_sh[dv]=b[base+dv]; r_sh[dv]=r[base+dv];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
                 float sa = 0;
-                for (uint dk=0; dk<HEAD_SIZE_C; dk++) sa += h_row[dk]*a[base+dk];
+                for (uint dk=0; dk<HEAD_SIZE_C; dk++) sa += h_row[dk]*a_sh[dk];
                 sa_out[base+dv] = sa;
+
                 float vv = v[base+dv];
                 for (uint dk=0; dk<HEAD_SIZE_C; dk++)
-                    h_row[dk] = w[base+dk]*h_row[dk] + vv*k[base+dk] + sa*b[base+dk];
+                    h_row[dk] = w_sh[dk]*h_row[dk] + vv*k_sh[dk] + sa*b_sh[dk];
+
                 float y = 0;
-                for (uint dk=0; dk<HEAD_SIZE_C; dk++) y += h_row[dk]*r[base+dk];
+                for (uint dk=0; dk<HEAD_SIZE_C; dk++) y += h_row[dk]*r_sh[dk];
                 out[base+dv] = y;
+
+                // следующий t перезапишет *_sh, пока их ещё читают
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             uint ckb = ((bi*H_C+hi)*N_CHUNKS_C + c)*HEAD_SIZE_C*HEAD_SIZE_C + dv*HEAD_SIZE_C;
             for (uint dk=0; dk<HEAD_SIZE_C; dk++) h_checkpoints[ckb+dk] = h_row[dk];
@@ -180,6 +204,159 @@ private func ckptBwdKernel(H: Int, T: Int) -> MLXFastKernel {
     return kern
 }
 
+private var ckptBwd2Cache: [String: MLXFastKernel] = [:]
+
+/// Скалярное произведение четырьмя независимыми аккумуляторами (цепочка
+/// зависимых FMA рвётся — ядро упирается в её латентность).
+private func dot4(_ dst: String, _ a: (String) -> String, _ b: (String) -> String) -> String {
+    var lines = ["float \(dst)0=0.0f,\(dst)1=0.0f,\(dst)2=0.0f,\(dst)3=0.0f;",
+                 "for (uint j=0; j<HEAD_SIZE_C; j+=4) {"]
+    for u in 0 ..< 4 { lines.append("    \(dst)\(u) += \(a("j+\(u)")) * \(b("j+\(u)"));") }
+    lines.append("}")
+    lines.append("float \(dst) = (\(dst)0+\(dst)1)+(\(dst)2+\(dst)3);")
+    return lines.joined(separator: "\n                ")
+}
+
+/// Обратное ядро по схеме ядра Бо Пэна (RWKV-CUDA/rwkv7_fast_fused); порт
+/// `_get_ckpt_bwd_v2` из rwkv-metal.
+///
+/// Прежнее ядро держит СТРОКУ состояния, как прямое, и потому считает
+/// dr / dw / dk / da / db МЕЖПОТОКОВЫМИ редукциями: пять обменов через
+/// threadgroup на шаг времени, каждый — запись матрицы 64×64 и два барьера.
+/// Здесь поток держит КОЛОНКУ: stT[j] = h[j][i]. Тогда все пять величин —
+/// скалярные произведения внутри потока с общими векторами шага, а
+/// межпотоковый обмен остаётся один (dSb, нужен для da). Пять произведений
+/// идут одним проходом по j: порознь они читали три регистровых массива по
+/// пять раз.
+///
+/// Математика та же, порядок сложения другой: с прежним ядром сходится до
+/// ~1e-5 (fp32). Память threadgroup: 9 × 64 float = 2304 байта.
+private func ckptBwdKernelV2(H: Int, T: Int) -> MLXFastKernel {
+    let key = "\(H)_\(T)"
+    if let k = ckptBwd2Cache[key] { return k }
+    let N = T / WKV7_CHUNK
+    let header = """
+    constant uint HEAD_SIZE_C = \(WKV7_HEAD_SIZE);
+    constant uint T_C         = \(T);
+    constant uint CHUNK_C     = \(WKV7_CHUNK);
+    constant uint N_CHUNKS_C  = \(N);
+    constant uint H_C         = \(H);
+    """
+    let dr = dot4("dr", { "stT[\($0)]" }, { "dy_sh[\($0)]" })
+    let da = dot4("da", { "stT[\($0)]" }, { "dsb_sh[\($0)]" })
+    let source = """
+        uint i    = thread_position_in_threadgroup.x;
+        uint bhi  = threadgroup_position_in_grid.x;
+        uint bidx = bhi / H_C, hi = bhi % H_C;
+
+        threadgroup float r_sh[HEAD_SIZE_C], w_sh[HEAD_SIZE_C], k_sh[HEAD_SIZE_C];
+        threadgroup float v_sh[HEAD_SIZE_C], a_sh[HEAD_SIZE_C], b_sh[HEAD_SIZE_C];
+        threadgroup float dy_sh[HEAD_SIZE_C], sa_sh[HEAD_SIZE_C];
+        threadgroup float dsb_sh[HEAD_SIZE_C];
+
+        // stT — колонка i состояния; dst — строка i градиента по состоянию,
+        // dstT — его же колонка: dv / dSb берутся по строке, dw / dk / db — по колонке.
+        float stT[HEAD_SIZE_C], dst[HEAD_SIZE_C], dstT[HEAD_SIZE_C];
+
+        uint hbase = (bidx*H_C+hi)*HEAD_SIZE_C*HEAD_SIZE_C;
+        uint hrow  = hbase + i*HEAD_SIZE_C;
+        for (uint j=0; j<HEAD_SIZE_C; j++) {
+            dst[j]  = d_h_out[hrow + j];
+            dstT[j] = d_h_out[hbase + j*HEAD_SIZE_C + i];
+        }
+
+        for (int c=(int)N_CHUNKS_C-1; c>=0; c--) {
+            uint ckb = ((bidx*H_C+hi)*N_CHUNKS_C+(uint)c)*HEAD_SIZE_C*HEAD_SIZE_C;
+            for (uint j=0; j<HEAD_SIZE_C; j++)
+                stT[j] = h_ckpts[ckb + j*HEAD_SIZE_C + i];
+
+            for (int t=(int)CHUNK_C-1; t>=0; t--) {
+                uint base = ((bidx*T_C+(uint)c*CHUNK_C+(uint)t)*H_C+hi)*HEAD_SIZE_C;
+
+                r_sh[i]=r[base+i]; w_sh[i]=w[base+i]; k_sh[i]=k[base+i];
+                v_sh[i]=v[base+i]; a_sh[i]=a[base+i]; b_sh[i]=b[base+i];
+                dy_sh[i]=d_out[base+i]; sa_sh[i]=sa_fwd[base+i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                float ri=r_sh[i], wi=w_sh[i], ki=k_sh[i];
+                float ai=a_sh[i], bb=b_sh[i], dyi=dy_sh[i];
+
+                // dr[i] = sum_j h[j][i]*dy[j] — состояние ДО реконструкции
+                \(dr)
+                dr_out[base+i] = dr;
+
+                // h_prev[j][i] = (h[j][i] - v[j]*k[i] - sa[j]*b[i]) / w[i]
+                float iwi = 1.0f/wi;
+                for (uint j=0; j<HEAD_SIZE_C; j++) {
+                    stT[j]   = (stT[j] - v_sh[j]*ki - sa_sh[j]*bb) * iwi;
+                    dst[j]  += dyi*r_sh[j];
+                    dstT[j] += ri*dy_sh[j];
+                }
+
+                float dw0=0.0f,dw1=0.0f, dkv0=0.0f,dkv1=0.0f, dvv0=0.0f,dvv1=0.0f;
+                float db0=0.0f,db1=0.0f, dsb0=0.0f,dsb1=0.0f;
+                for (uint j=0; j<HEAD_SIZE_C; j+=2) {
+                    float tA=dstT[j],   tB=dstT[j+1];
+                    float sA=stT[j],    sB=stT[j+1];
+                    float uA=dst[j],    uB=dst[j+1];
+                    dw0  += tA*sA;         dw1  += tB*sB;
+                    dkv0 += tA*v_sh[j];    dkv1 += tB*v_sh[j+1];
+                    db0  += tA*sa_sh[j];   db1  += tB*sa_sh[j+1];
+                    dvv0 += uA*k_sh[j];    dvv1 += uB*k_sh[j+1];
+                    dsb0 += uA*b_sh[j];    dsb1 += uB*b_sh[j+1];
+                }
+                float dw=dw0+dw1, dkv=dkv0+dkv1, dvv=dvv0+dvv1;
+                float db=db0+db1, dsb=dsb0+dsb1;
+                dw_out[base+i] = dw;
+                dk_out[base+i] = dkv;
+                dv_out[base+i] = dvv;
+                db_out[base+i] = db;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                dsb_sh[i] = dsb;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // единственная межпотоковая величина: da[i] = sum_j h_prev[j][i]*dSb[j]
+                \(da)
+                da_out[base+i] = da;
+
+                for (uint j=0; j<HEAD_SIZE_C; j++) {
+                    dst[j]  = dst[j]*w_sh[j] + dsb*a_sh[j];
+                    dstT[j] = dstT[j]*wi + ai*dsb_sh[j];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        for (uint j=0; j<HEAD_SIZE_C; j++) dh_in_out[hrow + j] = dst[j];
+    """
+    let kern = MLXFast.metalKernel(
+        name: "wkv7_ckpt_bwd2_H\(H)_T\(T)",
+        inputNames: ["r","w","k","v","a","b","h_ckpts","sa_fwd","d_out","d_h_out"],
+        outputNames: ["dr_out","dw_out","dk_out","dv_out","da_out","db_out","dh_in_out"],
+        source: source, header: header
+    )
+    ckptBwd2Cache[key] = kern
+    return kern
+}
+
+/// Обратное ядро обучаемого WKV: true — по схеме Бо Пэна (`ckptBwdKernelV2`),
+/// false — прежнее. Читается на каждый вызов VJP: A/B в одном процессе.
+public nonisolated(unsafe) var wkv7BackwardV2 = true
+
+/// Держать выходы прямого ядра (sa и чекпоинты состояния) до обратного
+/// прохода — true, либо пересчитывать прямое ядро внутри VJP — false.
+///
+/// Пересчёт — лишний запуск прямого ядра на слой и шаг. Держать — дешевле по
+/// времени, но sa [B,T,H,S] и чекпоинты [B,H,T/16,S,S] живут до обратного
+/// прохода: ~40 КБ на токен и слой при H = 32. Под блочным чекпоинтом
+/// (`useBlockCheckpoint`) слой в обратном проходе живёт один, и это ничего не
+/// стоит; без него на длинной последовательности набегает (T = 2048, 24 слоя
+/// — ~2 ГБ), тогда выгоднее false. В rwkv-metal выходы держатся всегда.
+public nonisolated(unsafe) var wkv7KeepForwardOutputs = true
+
+/// Сколько раз поставлено в граф прямое ядро обучаемого WKV (счётчик для
+/// тестов: при удержании выходов — один запуск на вызов, при пересчёте — два).
+public nonisolated(unsafe) var wkv7TrainForwardLaunches = 0
+
 // Дифференцируемый WKV-7 на весь T с ЯВНЫМ граничным состоянием.
 // Входы [B,T,H,D], hIn [B,H,D,D] (nil ⇒ нули). Возвращает (out, hOut).
 //
@@ -208,71 +385,85 @@ public func wkv7TrainWithState(
     precondition(h0.shape == [B, H, D, D],
                  "hIn \(h0.shape) должен быть [B,H,D,D] = [\(B),\(H),\(D),\(D)]")
 
-    let fn = CustomFunction {
-        Forward { inp in
-            let r = inp[0], w = inp[1], k = inp[2], v = inp[3], a = inp[4], b = inp[5]
-            let hIn = inp[6]
-            let B = r.shape[0], T = r.shape[1], H = r.shape[2], D = r.shape[3]
-            let N = T / WKV7_CHUNK
-            let ins = [r,w,k,v,a,b,hIn].map { $0.asType(.float32) }
-            let o = ckptFwdKernel(H: H, T: T)(
-                ins, grid: (B*H, D, 1), threadGroup: (1,1,1),
-                outputShapes: [[B,T,H,D],[B,H,D,D],[B,T,H,D],[B,H,N,D,D]],
-                outputDTypes: [.float32,.float32,.float32,.float32]
-            )
-            return [o[0], o[1]]           // out, h_out; sa/ckpts — внутренние
+    let N = T / WKV7_CHUNK
+
+    func forwardKernel(_ ins: [MLXArray]) -> [MLXArray] {
+        wkv7TrainForwardLaunches += 1
+        return ckptFwdKernel(H: H, T: T)(
+            ins, grid: (B*H, D, 1), threadGroup: (1, D, 1),
+            outputShapes: [[B,T,H,D],[B,H,D,D],[B,T,H,D],[B,H,N,D,D]],
+            outputDTypes: [.float32,.float32,.float32,.float32]
+        )
+    }
+
+    // ВХОДЫ ОБОИХ ЯДЕР — СТРОГО fp32.
+    //
+    // MLX строит исходник пользовательского ядра из ТИПОВ входов, а
+    // кеширует библиотеку по ИМЕНИ. Одно имя с другими типами — для него
+    // «исходник сменился»: старая библиотека и её конвейер освобождаются
+    // НЕМЕДЛЕННО (Device::clear_library), хотя уже закодированные, но ещё
+    // не исполненные запуски в командном буфере на них ссылаются. Примелы
+    // слоя 0 приходят в типе параметров (bf16 / fp16), а слоёв выше — в
+    // fp32 (выход WKV), и на обратном проходе ядро слоя 0 выбивало конвейер
+    // из-под ядра слоя 1: недетерминированные NaN в градиентах r/k/v слоя 1
+    // и всего слоя 0 и срывы GPU (найдено 10.10).
+    func backward(_ primals: [MLXArray], saFwd: MLXArray, hCkpts: MLXArray,
+                  dOut: MLXArray, dHOut: MLXArray?) -> [MLXArray] {
+        let dH = dHOut?.asType(.float32) ?? MLXArray.zeros([B, H, D, D], dtype: .float32)
+        let kern = wkv7BackwardV2 ? ckptBwdKernelV2(H: H, T: T) : ckptBwdKernel(H: H, T: T)
+        return kern(
+            primals[0 ..< 6].map { $0.asType(.float32) } + [hCkpts, saFwd, dOut.asType(.float32), dH],
+            grid: (B*H*D, 1, 1), threadGroup: (D, 1, 1),
+            outputShapes: Array(repeating: [B,T,H,D], count: 6) + [[B,H,D,D]],
+            outputDTypes: Array(repeating: DType.float32, count: 7)
+        )
+    }
+
+    if RWKVAblation.skipWKVBackward || !wkv7KeepForwardOutputs {
+        // Пересчёт прямого ядра внутри VJP: Swift-овский VJP { primals,
+        // cotangents } не получает выходов прямого прохода, а sa и чекпоинты
+        // состояния обратному ядру нужны.
+        let fn = CustomFunction {
+            Forward { inp in
+                let o = forwardKernel(inp.map { $0.asType(.float32) })
+                return [o[0], o[1]]           // out, h_out; sa/ckpts — внутренние
+            }
+            VJP { primals, cotangents in
+                if RWKVAblation.skipWKVBackward {                 // только замер, см. RWKVAblation
+                    return primals.map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
+                }
+                let f = forwardKernel(primals.map { $0.asType(.float32) })
+                let g = backward(primals, saFwd: f[2], hCkpts: f[3], dOut: cotangents[0],
+                                 dHOut: cotangents.count > 1 ? cotangents[1] : nil)
+                // argnums Swift игнорирует ⇒ градиенты по ВСЕМ семи примелам
+                // по порядку, включая dh_in (g[6]).
+                return zip(g, primals).map { $0.asType($1.dtype) }
+            }
         }
+        let out = fn([r, w, k, v, a, b, h0])
+        return (out[0], out[1])
+    }
+
+    // Выходы прямого ядра держатся до обратного прохода — без пересчёта.
+    //
+    // Обход того, что VJP в Swift не видит выходов Forward: прямое ядро
+    // считается СНАРУЖИ дифференцируемой функции, на входах под stopGradient
+    // (для автограда его выходы — константы, VJP у ядра не спрашивают), а
+    // сама функция принимает их дополнительными входами и пропускает out и
+    // h_out как есть. VJP тогда находит sa и чекпоинты среди своих примелов.
+    // Градиент идёт только по первым семи входам: остальные четыре от
+    // примелов дифференцирования не зависят, и MLX их котангенты не берёт.
+    let f = forwardKernel([r, w, k, v, a, b, h0].map { stopGradient($0.asType(.float32)) })
+    let fn = CustomFunction {
+        Forward { inp in [stopGradient(inp[7]), stopGradient(inp[8])] }
         VJP { primals, cotangents in
-            let r = primals[0], w = primals[1], k = primals[2]
-            let v = primals[3], a = primals[4], b = primals[5]
-            let hIn = primals[6]
-            let B = r.shape[0], T = r.shape[1], H = r.shape[2], D = r.shape[3]
-            let N = T / WKV7_CHUNK
-            let dOut  = cotangents[0]
-            // Swift-овский VJP не получает outputs forward'а (третий аргумент
-            // C-замыкания — argnums — отбрасывается), поэтому sa_fwd и
-            // h_checkpoints пересчитываем: один лишний forward и есть
-            // gradient checkpointing.
-            let f = ckptFwdKernel(H: H, T: T)(
-                [r,w,k,v,a,b,hIn].map { $0.asType(.float32) },
-                grid: (B*H, D, 1), threadGroup: (1,1,1),
-                outputShapes: [[B,T,H,D],[B,H,D,D],[B,T,H,D],[B,H,N,D,D]],
-                outputDTypes: [.float32,.float32,.float32,.float32]
-            )
-            let saFwd = f[2], hCkpts = f[3]
-            let dHOut = cotangents.count > 1
-                ? cotangents[1].asType(.float32)
-                : MLXArray.zeros([B, H, D, D], dtype: .float32)
-            // ВХОДЫ ОБРАТНОГО ЯДРА — СТРОГО fp32, как у прямого.
-            //
-            // MLX строит исходник пользовательского ядра из ТИПОВ входов, а
-            // кеширует библиотеку по ИМЕНИ. Одно имя с другими типами — для
-            // него «исходник сменился»: старая библиотека и её конвейер
-            // освобождаются НЕМЕДЛЕННО (Device::clear_library), хотя уже
-            // закодированные, но ещё не исполненные запуски в командном
-            // буфере на них ссылаются. Здесь именно это и происходило:
-            // примелы слоя 0 приходят в типе параметров (bf16 / fp16), а слоёв
-            // выше — в fp32 (выход WKV), и на обратном проходе ядро слоя 0
-            // выбивало конвейер из-под ядра слоя 1. Отсюда недетерминированные
-            // NaN в градиентах r/k/v слоя 1 и всего слоя 0 и срывы GPU
-            // (Hang / PageFault / InnocentVictim) — и отсюда же их исчезновение
-            // при малых командных буферах, под валидацией Metal и при
-            // однотипных параметрах (найдено 10.10).
-            // Значения те же: ядро и раньше читало bf16 с неявным
-            // приведением к float.
-            let g = ckptBwdKernel(H: H, T: T)(
-                [r,w,k,v,a,b].map { $0.asType(.float32) }
-                    + [hCkpts,saFwd,dOut.asType(.float32),dHOut],
-                grid: (B*H*D, 1, 1), threadGroup: (D, 1, 1),
-                outputShapes: Array(repeating: [B,T,H,D], count: 6) + [[B,H,D,D]],
-                outputDTypes: Array(repeating: DType.float32, count: 7)
-            )
-            // argnums Swift игнорирует ⇒ возвращаем градиенты по ВСЕМ семи
-            // примелам по порядку, включая dh_in (g[6]).
+            let g = backward(primals, saFwd: primals[9], hCkpts: primals[10], dOut: cotangents[0],
+                             dHOut: cotangents.count > 1 ? cotangents[1] : nil)
             return zip(g, primals).map { $0.asType($1.dtype) }
+                + primals[7...].map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
         }
     }
-    let out = fn([r, w, k, v, a, b, h0])
+    let out = fn([r, w, k, v, a, b, h0, f[0], f[1], f[2], f[3]])
     return (out[0], out[1])
 }
 
