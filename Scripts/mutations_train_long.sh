@@ -204,6 +204,19 @@ run "верхние слои на сжатой базе разрешены бе�
 run "проверка сжатых слоёв смотрит на нижние" \
     "$ET" '(from ..< bb.cfg.nLayer).contains { key.hasPrefix("blocks.\($0).") }' \
           '(0 ..< from).contains { key.hasPrefix("blocks.\($0).") }'
+echo "── эмбеддер: оценка батчем по токенам ──"
+EM=Sources/RWKVEmbedding/EmbeddingMetrics.swift
+run "бюджет токенов батча оценки не действует" \
+    "$EM" 'if batchTokens > 0, (end - i + 1) * grown > batchTokens { break }' \
+          'if batchTokens < 0, (end - i + 1) * grown > batchTokens { break }'
+run "бюджет считается по первой строке батча, а не по самой длинной" \
+    "$EM" 'if batchTokens > 0, (end - i + 1) * grown > batchTokens { break }' \
+          'if batchTokens > 0, (end - i + 1) * rows[i].count > batchTokens { break }'
+run "последняя строка батча оценки потеряна" \
+    "$EM" 'let (idx, pool) = padBatch(Array(rows[i ..< end]), terminator: terminator)' \
+          'let (idx, pool) = padBatch(Array(rows[i ..< Swift.max(i + 1, end - 1)]), terminator: terminator)'
+run "батч оценки не ограничен числом строк" \
+    "$EM" 'while end < rows.count, end - i < batchSize {' 'while end < rows.count {'
 
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

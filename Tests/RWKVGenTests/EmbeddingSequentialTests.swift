@@ -374,6 +374,49 @@ final class EmbeddingSequentialTests: XCTestCase {
               })
     }
 
+    /// Оценка: батч ограничен токенами (строки × длина самой длинной), а не
+    /// только числом строк; разбиение на батчи вектора не меняет.
+    func testEvaluationBatchesAreBoundedByTokens() throws {
+        let tok = try EmbeddingFinetuneTests().loadWorldTokenizerOrSkip()
+        let model = makeModel(vocab: 65536)
+        let texts = ["a", String(repeating: "слово ", count: 40), "bb", String(repeating: "x y ", count: 30),
+                     "c", "d e f", "g", String(repeating: "долгий текст ", count: 20), "h"]
+        let lens = texts.map { encodeRow(tokenizer: tok, text: $0, maxTokens: 64).count }
+        let longest = lens.max()!
+        XCTAssertGreaterThan(longest, 4 * lens.min()!, "нужны и длинные, и короткие строки")
+        defer { SequentialBody.probe = nil }
+        func run(batchSize: Int, tokens: Int) -> (MLXArray, Int) {
+            var n = 0
+            SequentialBody.probe = { if $0 == "embed batch" { n += 1 } }
+            let v = EmbeddingMetrics.embedAll(model: model, tokenizer: tok, texts: texts, batchSize: batchSize,
+                                              maxTokens: 64, batchTokens: tokens).asType(.float32)
+            eval(v)
+            return (v, n)
+        }
+        // правило, записанное заново: батч растёт, пока строк не больше batchSize и
+        // строки × самая длинная не больше бюджета; одна строка проходит всегда
+        func expected(batchSize: Int, tokens: Int) -> Int {
+            var batches = 0, rows = 0, top = 0
+            for l in lens {
+                let fits = rows > 0 && rows < batchSize && (tokens == 0 || (rows + 1) * Swift.max(top, l) <= tokens)
+                if fits { rows += 1; top = Swift.max(top, l) } else { batches += 1; rows = 1; top = l }
+            }
+            return batches
+        }
+        let (ref, one) = run(batchSize: 100, tokens: 0)
+        XCTAssertEqual(one, 1, "без ограничений — один батч")
+        XCTAssertEqual(ref.shape[0], texts.count)
+        for (batchSize, tokens) in [(100, 2 * longest), (100, longest), (100, 1), (2, 0), (3, 3 * longest)] {
+            let (v, n) = run(batchSize: batchSize, tokens: tokens)
+            XCTAssertEqual(n, expected(batchSize: batchSize, tokens: tokens), "строк \(batchSize), токенов \(tokens)")
+            XCTAssertEqual(v.shape, ref.shape)
+            XCTAssertLessThan(MLX.abs(v - ref).max().item(Float.self), 1e-5,
+                              "строк \(batchSize), токенов \(tokens): векторы те же, порядок строк тот же")
+        }
+        XCTAssertEqual(run(batchSize: 100, tokens: 1).1, texts.count, "бюджет меньше строки — по одной")
+        XCTAssertGreaterThan(run(batchSize: 100, tokens: 2 * longest).1, 1, "бюджет действует")
+    }
+
     /// Потолок кэша MLX действует уже на оценке «до обучения», а не только в
     /// цикле обучения: без него пик footprint всего прогона случался на оценке.
     func testCacheLimitIsAppliedBeforeFirstEvaluation() throws {

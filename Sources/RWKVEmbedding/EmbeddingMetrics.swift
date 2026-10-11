@@ -71,6 +71,11 @@ private func fmt(_ x: Double) -> String { String(format: "%.4f", x) }
 
 public enum EmbeddingMetrics {
 
+    /// Бюджет токенов батча оценки по умолчанию — один на процесс: оценку
+    /// зовёт стадия (`EmbeddingFinetune.evaluate`), и приложению с жёстким
+    /// пределом памяти нужна одна ручка, а не параметр в каждом вызове.
+    nonisolated(unsafe) public static var evaluationBatchTokens = 4096
+
     /// Векторы плоского списка текстов, микробатчами.
     ///
     /// Выравнивание T здесь не нужно: оценка идёт БЕЗ градиента, а
@@ -82,20 +87,40 @@ public enum EmbeddingMetrics {
     /// предполагается: оценка идёт и между шагами обучения, когда у базы
     /// выставлен `trainLayers` (верхние слои, вся база, адаптеры). Без этого
     /// она уходила в дифференцируемое ядро и падала на длине, не кратной 16.
+    ///
+    /// Батч ограничен и строками (`batchSize`), и ТОКЕНАМИ (`batchTokens`,
+    /// строки × длина самой длинной): память прохода идёт за токенами батча —
+    /// ~0.14 ГБ на 1024 токена сверх модели (0.1B), и 16 текстов по 1024 токена
+    /// одним батчем стоили больше шага обучения. Строки в теле независимы,
+    /// разбиение на батчи вектора не меняет. 0 — без ограничения по токенам.
     public static func embedAll(model: EmbeddingModel, tokenizer: WorldTokenizer,
                                 texts: [String], batchSize: Int = 16,
                                 terminator: Int = 0,
-                                maxTokens: Int? = 512) -> MLXArray {
+                                maxTokens: Int? = 512,
+                                batchTokens: Int = EmbeddingMetrics.evaluationBatchTokens) -> MLXArray {
+        let rows = texts.map { encodeRow(tokenizer: tokenizer, text: $0, terminator: terminator, maxTokens: maxTokens) }
+        let frozen = SequentialBody.Plan(names: [], nLayer: model.backbone.cfg.nLayer)
         var parts: [MLXArray] = []
         var i = 0
-        while i < texts.count {
-            let end = Swift.min(i + batchSize, texts.count)
-            let (idx, pool) = encodeBatch(tokenizer: tokenizer,
-                                          texts: Array(texts[i ..< end]),
-                                          terminator: terminator,
-                                          maxTokens: maxTokens)
-            let v = model.backbone.withoutGradientPath { model.embed(idx, poolIndex: pool) }
+        while i < rows.count {
+            var end = i + 1, longest = rows[i].count
+            while end < rows.count, end - i < batchSize {
+                let grown = Swift.max(longest, rows[end].count)
+                if batchTokens > 0, (end - i + 1) * grown > batchTokens { break }
+                longest = grown
+                end += 1
+            }
+            let (idx, pool) = padBatch(Array(rows[i ..< end]), terminator: terminator)
+            // Тело — по блокам, с вычислением после каждого (`SequentialBody.forward`
+            // без обучаемых слоёв входов не хранит): те же операции, что у
+            // `model.embed`, но одним ленивым графом всё тело держало ~1 ГБ
+            // активаций уже на 2048 токенах батча (0.1B), по блокам — треть.
+            let v = model.backbone.withoutGradientPath { () -> MLXArray in
+                let top = SequentialBody.forward(model.backbone, ids: idx, plan: frozen).top
+                return model.embedFromTop(top, poolIndex: pool)
+            }
             eval(v)                       // иначе ленивый граф удержит активации
+            SequentialBody.probe?("embed batch")
             parts.append(v)
             i = end
         }

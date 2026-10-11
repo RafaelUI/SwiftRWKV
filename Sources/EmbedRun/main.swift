@@ -18,8 +18,9 @@ import RWKVEmbedding
 //  --mode  frozen     — обучается только голова (база заморожена)
 //          lora       — адаптеры LoRA на проекциях tmix и голова; на базе из
 //                       .rwkvq это QLoRA: база остаётся сжатой
-//          top:N      — верхние N слоёв и голова (только плотная база: у
-//                       квантованной проекции — не веса, обучать нечего)
+//          top:N      — верхние N слоёв и голова; на базе из .rwkvq эти N
+//                       слоёв разворачиваются в плотные (unpackTopLayers),
+//                       низ остаётся сжатым и замороженным
 //          full       — вся база и голова (только плотная база)
 //          none       — только оценка
 //
@@ -41,9 +42,10 @@ struct Args {
     var logEvery = 50              // печать шага; 1 — время каждого шага (замеры)
     var guardGB = 0.0              // > 0: footprint выше порога — выход (замер под свопом негоден)
     var probe = false              // память по фазам шага (SequentialBody.probe)
-    var chunkTokens = 0            // EmbeddingStage.bodyChunkTokens
+    var chunkTokens: Int? = nil    // EmbeddingStage.bodyChunkTokens (не задано — умолчание стадии)
     var traceStride = 1            // EmbeddingStage.traceStride
     var pipelineAB = false         // A/B в одном процессе: чётные шаги — SequentialBody.pipelined
+    var unpack: Int? = nil         // развернуть столько верхних слоёв .rwkvq (по умолчанию — N из top:N)
 }
 
 func parse() -> Args {
@@ -74,9 +76,11 @@ func parse() -> Args {
         case "--log-every": a.logEvery = max(1, Int(v()) ?? a.logEvery)
         case "--guard": a.guardGB = Double(v()) ?? a.guardGB
         case "--probe": a.probe = true
-        case "--chunk-tokens": a.chunkTokens = Int(v()) ?? a.chunkTokens
+        case "--chunk-tokens": a.chunkTokens = Int(v())
         case "--trace-stride": a.traceStride = Int(v()) ?? a.traceStride
         case "--pipeline-ab": a.pipelineAB = true
+        case "--unpack": a.unpack = Int(v())
+        case "--eval-tokens": EmbeddingMetrics.evaluationBatchTokens = Int(v()) ?? EmbeddingMetrics.evaluationBatchTokens
         case "--pipeline": SequentialBody.pipelined = v() != "0"
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!)
@@ -173,7 +177,14 @@ case "lora":
     LoRA.add(to: base, spec: LoRASpec(rank: args.loraRank, alpha: Float(args.loraRank)))
     mode = .lora
 default:
-    if args.mode.hasPrefix("top:"), let n = Int(args.mode.dropFirst(4)) { mode = .topLayers(n) }
+    if args.mode.hasPrefix("top:"), let n = Int(args.mode.dropFirst(4)) {
+        if quantised {
+            let unpacked = base.unpackTopLayers(args.unpack ?? n)
+            print(String(format: "развёрнуто в плотные: %d весов верхних %d слоёв; MLX активная %.2f ГБ",
+                         unpacked.count, args.unpack ?? n, Double(GPU.activeMemory) / 1e9))
+        }
+        mode = .topLayers(n)
+    }
     else { print("режим \(args.mode)?"); exit(2) }
 }
 let model = EmbeddingModel(backbone: base)
@@ -190,7 +201,7 @@ var stage = EmbeddingStage(
 stage.sequentialBackward = args.sequential
 stage.config.cacheLimitGB = args.cacheGB
 stage.config.logEvery = args.logEvery
-stage.bodyChunkTokens = args.chunkTokens
+if let c = args.chunkTokens { stage.bodyChunkTokens = c }
 stage.traceStride = args.traceStride
 var report: [String: Any] = ["model": args.model, "mode": args.mode, "task": task.rawValue,
                              "train": train.count, "eval": heldOut.count, "steps": args.steps,
@@ -257,13 +268,16 @@ if let mode {
     report["final_loss"] = Double(r.finalLoss); report["train_seconds"] = r.seconds
     report["train_peak_gb"] = Double(GPU.peakMemory) / 1e9
 } else {
+    if args.cacheGB > 0 { MLX.Memory.cacheLimit = Int(args.cacheGB * 1e9) }
+    _ = EmbeddingMetrics.embedAll(model: model, tokenizer: tok, texts: ["прогрев"])   // первое касание весов — не в замер
     GPU.resetPeakMemory()
+    _ = watch.take()
     t = Date()
     let before = EmbeddingFinetune.evaluate(model: model, tokenizer: tok, stage: stage)
     let evalSeconds = Date().timeIntervalSince(t)
-    print(String(format: "оценка: %@ | %.1f с (%.1f мс на строку) | пик MLX %.2f ГБ",
+    print(String(format: "оценка: %@ | %.1f с (%.1f мс на строку) | пик MLX %.2f ГБ, пик footprint оценки %.2f ГБ",
                  before.description, evalSeconds, evalSeconds * 1e3 / Double(heldOut.count),
-                 Double(GPU.peakMemory) / 1e9))
+                 Double(GPU.peakMemory) / 1e9, watch.take()))
     report["before"] = before.headline; report["eval_seconds"] = evalSeconds
     report["eval_peak_gb"] = Double(GPU.peakMemory) / 1e9
 }

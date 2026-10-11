@@ -169,12 +169,22 @@ public func encodeBatch(tokenizer: WorldTokenizer, texts: [String],
                         terminator: Int = 0,
                         maxTokens: Int? = nil,
                         padMultiple: Int? = nil) -> (idx: MLXArray, poolIndex: MLXArray) {
-    var seqs = texts.map { text -> [Int] in
-        var ids = tokenizer.encode(text)
-        if let m = maxTokens, ids.count > m - 1 { ids = Array(ids.prefix(m - 1)) }
-        ids.append(terminator)
-        return ids
-    }
+    padBatch(texts.map { encodeRow(tokenizer: tokenizer, text: $0, terminator: terminator, maxTokens: maxTokens) },
+             terminator: terminator, padMultiple: padMultiple)
+}
+
+/// Токены одной строки: обрезка до `maxTokens` вместе с терминатором.
+func encodeRow(tokenizer: WorldTokenizer, text: String, terminator: Int = 0, maxTokens: Int? = nil) -> [Int] {
+    var ids = tokenizer.encode(text)
+    if let m = maxTokens, ids.count > m - 1 { ids = Array(ids.prefix(m - 1)) }
+    ids.append(terminator)
+    return ids
+}
+
+/// Строки разной длины — в один батч [B, T] с добивкой справа (см. `encodeBatch`).
+func padBatch(_ rows: [[Int]], terminator: Int = 0,
+              padMultiple: Int? = nil) -> (idx: MLXArray, poolIndex: MLXArray) {
+    var seqs = rows
     let poolIdx = seqs.map { Int32($0.count - 1) }
     var maxLen = seqs.map(\.count).max() ?? 1
     if let mult = padMultiple, mult > 1, maxLen % mult != 0 {
