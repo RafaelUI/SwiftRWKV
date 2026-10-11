@@ -62,6 +62,98 @@ public enum EmbeddingObjective {
                                           temperature: temperature)
     }
 
+    // ── Обратный проход по блокам ────────────────────────────────────
+    //
+    // Тот же градиент, что у eager-пути, при памяти одного блока одной пачки
+    // (см. RWKVGen/Training/SequentialBackward.swift). Автоград по всему графу
+    // держит активации всех слоёв всех пачек до конца обратного прохода: на
+    // 0.1B при 8 триплетах по 256 токенов это 7.8 ГБ пика. Здесь прямой проход
+    // без градиента хранит только входы блоков, лосс считается по выходам
+    // последнего блока, а блоки идут сверху вниз с вычислением после каждого.
+    // Цена — каждый блок считается дважды.
+
+    /// Сколько раз градиент посчитан этим путём (счётчик для тестов).
+    nonisolated(unsafe) static var sequentialCalls = 0
+
+    /// (лосс, градиенты в порядке `trainable.parameterNames`). `groups` —
+    /// пачки, которые модель векторизует порознь (якоря, положительные, …);
+    /// `loss` получает их векторы в том же порядке.
+    static func sequentialValueAndGrad(
+        model: EmbeddingModel, trainable: TrainableSet, parameters: [MLXArray],
+        groups: [(idx: MLXArray, pool: MLXArray)],
+        loss: @escaping ([MLXArray]) -> MLXArray
+    ) -> (loss: MLXArray, gradients: [MLXArray]) {
+        sequentialCalls += 1
+        let bb = model.backbone
+        let plan = SequentialBody.Plan(names: trainable.parameterNames, nLayer: bb.cfg.nLayer)
+
+        // 1. прямой проход каждой пачки без градиента
+        trainable.inject(parameters)
+        let traces = groups.map { SequentialBody.forward(bb, ids: $0.idx, plan: plan) }
+
+        // 2. всё, что над телом: ln_out, пулинг, голова, лосс — по выходам
+        //    последнего блока и по параметрам «над телом» (голова, ln_out)
+        let above = plan.above
+        let n = groups.count
+        let (value, g) = vjp({ ins in
+            var current = parameters
+            for (j, i) in above.enumerated() { current[i] = ins[n + j] }
+            trainable.inject(current)
+            let vectors = (0 ..< n).map { model.embedFromTop(ins[$0], poolIndex: groups[$0].pool) }
+            return [loss(vectors).asType(.float32)]
+        }, primals: traces.map { $0.top } + above.map { parameters[$0] },
+           cotangents: [MLXArray(Float(1))])
+        trainable.inject(parameters)
+        eval(value + g)
+        var grads = [MLXArray?](repeating: nil, count: parameters.count)
+        for (j, i) in above.enumerated() { grads[i] = g[n + j] }
+
+        // 3. блоки сверху вниз, пачка за пачкой
+        for (k, trace) in traces.enumerated() {
+            SequentialBody.backward(bb, trace: trace, dTop: g[k], parameters: parameters, plan: plan,
+                                    inject: { trainable.inject($0) }, grads: &grads)
+        }
+        return (value[0], grads.enumerated().map { i, g in
+            g ?? MLXArray.zeros(parameters[i].shape, dtype: parameters[i].dtype)
+        })
+    }
+
+    /// Провайдер градиента триплетных задач обратным проходом по блокам.
+    public static func sequentialProvider(
+        model: EmbeddingModel, trainable: TrainableSet,
+        temperature: Float = 0.05, symmetric: Bool
+    ) -> GradientProvider<TripletBatch> {
+        { params, batch in
+            sequentialValueAndGrad(
+                model: model, trainable: trainable, parameters: params,
+                groups: [(batch.anchorIdx, batch.anchorPool), (batch.positiveIdx, batch.positivePool),
+                         (batch.negativeIdx, batch.negativePool)],
+                loss: { v in
+                    tripletPoolLoss(anchor: v[0], positive: v[1], negative: v[2],
+                                    temperature: temperature, symmetric: symmetric)
+                })
+        }
+    }
+
+    /// То же для zero-shot классификации: якоря и кандидаты — две пачки.
+    public static func sequentialClassificationProvider(
+        model: EmbeddingModel, trainable: TrainableSet, temperature: Float = 0.05
+    ) -> GradientProvider<ClassificationBatch> {
+        { params, batch in
+            let B = batch.candidateIdx.shape[0], K = batch.candidateIdx.shape[1]
+            let T = batch.candidateIdx.shape[2]
+            return sequentialValueAndGrad(
+                model: model, trainable: trainable, parameters: params,
+                groups: [(batch.anchorIdx, batch.anchorPool),
+                         (batch.candidateIdx.reshaped([B * K, T]), batch.candidatePool.reshaped([B * K]))],
+                loss: { v in
+                    zeroShotClassificationLoss(anchor: v[0], candidates: v[1].reshaped([B, K, -1]),
+                                               mask: batch.mask, targetIndex: batch.targetIndex,
+                                               temperature: temperature)
+                })
+        }
+    }
+
     // ── GradCache-путь ───────────────────────────────────────────────
     //
     // Отдельный путь есть ТОЛЬКО у триплетных задач, и это не пробел.

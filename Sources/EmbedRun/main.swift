@@ -30,6 +30,8 @@ struct Args {
     var lr: Float = 2e-5
     var loraRank = 8
     var gradCache = 0
+    var sequential = true
+    var cacheGB = 0.25
     var seed: UInt64 = 0
     var out: String? = nil
 }
@@ -54,6 +56,8 @@ func parse() -> Args {
         case "--lr": a.lr = Float(v()) ?? a.lr
         case "--lora-rank": a.loraRank = Int(v()) ?? a.loraRank
         case "--grad-cache": a.gradCache = Int(v()) ?? a.gradCache
+        case "--seq": a.sequential = v() != "0"
+        case "--cache-gb": a.cacheGB = Double(v()) ?? a.cacheGB
         case "--seed": a.seed = UInt64(v()) ?? a.seed
         case "--out": a.out = v()
         default:
@@ -130,13 +134,15 @@ let model = EmbeddingModel(backbone: base)
 if let m = mode, let why = EmbeddingTrainable.unsupportedReason(model: model, mode: m) {
     print(why); exit(2)
 }
-let stage = EmbeddingStage(
+var stage = EmbeddingStage(
     task: task, train: train, heldOut: heldOut,
     config: TrainingConfig(lr: args.lr, lrMin: args.lr / 20, schedule: .cosine,
                            warmupSteps: min(50, args.steps / 5), maxSteps: args.steps),
     batchSize: args.batch, gradCacheChunk: args.gradCache,
     maxTokens: args.maxTokens, maxChars: args.maxChars, seed: args.seed)
 
+stage.sequentialBackward = args.sequential
+stage.config.cacheLimitGB = args.cacheGB
 var report: [String: Any] = ["model": args.model, "mode": args.mode, "task": task.rawValue,
                              "train": train.count, "eval": heldOut.count, "steps": args.steps,
                              "batch": args.batch, "max_tokens": args.maxTokens, "quantised": quantised]

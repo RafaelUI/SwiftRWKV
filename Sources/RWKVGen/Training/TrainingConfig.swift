@@ -53,7 +53,7 @@ public struct TrainingConfig: Sendable {
                 adamEps: Float = 1e-8,
                 maxSteps: Int = 1000,
                 gradAccum: Int = 1,
-                cacheLimitGB: Double = 1.5,
+                cacheLimitGB: Double = 0.25,
                 logEvery: Int = 10) {
         self.lr = lr; self.lrMin = lrMin; self.schedule = schedule
         self.warmupSteps = warmupSteps; self.gradClip = gradClip

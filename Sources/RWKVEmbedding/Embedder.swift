@@ -132,6 +132,15 @@ public final class EmbeddingModel {
         return l2Normalize(head.apply(pooled, parameters: headParameters ?? head.parameters))
     }
 
+    /// Вектор по выходу ПОСЛЕДНЕГО БЛОКА базы (до ln_out): то, что стоит над
+    /// телом, — ln_out, пулинг, голова, нормировка. `embed` — это
+    /// `embedFromTop` поверх тела; отдельно нужен обратному проходу по блокам
+    /// (`EmbeddingObjective.sequentialValueAndGrad`).
+    public func embedFromTop(_ x: MLXArray, poolIndex: MLXArray) -> MLXArray {
+        let h = backbone.finalNorm(x, T: x.shape[1])
+        return l2Normalize(head.apply(pool(h, poolIndex: poolIndex), parameters: head.parameters))
+    }
+
     /// Пулинг без головы — сырой вектор базы.
     public func pooledOnly(_ idx: MLXArray, poolIndex: MLXArray) -> MLXArray {
         l2Normalize(pool(backbone.body(idx), poolIndex: poolIndex))

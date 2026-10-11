@@ -110,5 +110,41 @@ run "цели куска берутся с начала последовател
                 let piece' 'let targets = batch.y[0..., 0 ..< (to - from)].reshaped([-1]).asType(.int32)
                 let piece'
 
+FILTER='EmbeddingSequentialTests'
+EO=Sources/RWKVEmbedding/EmbeddingObjective.swift
+EF=Sources/RWKVEmbedding/EmbeddingFinetune.swift
+ED=Sources/RWKVEmbedding/Embedder.swift
+echo "── эмбеддер: обратный проход по блокам ──"
+run "параметры основания (ln0) считаются параметрами над телом" \
+    "$SB" '} else if name.hasPrefix("ln0.") || name.hasPrefix("emb.") {' '} else if name.hasPrefix("emb.") {'
+run "градиент основания не считается" \
+    "$SB" 'for (j, i) in idx.enumerated() { add(i, g[j]) }' 'for (j, i) in idx.enumerated() { _ = (i, g[j]) }'
+run "градиенты пачек не складываются, а затирают друг друга" \
+    "$SB" 'func add(_ i: Int, _ g: MLXArray) { grads[i] = grads[i].map { $0 + g } ?? g }' \
+          'func add(_ i: Int, _ g: MLXArray) { grads[i] = g }'
+run "котангент пачки взят у соседней" \
+    "$EO" 'SequentialBody.backward(bb, trace: trace, dTop: g[k], parameters: parameters, plan: plan,' \
+          'SequentialBody.backward(bb, trace: trace, dTop: g[(k + 1) % n], parameters: parameters, plan: plan,'
+run "градиенты параметров над телом перепутаны" \
+    "$EO" 'for (j, i) in above.enumerated() { grads[i] = g[n + j] }' \
+          'for (j, i) in above.enumerated() { grads[i] = g[n + (j + 1) % above.count] }'
+run "параметры над телом в лосс не подставляются" \
+    "$EO" 'for (j, i) in above.enumerated() { current[i] = ins[n + j] }' \
+          'for (j, i) in above.enumerated() { _ = (i, ins[n + j]) }'
+run "вектор над телом без ln_out" \
+    "$ED" 'let h = backbone.finalNorm(x, T: x.shape[1])' 'let h = x'
+run "пулинг пачки взят у якорей" \
+    "$EO" 'let vectors = (0 ..< n).map { model.embedFromTop(ins[$0], poolIndex: groups[$0].pool) }' \
+          'let vectors = (0 ..< n).map { model.embedFromTop(ins[$0], poolIndex: groups[0].pool) }'
+run "кандидаты классификации не собраны по строкам" \
+    "$EO" 'zeroShotClassificationLoss(anchor: v[0], candidates: v[1].reshaped([B, K, -1]),' \
+          'zeroShotClassificationLoss(anchor: v[0], candidates: v[1].reshaped([K, B, -1]).transposed(1, 0, 2),'
+run "стадия: режим по умолчанию выключен" \
+    "$EF" 'public var sequentialBackward: Bool = true' 'public var sequentialBackward: Bool = false'
+run "стадия: режим действует и под GradCache наоборот" \
+    "$EF" ': stage.sequentialBackward
+                ? EmbeddingObjective.sequentialProvider(' ': !stage.sequentialBackward
+                ? EmbeddingObjective.sequentialProvider('
+
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

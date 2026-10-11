@@ -46,11 +46,13 @@ public struct LoRAConfig: Sendable {
     public var useBlockCheckpoint: Bool
     /// Голова и лосс по кускам из стольких позиций (0 — целиком); см.
     /// `LoRAFinetune.languageModelLoss`. Память длинной последовательности.
-    public var lossChunkTokens: Int = 0
+    public var lossChunkTokens: Int = 256
     /// Обратный проход по блокам с вычислением после каждого (см.
     /// SequentialBackward.swift): память одного блока вместо нескольких.
     /// Градиент тот же; `useBlockCheckpoint` при этом не действует.
-    public var sequentialBackward: Bool = false
+    /// Умолчание — включено (решение владельца 11.10): +4…6 % времени шага
+    /// за половину пика памяти на длинной последовательности.
+    public var sequentialBackward: Bool = true
     /// Спад LR после warmup. Исторический дефолт — .constant (плоско).
     public var schedule: LRSchedule
     public var lrMin: Float
@@ -58,7 +60,7 @@ public struct LoRAConfig: Sendable {
     public init(lr: Float = 1e-4, gradClip: Float = 1.0, weightDecay: Float = 0.0,
                 beta1: Float = 0.9, beta2: Float = 0.95, adamEps: Float = 1e-8,
                 maxSteps: Int = 1000, gradAccum: Int = 1, warmupSteps: Int = 0,
-                cacheLimitGB: Double = 1.5, logEvery: Int = 10,
+                cacheLimitGB: Double = 0.25, logEvery: Int = 10,
                 useBlockCheckpoint: Bool = false,
                 schedule: LRSchedule = .constant, lrMin: Float = 0) {
         self.lr = lr; self.gradClip = gradClip; self.weightDecay = weightDecay

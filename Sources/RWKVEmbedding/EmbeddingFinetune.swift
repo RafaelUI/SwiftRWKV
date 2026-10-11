@@ -58,6 +58,10 @@ public struct EmbeddingStage {
     /// >0 ⇒ триплетные стадии идут под GradCache с чанком такого размера.
     /// Для классификации игнорируется (см. EmbeddingObjective).
     public var gradCacheChunk: Int
+    /// Градиент обратным проходом по блокам (`EmbeddingObjective.sequentialProvider`):
+    /// тот же градиент при памяти одного блока одной пачки, ценой второго
+    /// прямого прохода. Под GradCache не действует.
+    public var sequentialBackward: Bool = true
     public var temperature: Float
     public var maxTokens: Int?
     public var maxChars: Int
@@ -250,6 +254,10 @@ public enum EmbeddingFinetune {
                     model: model, trainable: trainable,
                     chunkSize: stage.gradCacheChunk,
                     temperature: stage.temperature, symmetric: symmetric)
+                : stage.sequentialBackward
+                ? EmbeddingObjective.sequentialProvider(
+                    model: model, trainable: trainable,
+                    temperature: stage.temperature, symmetric: symmetric)
                 : nil
 
             let trainer = Trainer<TripletBatch>(
@@ -275,7 +283,11 @@ public enum EmbeddingFinetune {
                 objective: { EmbeddingObjective.classificationLoss(model, $0,
                                                                    temperature: stage.temperature) },
                 nextBatch: { batcher.next() },
-                config: stage.config)
+                config: stage.config,
+                gradient: stage.sequentialBackward
+                    ? EmbeddingObjective.sequentialClassificationProvider(
+                        model: model, trainable: trainable, temperature: stage.temperature)
+                    : nil)
             return trainer.run(isCancelled: isCancelled, onStep: onStep)
         }
     }

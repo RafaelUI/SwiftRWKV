@@ -906,7 +906,7 @@ public final class X070Backbone {
     }
 
     /// ln_out поверх выхода последнего блока.
-    func finalNorm(_ x: MLXArray, T: Int) -> MLXArray {
+    public func finalNorm(_ x: MLXArray, T: Int) -> MLXArray {
         layerNorm(x, g("ln_out.weight"), g("ln_out.bias"),
                   fast: rwkvFrozenLayerNorm(context(cfg.nLayer - 1), T))
     }

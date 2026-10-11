@@ -34,9 +34,12 @@ OUT=$(swift test $FILTER 2>&1); RC=$?
 
 # Признак «код собрался и тесты пошли». Без него любое "error:" — это
 # ошибка компиляции, то есть мутация просто невалидна, а не поймана.
-if ! echo "$OUT" | grep -q "Test Case '"; then
+# Через here-string, а не `echo | grep -q`: grep -q выходит на первом совпадении,
+# echo на большом выводе получает SIGPIPE, и под pipefail конвейер считается
+# упавшим — мутация с сотней падений (то есть ПОЙМАННАЯ) объявлялась несобранной.
+if ! grep -q "Test Case '" <<< "$OUT"; then
     echo "НЕ СОБРАЛОСЬ (мутация невалидна)"
-    echo "$OUT" | grep -E "error:" | head -3
+    grep -E "error:" <<< "$OUT" | head -3 || true
     exit 2
 fi
 
@@ -56,10 +59,10 @@ fi
 # `swift test` возвращает ненулевой код при любом падении, включая сигнал и
 # fatal error. Текстовые признаки оставлены вторым рубежом.
 if [ $RC -ne 0 ] \
-   || echo "$OUT" | grep -qE "and [1-9][0-9]* failure|with [1-9][0-9]* failure" \
-   || echo "$OUT" | grep -qE "unexpected signal code|Fatal error"; then
+   || grep -qE "and [1-9][0-9]* failure|with [1-9][0-9]* failure" <<< "$OUT" \
+   || grep -qE "unexpected signal code|Fatal error" <<< "$OUT"; then
     echo "ПОЙМАНА"
-    echo "$OUT" | grep -E "error:|Fatal error" | grep -v "^error: Process" | head -3
+    grep -E "error:|Fatal error" <<< "$OUT" | grep -v "^error: Process" | head -3 || true
     exit 0
 fi
 

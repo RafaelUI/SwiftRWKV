@@ -144,7 +144,7 @@ growing a second one. Default is `nil` and the standard path is untouched.
 
 **Set a Metal buffer-cache ceiling.** Batch shapes vary, so freed buffers are
 rarely reusable, and MLX's cache grows linearly with the number of batches
-until the machine swaps. `cacheLimitGB: 2.0` is the default in every config
+until the machine swaps. `cacheLimitGB: 0.25` is the default in every config
 here. Measured: without it, an encoding run reached 13 GB physical footprint
 and went to swap.
 
@@ -263,9 +263,9 @@ activations of several blocks end up alive at once. Peak memory grows by about
 Two switches fix the order instead of the granularity:
 
 ```swift-skip
-cfg.sequentialBackward = true   // backward block by block, evaluated after each
-cfg.lossChunkTokens = 256       // head and cross-entropy in pieces
-cfg.cacheLimitGB = 0.25         // the MLX cache counts toward the footprint
+cfg.sequentialBackward = true   // backward block by block, evaluated after each (default)
+cfg.lossChunkTokens = 256       // head and cross-entropy in pieces (default)
+cfg.cacheLimitGB = 0.25         // the MLX cache counts toward the footprint (default)
 ```
 
 `sequentialBackward` runs a gradient-free forward pass that keeps each block's
@@ -287,8 +287,10 @@ and peak physical footprint (`/usr/bin/time -l`):
 `lossChunkTokens` applies only while the head is a constant (no adapter, no
 trained override); with a trained head the loss takes the ordinary path.
 
-Both are off by default. `decode-bench --train-bench m.rwkvq --tb-t 2048
---tb-seq --tb-loss-chunk 256` measures a step on your own model.
+All three are the defaults. Switch `sequentialBackward` off when memory is not
+a constraint: the plain path saves the second forward pass. `decode-bench
+--train-bench m.rwkvq --tb-t 2048 --tb-seq --tb-loss-chunk 256 --tb-cache 0.25`
+measures a step on your own model.
 
 Adapters persist separately from the base:
 

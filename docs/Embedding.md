@@ -225,6 +225,30 @@ it, an out-of-range embedding lookup does not fail in MLX: the loss becomes
 NaN and training spins uselessly until the run ends. This has happened twice
 in this codebase, which is why the check exists.
 
+### Memory: backward block by block
+
+A stage computes its gradient block by block by default
+(`EmbeddingStage.sequentialBackward`, see [Train.md](Train.md#long-sequences)).
+Autograd over the whole graph keeps the activations of every layer of every
+batch part alive until the backward pass ends; here only block inputs are
+kept, the loss is taken from the outputs of the last block, and blocks are
+differentiated top-down with an evaluation after each. The gradient is the
+same in every mode — head only, top layers, the whole base, adapters.
+
+0.1B, 8 triplets of 256 tokens, step time and peak physical footprint of the
+process (`embed-run --seq 0|1`, M4):
+
+| mode | whole-graph autograd | block by block |
+|---|---|---|
+| LoRA, dense base | 2.18 s, 8.76 GB | 2.98 s, 2.40 GB |
+| whole base | 2.97 s, 11.77 GB | 3.51 s, 3.31 GB |
+| top 4 layers | 1.40 s, 5.02 GB | 1.71 s, 2.57 GB |
+| QLoRA, REDUCTION | 2.17 s, 7.91 GB | 2.99 s, 1.74 GB |
+
+The price is a second forward pass (+18…37% time). Set
+`stage.sequentialBackward = false` when memory is not the constraint. Under
+GradCache the switch has no effect.
+
 ### GradCache
 
 Contrastive losses want large batches, because the batch *is* the pool of
