@@ -346,6 +346,75 @@ opaque to autograd and runs only in the recurrent step.
 
 ---
 
+## State-tuning and pluggable initial states
+
+RWKV is an RNN: a sequence does not have to start from zeros. The starting
+state is a pluggable object here — trained (state-tuning), folded from a prompt,
+or one on top of the other — kept in its own small file. Code:
+`Sources/RWKVGen/InitialState.swift`; the reference is rwkv-metal
+(`docs/state-tuning.md` there), and the file format and base fingerprint are
+the same in both, bit for bit.
+
+A trained state and a state after a prompt are one type, `RWKVBatchState` with
+batch 1: `wkv` `[L, 1, H, S, S]` (fp32), `tmixShift` and `cmixShift`
+`[L, 1, 1, D]`. State-tuning trains only `wkv` by default, as RWKV-PEFT does —
+0.1B: 589,824 numbers, 0.4B: 1,572,864, 1.5B: 3,145,728. The two shift vectors
+are 3% on top and act on the first token of each layer only; `train:` turns
+them on.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+let ids = MLXArray((0 ..< 65).map { Int32($0 % 60000) }, [1, 65])
+let batch: LoRABatch = (x: ids[0..., 0 ..< 64], y: ids[0..., 1 ... 64])   // T % 16 == 0
+
+var config = StateTuneConfig()           // lr 1 -> 0.01 (cosine), WKV only
+config.maxSteps = 500
+let (result, state) = StateTuning.run(base, nextBatch: { batch }, config: config)
+print(result.finalLoss, state.wkv.shape)
+
+// its own file, with the fingerprint of the base it was trained on
+let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
+try StateFile.save(state, base: base, to: url, note: "world 0.1b")
+
+// later, on the same base
+let (loaded, info) = try StateFile.load(url, base: base)
+base.initialState = loaded               // body / prefill / embedder start from it
+print(info.kind, info.trained)
+
+let cached = base.foldPrompt([510, 261, 0])          // attached -> prompt -> cache
+_ = base.bodyWithState(batch.x, state: cached)       // an explicit state wins
+base.initialState = nil
+```
+
+- **Attaching.** `backbone.initialState = state` splits the state by layer; a
+  block takes `h_in` and the shifts from it only where the caller passed none —
+  each part separately. `body`, the embedder, `prefill` and the reranker's
+  prefix encoding therefore start from the attached state, and "trained ->
+  system prompt -> cache" is plain continuation with no code of its own.
+  `startState()` gives the same start to step-by-step decoding. An attached
+  zero state changes nothing, bit for bit.
+- **Memory and cost.** The state of a layer is a parameter of its own block
+  (`blocks.N.state0.wkv`), so `SequentialBody` runs the step backward block by
+  block with one block in memory, and the gradient equals autograd over the
+  whole graph. The state enters every layer from layer 0 up, so the gradient
+  goes through the full depth: there is no frozen bottom on fast kernels, and a
+  step costs about as much as adapters on every layer.
+- **Embedding.** `BaseTrainingMode.state(learningRateScale:parts:)` trains the
+  state and the pooling head. The two want very different step sizes — the state
+  starts from zero — so the mode carries a multiplier on the stage learning
+  rate (`TrainableSet.learningRateScales`).
+- **The file.** `StateFile` writes three fp32 tensors and metadata: format,
+  version, the contract (layers, D, heads, head size), `kind`, `trained`, a
+  free-form `note`, and the base fingerprint. A different architecture is
+  always refused; a different base throws `StateFile.Failure.otherBase` unless
+  `allowOtherBase: true`.
+- **The fingerprint** (`StateFile.baseFingerprint`) is a sha256 over the
+  contract, the small tensors of the base and row 0 of two projections, through
+  bf16 (rows of compressed `.rwkvq` projections through fp16). The same base
+  loaded as bf16 and as fp32 gives one value; a dense model, its `reduction`
+  file and its `compression` file are three different bases. Adapters, a
+  trainable override and the attached state are not part of it.
+
 ## Partial fine-tuning: top-N layers plus a classifier
 
 For classification, where only the upper layers need to move.
@@ -517,8 +586,9 @@ legitimate training input.
   `RerankTraining` does not surface it. Deliberately deferred while training
   takes seconds.
 - **`X070PartialFinetune` is not on the shared trainer.**
-- **The backbone is not fingerprinted in any checkpoint.** A head trained on
-  one backbone and loaded onto another differs in neither shape nor contract.
+- **The backbone is fingerprinted only in state files** (`StateFile`). Adapter
+  and head checkpoints still are not: a head trained on one backbone and loaded
+  onto another differs in neither shape nor contract.
 - **Reservoir sampling is missing from `EmbeddingDataset.loadJSONL`**, so a
   slice of a large corpus is its beginning rather than a sample.
   `RerankDataset` does this correctly and the code transfers by copying.

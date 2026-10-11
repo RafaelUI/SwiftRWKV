@@ -705,6 +705,43 @@ func doc_Train_7() throws {
         return X070Backbone(weights: weights, cfg: cfg)
     }
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    let ids = MLXArray((0 ..< 65).map { Int32($0 % 60000) }, [1, 65])
+    let batch: LoRABatch = (x: ids[0..., 0 ..< 64], y: ids[0..., 1 ... 64])   // T % 16 == 0
+
+    var config = StateTuneConfig()           // lr 1 -> 0.01 (cosine), WKV only
+    config.maxSteps = 500
+    let (result, state) = StateTuning.run(base, nextBatch: { batch }, config: config)
+    print(result.finalLoss, state.wkv.shape)
+
+    // its own file, with the fingerprint of the base it was trained on
+    let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
+    try StateFile.save(state, base: base, to: url, note: "world 0.1b")
+
+    // later, on the same base
+    let (loaded, info) = try StateFile.load(url, base: base)
+    base.initialState = loaded               // body / prefill / embedder start from it
+    print(info.kind, info.trained)
+
+    let cached = base.foldPrompt([510, 261, 0])          // attached -> prompt -> cache
+    _ = base.bodyWithState(batch.x, state: cached)       // an explicit state wins
+    base.initialState = nil
+}
+
+func doc_Train_8() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
     let examples = [X070Example(ids: [1, 2, 3], label: 0),
                     X070Example(ids: [4, 5, 6], label: 1)]
 
@@ -724,7 +761,7 @@ func doc_Train_7() throws {
     X070PartialFinetune.clearCache()
 }
 
-func doc_Train_8() throws {
+func doc_Train_9() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -761,7 +798,7 @@ func doc_Train_8() throws {
     print(cfg.modelConfig.nLayer, cfg.resolvedMaxSteps())
 }
 
-func doc_Train_9() throws {
+func doc_Train_10() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -783,7 +820,7 @@ func doc_Train_9() throws {
     print(weights.count, backbone.cfg.nLayer)
 }
 
-func doc_Train_10() throws {
+func doc_Train_11() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -810,7 +847,7 @@ func doc_Train_10() throws {
     print(source().x.shape)
 }
 
-func doc_Train_11() throws {
+func doc_Train_12() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
