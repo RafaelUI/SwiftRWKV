@@ -284,6 +284,9 @@ and peak physical footprint (`/usr/bin/time -l`):
 | 4096 | does not fit | 21.3 s, 5.17 GB |
 | 8192 | does not fit | 42.7 s, 8.16 GB |
 
+`lossChunkTokens` is a budget of positions for the whole batch: along the
+sequence a piece is `lossChunkTokens / B` positions, so a piece of logits is
+the same size at any batch (0.1B, 8 × 512: 3.06 → 2.04 GB of footprint).
 `lossChunkTokens` applies only while the head is a constant (no adapter, no
 trained override); with a trained head the loss takes the ordinary path.
 

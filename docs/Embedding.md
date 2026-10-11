@@ -309,10 +309,55 @@ Without the knobs, memory and time follow the tokens of the batch: 8 × 512 and
 4 × 1024 cost the same. Head-only training needs no backward pass through the
 body and stays under 1.9 GB in every cell above.
 
-Evaluation is a separate budget: `EmbeddingMetrics.embedAll` runs 16 texts per
-batch through the whole body in one graph, about 0.14 GB per 1024 tokens of
-the batch on top of the model — at 512 tokens it is already above a chunked
-training step.
+"As is" in these tables means `bodyChunkTokens = 0`; the default is 2048.
+
+Evaluation has its own budget. `EmbeddingMetrics.embedAll` fills a batch by
+rows and by tokens (`EmbeddingMetrics.evaluationBatchTokens`, 4096) and runs
+the body block by block. 32 held-out rows of 1024 tokens, peak MLX memory:
+0.1B 1.85 → 0.84 GB, 0.4B REDUCTION 2.17 → 1.15 GB; evaluation takes 10…29%
+longer than one graph over 16 rows did.
+
+### Training top layers over a quantized base
+
+Adapters on a 0.1B or 0.4B model carry too few parameters to be worth it; the
+useful mode there is training the top layers themselves. A `.rwkvq` base
+supports it once those layers are unpacked — the bottom stays compressed and
+frozen:
+
+```swift-skip
+let base = try X070Backbone.load(fromRwkvq: path)
+base.unpackTopLayers(4)                       // projections of the top 4 layers become dense weights
+let model = EmbeddingModel(backbone: base)
+try EmbeddingFinetune.run(model: model, tokenizer: tok, mode: .topLayers(4), stages: [stage])
+```
+
+The unpacked projections are the same dequantized numbers the compressed base
+computed with (the embedding moves by 1.7e-4). Training speed in tokens per
+second and peak physical footprint of the process — retrieval stage, top N
+layers and the head trained, three texts of 512 tokens per triplet, tokens
+counted over the whole step including the frozen bottom (M4 16 GB, defaults,
+`embed-run --mode top:N --eval 0`; bold is above 3 GB):
+
+| model | layers | batch 1 | batch 2 | batch 4 |
+|---|---|---|---|---|
+| 0.1B bf16 | 2 | 3072 tok/s, 1.05 GB | 3657 tok/s, 1.24 GB | 3840 tok/s, 1.74 GB |
+| 0.1B bf16 | 4 | 2259 tok/s, 1.32 GB | 2719 tok/s, 1.48 GB | 2831 tok/s, 2.01 GB |
+| 0.1B bf16 | 6 | 1766 tok/s, 1.64 GB | 2148 tok/s, 1.74 GB | 2259 tok/s, 2.28 GB |
+| 0.1B REDUCTION | 2 | 3268 tok/s, 0.98 GB | 3889 tok/s, 1.21 GB | 4267 tok/s, 1.68 GB |
+| 0.1B REDUCTION | 4 | 2363 tok/s, 1.26 GB | 2844 tok/s, 1.46 GB | 3027 tok/s, 1.96 GB |
+| 0.1B REDUCTION | 6 | 1807 tok/s, 1.59 GB | 2210 tok/s, 1.73 GB | 2336 tok/s, 2.25 GB |
+| 0.4B bf16* | 2 | 1313 tok/s, 1.91 GB | 1477 tok/s, 2.13 GB | 1466 tok/s, 2.70 GB |
+| 0.4B bf16* | 4 | 1067 tok/s, 2.32 GB | 1209 tok/s, 2.56 GB | 1212 tok/s, **3.16** GB |
+| 0.4B bf16* | 6 | 909 tok/s, 2.86 GB | 1031 tok/s, 3.00 GB | 1027 tok/s, **3.62** GB |
+| 0.4B REDUCTION | 2 | 1463 tok/s, 1.60 GB | 1707 tok/s, 1.88 GB | 1736 tok/s, 2.41 GB |
+| 0.4B REDUCTION | 4 | 1164 tok/s, 2.07 GB | 1347 tok/s, 2.30 GB | 1368 tok/s, 2.90 GB |
+| 0.4B REDUCTION | 6 | 966 tok/s, 2.61 GB | 1113 tok/s, 2.77 GB | 1129 tok/s, **3.39** GB |
+
+\* no dense 0.4B file was at hand: the model is the dequantized REDUCTION
+saved as bf16 — speed and memory of a real bf16 model, not its weights.
+
+With `SequentialBody.pipelined = true` the same grid runs 2…15% faster for
+0.2…0.6 GB more.
 
 ### GradCache
 
