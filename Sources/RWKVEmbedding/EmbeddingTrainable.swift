@@ -92,12 +92,25 @@ public enum EmbeddingTrainable {
     /// `.frozen` и `.lora` (QLoRA: база остаётся сжатой).
     public static func unsupportedReason(model: EmbeddingModel,
                                          mode: BaseTrainingMode) -> String? {
-        guard !model.backbone.rwkvqBackedKeys.isEmpty else { return nil }
+        let bb = model.backbone
+        guard !bb.rwkvqBackedKeys.isEmpty else { return nil }
         switch mode {
         case .frozen, .lora: return nil
-        case .topLayers, .full:
+        case .topLayers(let n):
+            // верхние слои развёрнуты в плотные (`unpackTopLayers`) — обучать можно:
+            // низ остаётся сжатым и замороженным
+            let from = Swift.max(0, bb.cfg.nLayer - n)
+            let packed = bb.rwkvqBackedKeys.filter { key in
+                (from ..< bb.cfg.nLayer).contains { key.hasPrefix("blocks.\($0).") }
+            }
+            if packed.isEmpty { return nil }
+            return "режим \(mode) на квантованной базе: в верхних \(n) слоях \(packed.count) проекций — "
+                + "сжатые коды, в обучаемое множество они не входят; сначала "
+                + "backbone.unpackTopLayers(\(n)) либо режим .frozen / .lora"
+        case .full:
             return "режим \(mode) на квантованной базе: проекции — сжатые коды и в обучаемое "
-                + "множество не входят; квантованной базе — .frozen либо .lora"
+                + "множество не входят; квантованной базе — .frozen, .lora либо .topLayers "
+                + "после unpackTopLayers"
         }
     }
 

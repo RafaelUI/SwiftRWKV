@@ -477,6 +477,35 @@ public final class X070Backbone {
         }
     }
 
+    /// Развернуть проекции верхних `n` слоёв базы из .rwkvq в плотные веса:
+    /// нижние слои остаются сжатыми и замороженными, верхние становятся
+    /// обычными весами в типе плотных параметров модели и могут войти в
+    /// обучаемое множество (`BaseTrainingMode.topLayers`). Сжатые коды — не
+    /// веса, обучать их нельзя; адаптеры на малых моделях (0.1B, 0.4B) дают
+    /// слишком мало параметров, поэтому путь для них — обучение самих верхних
+    /// слоёв над сжатым низом. Числа проекции — те же деквантованные, что
+    /// считала сжатая база. Необратимо: подложка веса отпускается.
+    /// Возвращает имена развёрнутых весов.
+    @discardableResult
+    public func unpackTopLayers(_ n: Int) -> [String] {
+        let from = Swift.max(0, cfg.nLayer - n)
+        let dtype = w["ln0.weight"]?.dtype ?? .bfloat16
+        func layer(_ key: String) -> Int? {
+            let parts = key.split(separator: ".")
+            return parts.count > 2 && parts[0] == "blocks" ? Int(parts[1]) : nil
+        }
+        var done: [String] = []
+        for key in (rwkvqBackedKeys + rwkvqDenseTargets.sorted()) where (layer(key) ?? -1) >= from {
+            guard let dense = denseWeight(key) else { continue }
+            let value = dense.asType(dtype)
+            eval(value)
+            w[key] = value
+            releaseRwkvqBacking(key)
+            done.append(key)
+        }
+        return done
+    }
+
     /// Форма (out, in) проекции, где бы ни лежал её вес: плотным, в
     /// стоковом кванте, в сайдкаре .rwkvq или в родном контейнере. Нужна
     /// тем, кто навешивает адаптеры: на базе из .rwkvq плотных копий

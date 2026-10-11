@@ -187,5 +187,23 @@ run "потолок кэша ставится только в цикле обу�
 run "потолок кэша 0 понимается как «без кэша»" \
     "$EF" 'if cfg.cacheLimitGB > 0 { MLX.Memory.cacheLimit' 'if cfg.cacheLimitGB >= 0 { MLX.Memory.cacheLimit'
 
+echo "── эмбеддер: верхние слои базы из .rwkvq плотными ──"
+XB=Sources/RWKVGen/X070Backbone.swift
+ET=Sources/RWKVEmbedding/EmbeddingTrainable.swift
+run "разворачиваются нижние слои вместо верхних" \
+    "$XB" 'for key in (rwkvqBackedKeys + rwkvqDenseTargets.sorted()) where (layer(key) ?? -1) >= from {' \
+          'for key in (rwkvqBackedKeys + rwkvqDenseTargets.sorted()) where (layer(key) ?? cfg.nLayer) < n {'
+run "развёрнутый вес остаётся на сжатой подложке" \
+    "$XB" '            w[key] = value
+            releaseRwkvqBacking(key)' '            w[key] = value'
+run "развёрнут вес соседней проекции" \
+    "$XB" 'guard let dense = denseWeight(key) else { continue }' \
+          'guard let dense = denseWeight(key.replacingOccurrences(of: "k_proj", with: "v_proj")) else { continue }'
+run "верхние слои на сжатой базе разрешены без разворачивания" \
+    "$ET" 'if packed.isEmpty { return nil }' 'if packed.isEmpty || n > 0 { return nil }'
+run "проверка сжатых слоёв смотрит на нижние" \
+    "$ET" '(from ..< bb.cfg.nLayer).contains { key.hasPrefix("blocks.\($0).") }' \
+          '(0 ..< from).contains { key.hasPrefix("blocks.\($0).") }'
+
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

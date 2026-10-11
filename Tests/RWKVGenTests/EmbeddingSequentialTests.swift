@@ -326,6 +326,54 @@ final class EmbeddingSequentialTests: XCTestCase {
               })
     }
 
+    /// Верхние слои базы из .rwkvq, развёрнутые в плотные (`unpackTopLayers`):
+    /// низ остаётся сжатым, верх обучается как у плотной модели. Числа
+    /// проекций те же деквантованные — выход тела не уходит дальше решётки
+    /// типа; градиент по блокам сходится с автоградом по каждому весу.
+    func testTopLayersTrainOverQuantisedBase() throws {
+        let path = try RwkvqFileTests.sourcePath("reduction")
+        let bb = try X070Backbone.load(fromRwkvq: path)
+        let L = bb.cfg.nLayer
+        let model = EmbeddingModel(backbone: bb)
+        MLXRandom.seed(103)
+        model.head.fc2 = MLXRandom.normal(model.head.fc2.shape) * 0.05
+        let b = triplets(vocab: 60000)
+        let before = bb.withoutGradientPath { model.embed(b.positiveIdx, poolIndex: b.positivePool) }
+        eval(before)
+        XCTAssertNotNil(EmbeddingTrainable.unsupportedReason(model: model, mode: .topLayers(2)),
+                        "сжатые верхние слои обучать нельзя")
+
+        let packedBefore = bb.rwkvqBackedKeys.count
+        let unpacked = bb.unpackTopLayers(2)
+        XCTAssertFalse(unpacked.isEmpty)
+        XCTAssertTrue(unpacked.allSatisfy { $0.hasPrefix("blocks.\(L - 1).") || $0.hasPrefix("blocks.\(L - 2).") },
+                      "развёрнуты только два верхних слоя")
+        XCTAssertTrue(unpacked.allSatisfy { bb.w[$0] != nil && !bb.isRwkvqBacked($0) }, "вес плотный, подложка снята")
+        XCTAssertEqual(bb.rwkvqBackedKeys.count + unpacked.filter { !bb.rwkvqDenseTargets.contains($0) }.count,
+                       packedBefore, "остальные слои остались сжатыми")
+        XCTAssertFalse(bb.rwkvqBackedKeys.contains { $0.hasPrefix("blocks.\(L - 1).") || $0.hasPrefix("blocks.\(L - 2).") })
+        XCTAssertTrue(bb.rwkvqBackedKeys.contains { $0.hasPrefix("blocks.\(L - 3).") })
+        XCTAssertNil(EmbeddingTrainable.unsupportedReason(model: model, mode: .topLayers(2)))
+        XCTAssertNotNil(EmbeddingTrainable.unsupportedReason(model: model, mode: .topLayers(3)), "третий сверху — сжат")
+        XCTAssertNotNil(EmbeddingTrainable.unsupportedReason(model: model, mode: .full))
+
+        let after = bb.withoutGradientPath { model.embed(b.positiveIdx, poolIndex: b.positivePool) }
+        let drift = MLX.abs(before.asType(.float32) - after.asType(.float32)).max().item(Float.self)
+        print(String(format: "ВЕРХ ИЗ .rwkvq ПЛОТНЫМ: развёрнуто %d весов (тип %@), сдвиг вектора %.1e",
+                     unpacked.count, String(describing: bb.w[unpacked[0]]!.dtype), drift))
+        XCTAssertLessThan(drift, 2e-3, "те же деквантованные числа: вектор (норма 1) сдвигается лишь на округления счёта (замерено 1.7e-4)")
+
+        let set = EmbeddingTrainable.make(model: model, mode: .topLayers(2))
+        XCTAssertTrue(unpacked.allSatisfy { set.parameterNames.contains($0) }, "развёрнутые веса — в обучаемом множестве")
+        let ps = set.initialParameters()
+        check(".rwkvq, два верхних слоя плотными", set, ps,
+              eager: { EmbeddingObjective.tripletLoss(model, b, temperature: 0.05, symmetric: false) },
+              sequential: {
+                  EmbeddingObjective.sequentialProvider(model: model, trainable: set,
+                                                        temperature: 0.05, symmetric: false)(ps, b)
+              })
+    }
+
     /// Потолок кэша MLX действует уже на оценке «до обучения», а не только в
     /// цикле обучения: без него пик footprint всего прогона случался на оценке.
     func testCacheLimitIsAppliedBeforeFirstEvaluation() throws {
