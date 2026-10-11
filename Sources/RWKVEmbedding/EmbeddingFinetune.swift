@@ -156,6 +156,13 @@ public enum EmbeddingFinetune {
         try checkVocab(model: model, tokenizer: tokenizer, stage: stage,
                        terminator: terminator)
 
+        // Потолок кэша MLX — ДО первой оценки. `Trainer.run` ставит его сам, но
+        // оценка «до обучения» идёт раньше, и без потолка её освобождённые
+        // буферы остаются в кэше, а кэш входит в footprint процесса: пик всего
+        // прогона случался здесь, а не в обучении (0.1B, LoRA, 8 триплетов по
+        // 256 токенов: 3.12 ГБ при 1.83 ГБ в установившемся обучении).
+        applyCacheLimit(stage.config)
+
         let before = stage.heldOut.isEmpty ? nil
             : evaluate(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
 
@@ -172,6 +179,15 @@ public enum EmbeddingFinetune {
                            finalLoss: result.finalLoss, steps: result.steps,
                            seconds: seconds)
     }
+
+    /// Потолок кэша MLX из конфигурации стадии (0 — не трогать).
+    static func applyCacheLimit(_ cfg: TrainingConfig) {
+        if cfg.cacheLimitGB > 0 { MLX.Memory.cacheLimit = Int(cfg.cacheLimitGB * 1e9) }
+    }
+
+    /// Вызывается в начале каждой оценки — только для тестов (что действует в
+    /// момент оценки, снаружи иначе не увидеть).
+    nonisolated(unsafe) static var evaluationProbe: (() -> Void)? = nil
 
     /// Curriculum: стадии подряд над одной моделью, обучаемое множество общее.
     @discardableResult
@@ -297,6 +313,7 @@ public enum EmbeddingFinetune {
     public static func evaluate(model: EmbeddingModel, tokenizer: WorldTokenizer,
                                 stage: EmbeddingStage,
                                 terminator: Int = 0) -> EmbeddingEvaluation {
+        evaluationProbe?()
         switch stage.task {
         case .retrieval:
             return .ranking(EmbeddingMetrics.evaluateRetrieval(

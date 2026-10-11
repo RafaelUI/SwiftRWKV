@@ -161,6 +161,31 @@ final class EmbeddingSequentialTests: XCTestCase {
               })
     }
 
+    /// Потолок кэша MLX действует уже на оценке «до обучения», а не только в
+    /// цикле обучения: без него пик footprint всего прогона случался на оценке.
+    func testCacheLimitIsAppliedBeforeFirstEvaluation() throws {
+        let tok = try EmbeddingFinetuneTests().loadWorldTokenizerOrSkip()
+        let rows = try EmbeddingFinetuneTests().slice().filter { $0.task == .retrieval }
+        try XCTSkipIf(rows.count < 8, "мало строк retrieval в срезе")
+        let saved = MLX.Memory.cacheLimit
+        defer { MLX.Memory.cacheLimit = saved; EmbeddingFinetune.evaluationProbe = nil }
+        func limitsSeen(cacheGB: Double) throws -> [Int] {
+            MLX.Memory.cacheLimit = 7_000_000_000
+            var seen: [Int] = []
+            EmbeddingFinetune.evaluationProbe = { seen.append(MLX.Memory.cacheLimit) }
+            let model = makeModel(vocab: 65536)
+            let set = EmbeddingTrainable.make(model: model, mode: .frozen)
+            let stage = EmbeddingStage(task: .retrieval, train: Array(rows.prefix(4)),
+                                       heldOut: Array(rows.suffix(4)),
+                                       config: TrainingConfig(lr: 1e-3, maxSteps: 1, cacheLimitGB: cacheGB, logEvery: 0),
+                                       batchSize: 2, maxTokens: 48, maxChars: 200)
+            _ = try EmbeddingFinetune.runStage(model: model, tokenizer: tok, trainable: set, stage: stage)
+            return seen
+        }
+        XCTAssertEqual(try limitsSeen(cacheGB: 0.125), [125_000_000, 125_000_000], "оценка до и после обучения")
+        XCTAssertEqual(try limitsSeen(cacheGB: 0), [7_000_000_000, 7_000_000_000], "0 — потолок не трогать")
+    }
+
     /// Стадия идёт обратным проходом по блокам по умолчанию, не идёт под
     /// GradCache и при выключателе; обучение даёт те же параметры.
     func testStageUsesSequentialBackwardByDefault() throws {
