@@ -204,6 +204,9 @@ run "верхние слои на сжатой базе разрешены бе�
 run "проверка сжатых слоёв смотрит на нижние" \
     "$ET" '(from ..< bb.cfg.nLayer).contains { key.hasPrefix("blocks.\($0).") }' \
           '(0 ..< from).contains { key.hasPrefix("blocks.\($0).") }'
+run "куски по строкам по умолчанию выключены" \
+    "$EF" 'public var bodyChunkTokens: Int = 2048' 'public var bodyChunkTokens: Int = 0'
+
 echo "── эмбеддер: оценка батчем по токенам ──"
 EM=Sources/RWKVEmbedding/EmbeddingMetrics.swift
 run "бюджет токенов батча оценки не действует" \

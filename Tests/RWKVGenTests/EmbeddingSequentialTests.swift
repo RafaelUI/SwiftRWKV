@@ -296,7 +296,7 @@ final class EmbeddingSequentialTests: XCTestCase {
             XCTAssertEqual(retraced > 0, stride > 1, "traceStride из стадии")
             return n
         }
-        XCTAssertEqual(EmbeddingStage(task: .retrieval, train: []).bodyChunkTokens, 0, "умолчание")
+        XCTAssertEqual(EmbeddingStage(task: .retrieval, train: []).bodyChunkTokens, 2048, "умолчание")
         XCTAssertEqual(try forwards(chunk: nil), 3, "три пачки целиком")
         XCTAssertEqual(try forwards(chunk: 1), 6, "по строке: две строки в каждой из трёх пачек")
         XCTAssertEqual(try forwards(chunk: nil, stride: 2), 3)
