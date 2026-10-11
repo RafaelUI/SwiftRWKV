@@ -306,7 +306,10 @@ public final class X070Backbone {
             }
             // буферы базы — константы, котангент только по x
             VJP { primals, cotangents in
-                [matmul(cotangents[0].asType(bwd), weight(bwd)).asType(primals[0].dtype)]
+                if RWKVAblation.skipProjectionBackward {      // только замер, см. RWKVAblation
+                    return [MLXArray.zeros(primals[0].shape, dtype: primals[0].dtype)]
+                }
+                return [matmul(cotangents[0].asType(bwd), weight(bwd)).asType(primals[0].dtype)]
             }
         }
         return fn([x])[0]
@@ -557,6 +560,9 @@ public final class X070Backbone {
     public var bodyWeightKeys: [String] {
         weightKeys.filter { $0 != "emb.weight" && $0 != "head.weight" }
     }
+
+    /// Голова — константа для автограда: ни адаптера, ни обучаемой подмены.
+    var headIsConstant: Bool { loraA["head"] == nil && wOverride?["head.weight"] == nil }
 
     /// Навешены ли LoRA-адаптеры.
     public var hasLoRAAdapters: Bool { !loraA.isEmpty }
@@ -882,8 +888,7 @@ public final class X070Backbone {
 
     /// body: всё кроме головы. ids [B,T] → ln_out [B,T,D].
     public func body(_ ids: MLXArray) -> MLXArray {
-        let emb = embed(ids)        // [B,T,D]
-        var x = layerNorm(emb, g("ln0.weight"), g("ln0.bias"))
+        var x = stem(ids)
         var vFirst: MLXArray? = nil
         for layer in 0 ..< cfg.nLayer {
             let (xo, vf): (MLXArray, MLXArray) = useBlockCheckpoint
@@ -892,8 +897,18 @@ public final class X070Backbone {
             x = xo
             vFirst = vf
         }
-        return layerNorm(x, g("ln_out.weight"), g("ln_out.bias"),
-                         fast: rwkvFrozenLayerNorm(context(cfg.nLayer - 1), ids.shape[1]))
+        return finalNorm(x, T: ids.shape[1])
+    }
+
+    /// Вход первого блока: ln0(emb(ids)), [B,T,D].
+    func stem(_ ids: MLXArray) -> MLXArray {
+        layerNorm(embed(ids), g("ln0.weight"), g("ln0.bias"))
+    }
+
+    /// ln_out поверх выхода последнего блока.
+    func finalNorm(_ x: MLXArray, T: Int) -> MLXArray {
+        layerNorm(x, g("ln_out.weight"), g("ln_out.bias"),
+                  fast: rwkvFrozenLayerNorm(context(cfg.nLayer - 1), T))
     }
 
     /// Полный forward в логиты: ids [B,T] → logits [B,T,vocab].

@@ -126,6 +126,10 @@ struct Args {
     var prefillProfile: String? = nil
     /// Короткий параллельный проход: ядра GEMV против «деквант + матмул» по длинам.
     var shortBench: String? = nil
+    /// Шаг QLoRA над базой из .rwkvq: время и память по длинам (TrainBench.swift).
+    var trainBench: String? = nil
+    var tb = TrainBenchOptions()
+    var tbMicro: Int? = nil
 }
 
 func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
@@ -168,6 +172,20 @@ func parseArgs() -> Args {
         case "--no-read-ahead": RwkvqContainer.readAheadEnabled = false
         case "--prefill-profile": a.prefillProfile = it.next()
         case "--short-bench": a.shortBench = it.next()
+        case "--train-bench": a.trainBench = it.next()
+        case "--tb-profile": a.tb.profile = true
+        case "--tb-seq": a.tb.sequential = true
+        case "--tb-no-forward": a.tb.forward = false
+        case "--tb-loss-chunk": a.tb.lossChunk = Int(it.next() ?? "") ?? a.tb.lossChunk
+        case "--tb-guard": a.tb.guardGB = Double(it.next() ?? "") ?? a.tb.guardGB
+        case "--tb-micro": a.tbMicro = Int(it.next() ?? "")
+        case "--tb-t": a.tb.lengths = (it.next() ?? "").split(separator: ",").compactMap { Int($0) }
+        case "--tb-rank": a.tb.rank = Int(it.next() ?? "") ?? a.tb.rank
+        case "--tb-ckpt": a.tb.checkpoint = it.next() ?? a.tb.checkpoint
+        case "--tb-steps": a.tb.steps = Int(it.next() ?? "") ?? a.tb.steps
+        case "--tb-batch": a.tb.batch = Int(it.next() ?? "") ?? a.tb.batch
+        case "--tb-cache": a.tb.cacheLimitGB = Double(it.next() ?? "") ?? a.tb.cacheLimitGB
+        case "--tb-from": a.tb.layersFrom = Int(it.next() ?? "") ?? a.tb.layersFrom
         default:
             print("неизвестный аргумент \(k)")
             exit(2)
@@ -1155,6 +1173,14 @@ func shortBench(_ path: String, _ args: Args) throws {
     }
 }
 
+if let T = args.tbMicro {
+    trainMicro(T)
+    exit(0)
+}
+if let path = args.trainBench {
+    try trainBench(path, args.tb)
+    exit(0)
+}
 if let path = args.shortBench {
     try shortBench(path, args)
     exit(0)

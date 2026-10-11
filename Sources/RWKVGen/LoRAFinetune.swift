@@ -44,6 +44,13 @@ public struct LoRAConfig: Sendable {
     public var logEvery: Int
     /// true ⇒ блочный gradient checkpoint (−~45% пик памяти / +~22% времени).
     public var useBlockCheckpoint: Bool
+    /// Голова и лосс по кускам из стольких позиций (0 — целиком); см.
+    /// `LoRAFinetune.languageModelLoss`. Память длинной последовательности.
+    public var lossChunkTokens: Int = 0
+    /// Обратный проход по блокам с вычислением после каждого (см.
+    /// SequentialBackward.swift): память одного блока вместо нескольких.
+    /// Градиент тот же; `useBlockCheckpoint` при этом не действует.
+    public var sequentialBackward: Bool = false
     /// Спад LR после warmup. Исторический дефолт — .constant (плоско).
     public var schedule: LRSchedule
     public var lrMin: Float
@@ -93,7 +100,38 @@ func residentMemoryMB() -> Double {
 public enum LoRAFinetune {
 
     /// LM-лосс: cross-entropy по next-token на всём [B,T,vocab].
-    static func languageModelLoss(_ bb: X070Backbone, _ batch: LoRABatch) -> MLXArray {
+    ///
+    /// `chunk` > 0 — голова и кросс-энтропия по кускам из `chunk` позиций, каждый
+    /// под чекпоинтом (`lossChunkTokens` в `LoRAConfig`). Зачем: логиты
+    /// [B·T, 65536] в fp32 — 268 МБ на 1024 токена, а лосс держит их в трёх-
+    /// четырёх копиях (логиты, экспонента, softmax для градиента, котангент):
+    /// на 1.5B при T = 2048 это ~1.6 ГБ пика из 6.3. По кускам одновременно
+    /// живёт один кусок; цена — голова считается дважды (второй раз в обратном
+    /// проходе). Градиент тот же с точностью до порядка сложения.
+    /// Действует, только когда голова — константа (нет ни адаптера, ни
+    /// обучаемой подмены): чекпоинт дифференцирует по явным входам, и до
+    /// обучаемой головы (претрейн) градиент через него не дошёл бы. Короткая
+    /// последовательность (T <= chunk) идёт прежним путём побитно.
+    static func languageModelLoss(_ bb: X070Backbone, _ batch: LoRABatch, chunk: Int = 0) -> MLXArray {
+        let T0 = batch.x.shape[1]
+        if chunk > 0, T0 > chunk, bb.headIsConstant {
+            let h = bb.body(batch.x)                        // [B,T,D]
+            let B = h.shape[0], V = bb.cfg.vocab
+            var total = MLXArray(Float(0))
+            var from = 0
+            while from < T0 {
+                let to = Swift.min(from + chunk, T0)
+                let targets = batch.y[0..., from ..< to].reshaped([-1]).asType(.int32)
+                let piece = checkpointed { (ins: [MLXArray]) -> [MLXArray] in
+                    let lg = bb.projectForBlock(ins[0], "head.weight", lora: nil)
+                    return [crossEntropy(logits: lg.reshaped([-1, V]), targets: targets,
+                                         reduction: .sum).asType(.float32)]
+                }
+                total = total + piece([h[0..., from ..< to]])[0]
+                from = to
+            }
+            return total / Float(B * T0)
+        }
         let logits = bb(batch.x)                            // [B,T,V]
         let B = logits.shape[0], T = logits.shape[1], V = logits.shape[2]
         return crossEntropy(logits: logits.reshaped([B * T, V]),
@@ -117,7 +155,7 @@ public enum LoRAFinetune {
         onStep: (_ step: Int, _ loss: Float, _ gradNorm: Float, _ peakMB: Double) -> Void = { _,_,_,_ in }
     ) -> LoRATrainResult {
 
-        bb.useBlockCheckpoint = cfg.useBlockCheckpoint
+        bb.useBlockCheckpoint = cfg.useBlockCheckpoint && !cfg.sequentialBackward
         precondition(!bb.loraA.isEmpty, "нет адаптеров — сначала LoRA.add(...)")
 
         // withoutActuallyEscaping, а не @escaping в сигнатуре: публичный API
@@ -134,11 +172,19 @@ public enum LoRAFinetune {
                 }
                 return b
             }
+            let set = LoRATrainableSet(bb)
+            let provider: GradientProvider<LoRABatch>? = cfg.sequentialBackward
+                ? { ps, batch in
+                    sequentialGradients(bb, set: set, parameters: ps, batch: batch,
+                                        lossChunk: cfg.lossChunkTokens)
+                }
+                : nil
             let trainer = Trainer<LoRABatch>(
-                trainable: LoRATrainableSet(bb),
-                objective: { languageModelLoss(bb, $0) },
+                trainable: set,
+                objective: { languageModelLoss(bb, $0, chunk: cfg.lossChunkTokens) },
                 nextBatch: source,
-                config: cfg.training)
+                config: cfg.training,
+                gradient: provider)
             return trainer.run(isCancelled: isCancelled) { s in
                 onStep(s.step, s.loss, s.gradNorm, s.peakMemoryMB)
             }

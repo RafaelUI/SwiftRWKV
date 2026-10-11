@@ -254,6 +254,42 @@ print(result.finalLoss)
 language-modelling loss. `T` must be a multiple of 16; the first batch is
 checked and the run aborts with a clear message if it is not.
 
+#### Long sequences
+
+With `useBlockCheckpoint` the whole backward pass is still one lazy MLX graph,
+and MLX, not the caller, picks the order in which it is evaluated: recomputed
+activations of several blocks end up alive at once. Peak memory grows by about
+1.9 GB per 1024 tokens on a 1.5B model, and 4096 tokens do not fit in 16 GB.
+Two switches fix the order instead of the granularity:
+
+```swift-skip
+cfg.sequentialBackward = true   // backward block by block, evaluated after each
+cfg.lossChunkTokens = 256       // head and cross-entropy in pieces
+cfg.cacheLimitGB = 0.25         // the MLX cache counts toward the footprint
+```
+
+`sequentialBackward` runs a gradient-free forward pass that keeps each block's
+input, then the head, then the blocks top-down, evaluating after every block.
+The gradient is **bit-for-bit** the one autograd gives over the whole graph.
+It replaces `useBlockCheckpoint` and costs the same: every block is computed
+twice.
+
+1.5B REDUCTION, rank-16 adapters on every layer, batch 1, M4 16 GB — step time
+and peak physical footprint (`/usr/bin/time -l`):
+
+| tokens | block checkpoint | sequential, chunks of 256, cache 0.25 GB |
+|---|---|---|
+| 1024 | 5.2 s, 5.66 GB | 5.5 s, 3.16 GB |
+| 2048 | 10.3 s, 7.18 GB | 10.7 s, 3.92 GB |
+| 4096 | does not fit | 21.3 s, 5.17 GB |
+| 8192 | does not fit | 42.7 s, 8.16 GB |
+
+`lossChunkTokens` applies only while the head is a constant (no adapter, no
+trained override); with a trained head the loss takes the ordinary path.
+
+Both are off by default. `decode-bench --train-bench m.rwkvq --tb-t 2048
+--tb-seq --tb-loss-chunk 256` measures a step on your own model.
+
 Adapters persist separately from the base:
 
 ```swift
