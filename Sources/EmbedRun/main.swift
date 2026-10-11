@@ -44,6 +44,7 @@ struct Args {
     var stateIn: String? = nil
     var headIn: String? = nil
     var allowOtherBase = false
+    var forwardAB = 0
     var out: String? = nil
     var limit: Int? = nil          // читать не больше стольких строк JSONL (иначе файл целиком в память)
     var logEvery = 50              // печать шага; 1 — время каждого шага (замеры)
@@ -85,6 +86,7 @@ func parse() -> Args {
         case "--state-in": a.stateIn = v()
         case "--head-in": a.headIn = v()
         case "--allow-other-base": a.allowOtherBase = true
+        case "--forward-ab": a.forwardAB = Int(v()) ?? 0
         case "--out": a.out = v()
         case "--limit": a.limit = Int(v())
         case "--log-every": a.logEvery = max(1, Int(v()) ?? a.logEvery)
@@ -241,6 +243,54 @@ var report: [String: Any] = ["model": args.model, "mode": args.mode, "task": tas
                              "train": train.count, "eval": heldOut.count, "steps": args.steps,
                              "batch": args.batch, "max_tokens": args.maxTokens, "quantised": quantised]
 
+if args.forwardAB > 0 {
+    // ПРЯМОЙ ПРОХОД: один граф против прохода по блокам. Один и тот же батч
+    // (--batch строк по --max-tokens токенов), плечи чередуются в одном
+    // процессе, --forward-ab повторов на плечо; первый круг — прогрев.
+    // Плечи: одним графом; по блокам с eval после каждого; то же с asyncEval;
+    // eval после каждых 2 / 4 / 8 блоков; eval один раз в конце.
+    if args.cacheGB > 0 { MLX.Memory.cacheLimit = Int(args.cacheGB * 1e9) }
+    let texts = heldOut.prefix(args.batch).map { String($0.positive.prefix(args.maxChars)) }
+    let (idx, pool) = encodeBatch(tokenizer: tok, texts: Array(texts), terminator: 0, maxTokens: args.maxTokens)
+    let plan = SequentialBody.Plan(names: [], nLayer: base.cfg.nLayer)
+    let L = base.cfg.nLayer
+    var arms: [(String, () -> MLXArray)] = [("один граф", { model.embed(idx, poolIndex: pool) })]
+    func blocks(_ every: Int, async: Bool = false) -> () -> MLXArray {
+        return {
+            SequentialBody.forwardSettleEvery = every; SequentialBody.pipelined = async
+            defer { SequentialBody.forwardSettleEvery = 1; SequentialBody.pipelined = false }
+            return model.embedFromTop(SequentialBody.forward(base, ids: idx, plan: plan).top, poolIndex: pool)
+        }
+    }
+    arms.append(("по блокам, eval", blocks(1)))
+    arms.append(("по блокам, asyncEval", blocks(1, async: true)))
+    for k in [2, 4, 8] where k < L { arms.append(("eval каждые \(k)", blocks(k))) }
+    arms.append(("по блокам, eval в конце", blocks(L)))
+    var times = [[Double]](repeating: [], count: arms.count), peaks = [[Double]](repeating: [], count: arms.count)
+    var reference: MLXArray? = nil
+    for round in 0 ... args.forwardAB {
+        for (i, arm) in arms.enumerated() {
+            GPU.resetPeakMemory()
+            let t0 = Date()
+            let v = base.withoutGradientPath { arm.1() }
+            eval(v)
+            if round > 0 { times[i].append(Date().timeIntervalSince(t0)); peaks[i].append(Double(GPU.peakMemory) / 1e9) }
+            if reference == nil { reference = v }
+            else if round == 0 {
+                print(String(format: "  %@: расхождение с одним графом %.1e", arm.0 as NSString,
+                             MLX.abs(v.asType(.float32) - reference!.asType(.float32)).max().item(Float.self)))
+            }
+        }
+    }
+    func med(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
+    print("ПРЯМОЙ ПРОХОД, \(idx.shape[0]) x \(idx.shape[1]) токенов, кэш \(args.cacheGB) ГБ, \(args.forwardAB) повторов:")
+    let baseTime = med(times[0])
+    for (i, arm) in arms.enumerated() {
+        print(String(format: "  %@ %.3f с (%+.1f %%)  мин %.3f  пик MLX %.2f ГБ", (arm.0 as NSString).padding(toLength: 26, withPad: " ", startingAt: 0) as NSString,
+                     med(times[i]), (med(times[i]) / baseTime - 1) * 100, times[i].min()!, med(peaks[i])))
+    }
+    exit(0)
+}
 if args.probe {
     // Отметка: активная память MLX после фазы и пик MLX ЗА фазу (сбрасывается).
     // Разность пика и активной памяти до фазы — её временное потребление.

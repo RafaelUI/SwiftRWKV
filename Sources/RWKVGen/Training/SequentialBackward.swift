@@ -47,6 +47,13 @@ public enum SequentialBody {
     /// `DecodePipeline` на декоде). Счёт тот же; меняется только, ждёт ли CPU.
     nonisolated(unsafe) public static var pipelined = false
 
+    /// ОПЫТ (по умолчанию 1 — прежнее поведение): в ПРЯМОМ проходе вычислять
+    /// граф не после каждого блока, а после каждого `forwardSettleEvery`-го (и
+    /// после последнего). Счёт тот же; между вычислениями живут активации
+    /// стольких блоков, зато границ вычисления меньше. Прибор для вопроса,
+    /// почему проход по блокам медленнее того же прохода одним графом.
+    nonisolated(unsafe) public static var forwardSettleEvery = 1
+
     @inline(__always) static func settle(_ arrays: [MLXArray]) {
         if pipelined { asyncEval(arrays) } else { eval(arrays) }
     }
@@ -128,7 +135,7 @@ public enum SequentialBody {
         for l in 0 ..< plan.nLayer {
             if l >= first && (l - first) % Swift.max(1, stride) == 0 { trace.blockInput[l] = x }
             let (xo, vf) = bb.blockForward(x, vFirst, l)
-            settle([xo, vf])
+            if (l + 1) % Swift.max(1, forwardSettleEvery) == 0 || l == plan.nLayer - 1 { settle([xo, vf]) }
             x = xo
             vFirst = vf
         }
