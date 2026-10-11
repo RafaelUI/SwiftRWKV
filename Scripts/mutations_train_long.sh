@@ -221,5 +221,17 @@ run "последняя строка батча оценки потеряна" \
 run "батч оценки не ограничен числом строк" \
     "$EM" 'while end < rows.count, end - i < batchSize {' 'while end < rows.count {'
 
+echo "── эмбеддер: поштучный результат оценки (парный бутстрэп) ──"
+FILTER='EmbeddingFinetuneTests'
+run "ранг в поштучном результате считается с нуля" \
+    "$EM" 'ranks.append(Double(rank))' 'ranks.append(Double(better))'
+run "sts: поштучный результат перевёрнут" \
+    "$EM" 'perRowObserver?(correct.asArray(Float.self).map(Double.init))' \
+          'perRowObserver?((1 - correct).asArray(Float.self).map(Double.init))'
+run "классификация: поштучный результат перевёрнут" \
+    "$EM" 'predictions[$0] == targets[$0] ? 1 : 0' 'predictions[$0] == targets[$0] ? 0 : 1'
+run "ранжирование: наблюдатель не вызывается" \
+    "$EM" 'perRowObserver?(ranks)' '_ = ranks'
+
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

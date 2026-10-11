@@ -76,6 +76,13 @@ public enum EmbeddingMetrics {
     /// пределом памяти нужна одна ручка, а не параметр в каждом вызове.
     nonisolated(unsafe) public static var evaluationBatchTokens = 4096
 
+    /// Поштучный результат оценки — для парного бутстрэпа по запросам: средние
+    /// (MRR, точность) двух плеч сравнимы только по ОДНИМ И ТЕМ ЖЕ строкам, а
+    /// наружу метрики отдают одно число. Вызывается один раз на оценку, в
+    /// порядке строк выборки: ранжирование — 1-based ранг верного кандидата,
+    /// sts и классификация — 1 за верный ответ, 0 за неверный. По умолчанию nil.
+    nonisolated(unsafe) public static var perRowObserver: (([Double]) -> Void)? = nil
+
     /// Векторы плоского списка текстов, микробатчами.
     ///
     /// Выравнивание T здесь не нужно: оценка идёт БЕЗ градиента, а
@@ -175,6 +182,8 @@ public enum EmbeddingMetrics {
         var mrr = 0.0
         var hits = [Int: Int](uniqueKeysWithValues: ks.map { ($0, 0) })
         var ndcg = 0.0
+        var ranks: [Double] = []
+        ranks.reserveCapacity(n)
 
         for i in 0 ..< n {
             let base = i * width
@@ -185,11 +194,13 @@ public enum EmbeddingMetrics {
             var better = 0
             for j in 0 ..< width where rowsData[base + j] > target { better += 1 }
             let rank = better + 1
+            ranks.append(Double(rank))
             mrr += 1.0 / Double(rank)
             for k in ks where rank <= k { hits[k]! += 1 }
             if rank <= 10 { ndcg += 1.0 / log2(Double(rank) + 1.0) }
         }
 
+        perRowObserver?(ranks)
         return RankingMetrics(
             mrr: mrr / Double(n),
             recall: hits.mapValues { Double($0) / Double(n) },
@@ -226,6 +237,7 @@ public enum EmbeddingMetrics {
         let simNeg = (a * n).sum(axis: -1)
         let correct = (simPos .> simNeg).asType(.float32)
         eval(simPos, simNeg, correct)
+        perRowObserver?(correct.asArray(Float.self).map(Double.init))
 
         return PairwiseMetrics(
             accuracy: Double(correct.mean().item(Float.self)),
@@ -318,6 +330,7 @@ public enum EmbeddingMetrics {
             poolSizes.append(pool.count)
             if bestJ == targets[i] { correct += 1 }
         }
+        perRowObserver?(predictions.indices.map { predictions[$0] == targets[$0] ? 1 : 0 })
 
         return AccuracyMetrics(
             accuracy: Double(correct) / Double(anchors.count),

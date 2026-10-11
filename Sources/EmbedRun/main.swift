@@ -187,7 +187,13 @@ default:
     }
     else { print("режим \(args.mode)?"); exit(2) }
 }
-let model = EmbeddingModel(backbone: base)
+// сид задаёт и порядок данных, и начальные веса головы (fc1): при сиде 0 —
+// прежнее умолчание головы, счёт тот же
+let model = EmbeddingModel(backbone: base,
+                           head: EmbeddingHead(dim: base.cfg.nEmbd, seed: args.seed))
+// поштучные результаты ПОСЛЕДНЕЙ оценки — в отчёт, для парного бутстрэпа
+var perRow: [Double] = []
+EmbeddingMetrics.perRowObserver = { perRow = $0 }
 if let m = mode, let why = EmbeddingTrainable.unsupportedReason(model: model, mode: m) {
     print(why); exit(2)
 }
@@ -282,6 +288,7 @@ if let mode {
     report["eval_peak_gb"] = Double(GPU.peakMemory) / 1e9
 }
 report["footprint_gb"] = footprintGB() - f0
+report["seed"] = Int(args.seed); report["per_row"] = perRow
 if let out = args.out {
     try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
         .write(to: URL(fileURLWithPath: expand(out)))

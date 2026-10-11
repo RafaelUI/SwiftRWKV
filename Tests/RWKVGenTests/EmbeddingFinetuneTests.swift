@@ -434,6 +434,51 @@ final class EmbeddingFinetuneTests: XCTestCase {
         XCTAssertEqual(m.recall[1]!, 0.0, accuracy: 1e-9)
     }
 
+    /// Поштучный результат (для парного бутстрэпа) обязан быть тем же, из чего
+    /// сложено среднее: ранги по строкам, в порядке строк.
+    func testPerRowObserverReportsRanksInRowOrder() {
+        let sims = MLXArray([
+            0.9, 0.1, 0.2,     // ранг 1
+            0.5, 0.4, 0.9,     // ранг 3
+            0.3, 0.8, 0.7,     // ранг 2
+        ].map { Float($0) }, [3, 3])
+        eval(sims)
+        var seen: [[Double]] = []
+        EmbeddingMetrics.perRowObserver = { seen.append($0) }
+        defer { EmbeddingMetrics.perRowObserver = nil }
+        let m = EmbeddingMetrics.rankingMetrics(similarities: sims, correctIndex: [0, 1, 2])
+        XCTAssertEqual(seen, [[1, 3, 2]])
+        XCTAssertEqual(seen[0].map { 1 / $0 }.reduce(0, +) / 3, m.mrr, accuracy: 1e-12)
+    }
+
+    /// То же у sts и классификации: единицы и нули по строкам, их среднее —
+    /// точность, а число — число оценённых строк.
+    func testPerRowObserverMatchesAccuracy() throws {
+        let tok = try loadWorldTokenizerOrSkip()
+        let all = try slice()
+        let model = makeModel(vocab: 65536)
+        var seen: [[Double]] = []
+        EmbeddingMetrics.perRowObserver = { seen.append($0) }
+        defer { EmbeddingMetrics.perRowObserver = nil }
+
+        let sts = Array(all.filter { $0.task == .sts }.prefix(6))
+        try XCTSkipIf(sts.count < 6, "мало строк sts")
+        let ms = EmbeddingMetrics.evaluateSTS(model: model, tokenizer: tok, rows: sts, maxTokens: 64)
+        XCTAssertEqual(seen.count, 1)
+        XCTAssertEqual(seen[0].count, ms.count)
+        XCTAssertTrue(seen[0].allSatisfy { $0 == 0 || $0 == 1 })
+        XCTAssertEqual(seen[0].reduce(0, +) / Double(ms.count), ms.accuracy, accuracy: 1e-6)
+
+        let cls = Array(all.filter { $0.task == .classification }.prefix(8))
+        try XCTSkipIf(cls.count < 8, "мало строк классификации")
+        let mc = EmbeddingMetrics.evaluateClassification(model: model, tokenizer: tok, rows: cls,
+                                                         useFullPool: false, maxTokens: 64)
+        XCTAssertEqual(seen.count, 2)
+        XCTAssertEqual(seen[1].count, mc.count)
+        XCTAssertTrue(seen[1].allSatisfy { $0 == 0 || $0 == 1 })
+        XCTAssertEqual(seen[1].reduce(0, +) / Double(mc.count), mc.accuracy, accuracy: 1e-9)
+    }
+
     // ── Данные классификации ─────────────────────────────────────────
 
     /// Полный пул из 25 меток и семёрка из инструкции — разные задачи, и
