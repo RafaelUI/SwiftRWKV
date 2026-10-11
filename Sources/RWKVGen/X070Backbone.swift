@@ -187,6 +187,11 @@ public final class X070Backbone {
         defer { trainLayers = saved }
         return try body()
     }
+    /// Подключённое начальное состояние по слоям (`InitialState.swift`):
+    /// обученное (state-tuning), свёрнутый промпт или одно поверх другого.
+    /// nil ⇒ последовательность стартует с нуля, счёт прежний.
+    var initialLayers: [InitialLayerState]? = nil { didSet { stepVersion &+= 1 } }
+
     /// Подмена весов на обучаемые (fp32) во время valueAndGrad для full-weight
     /// partial-finetune верхних слоёв. nil ⇒ читаются frozen-веса (инференс не меняется).
     public var wOverride: [String: MLXArray]? = nil { didSet { stepVersion &+= 1 } }

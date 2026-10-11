@@ -35,10 +35,17 @@ public protocol TrainableSet: AnyObject {
 
     /// Человекочитаемые имена параметров — для чекпоинтов и диагностики.
     var parameterNames: [String] { get }
+
+    /// Множитель шага обучения на каждый параметр; nil — у всех единица (счёт
+    /// шага тот же, что без множителей). Нужен там, где в одном множестве
+    /// живут параметры разной природы: начальное состояние стартует с нуля и
+    /// требует шаг на порядки крупнее, чем веса головы рядом с ним.
+    var learningRateScales: [Float]? { get }
 }
 
 public extension TrainableSet {
     func commit(_ ps: [MLXArray]) { inject(ps) }
+    var learningRateScales: [Float]? { nil }
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -94,6 +101,14 @@ public final class CompositeTrainableSet: TrainableSet {
 
     public func inject(_ ps: [MLXArray]) { distribute(ps) { $0.inject($1) } }
     public func commit(_ ps: [MLXArray]) { distribute(ps) { $0.commit($1) } }
+
+    public var learningRateScales: [Float]? {
+        let per = parts.map { $0.learningRateScales }
+        guard per.contains(where: { $0 != nil }) else { return nil }
+        return zip(parts, per).flatMap { part, s in
+            s ?? [Float](repeating: 1, count: part.parameterNames.count)
+        }
+    }
 
     private func distribute(_ ps: [MLXArray], _ body: (TrainableSet, [MLXArray]) -> Void) {
         let sizes = slices

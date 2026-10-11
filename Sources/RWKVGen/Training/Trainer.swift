@@ -105,6 +105,11 @@ public final class Trainer<Batch> {
             return ([r.loss.asType(.float32)], r.gradients)
         }
 
+        // множители шага по параметрам (nil — единица у всех, счёт прежний)
+        let scales = trainable.learningRateScales
+        precondition(scales == nil || scales!.count == params.count,
+                     "множителей шага \(scales?.count ?? 0), параметров \(params.count)")
+
         var lastLoss: Float = .nan
         var step = startStep
 
@@ -147,7 +152,7 @@ public final class Trainer<Batch> {
                 let mhat = m[i] / c1, vhat = v[i] / c2
                 var upd = mhat / (sqrt(vhat) + cfg.adamEps)
                 if cfg.weightDecay > 0 { upd = upd + cfg.weightDecay * params[i] }
-                params[i] = params[i] - lr * upd
+                params[i] = params[i] - (scales.map { lr * $0[i] } ?? lr) * upd
             }
             eval(params + m + v)
             SequentialBody.probe?("adam")

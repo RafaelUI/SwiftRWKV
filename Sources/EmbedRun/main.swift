@@ -37,6 +37,13 @@ struct Args {
     var sequential = true
     var cacheGB = 0.25
     var seed: UInt64 = 0
+    var stateLR: Float = 1.0
+    var stateParts = "wkv"
+    var stateOut: String? = nil
+    var headOut: String? = nil
+    var stateIn: String? = nil
+    var headIn: String? = nil
+    var allowOtherBase = false
     var out: String? = nil
     var limit: Int? = nil          // читать не больше стольких строк JSONL (иначе файл целиком в память)
     var logEvery = 50              // печать шага; 1 — время каждого шага (замеры)
@@ -71,6 +78,13 @@ func parse() -> Args {
         case "--seq": a.sequential = v() != "0"
         case "--cache-gb": a.cacheGB = Double(v()) ?? a.cacheGB
         case "--seed": a.seed = UInt64(v()) ?? a.seed
+        case "--state-lr": a.stateLR = Float(v()) ?? a.stateLR
+        case "--state-parts": a.stateParts = v()
+        case "--state-out": a.stateOut = v()
+        case "--head-out": a.headOut = v()
+        case "--state-in": a.stateIn = v()
+        case "--head-in": a.headIn = v()
+        case "--allow-other-base": a.allowOtherBase = true
         case "--out": a.out = v()
         case "--limit": a.limit = Int(v())
         case "--log-every": a.logEvery = max(1, Int(v()) ?? a.logEvery)
@@ -176,6 +190,10 @@ case "full": mode = .full
 case "lora":
     LoRA.add(to: base, spec: LoRASpec(rank: args.loraRank, alpha: Float(args.loraRank)))
     mode = .lora
+case "state":
+    // state-tuning: состояние и голова; шаг состояния --state-lr, шаг головы --lr
+    let parts: [StateTrainableSet.Part] = args.stateParts == "all" ? StateTrainableSet.Part.allCases : [.wkv]
+    mode = .state(learningRateScale: args.stateLR / args.lr, parts: parts)
 default:
     if args.mode.hasPrefix("top:"), let n = Int(args.mode.dropFirst(4)) {
         if quantised {
@@ -189,8 +207,18 @@ default:
 }
 // сид задаёт и порядок данных, и начальные веса головы (fc1): при сиде 0 —
 // прежнее умолчание головы, счёт тот же
-let model = EmbeddingModel(backbone: base,
+var model = EmbeddingModel(backbone: base,
                            head: EmbeddingHead(dim: base.cfg.nEmbd, seed: args.seed))
+// готовые состояние и голова (перенос на другую базу, оценка без обучения)
+if let path = args.headIn { model = try model.loadHead(from: URL(fileURLWithPath: expand(path))) }
+if let path = args.stateIn {
+    let (state, info) = try StateFile.load(URL(fileURLWithPath: expand(path)), base: base,
+                                           allowOtherBase: args.allowOtherBase)
+    base.initialState = state
+    let here = StateFile.baseFingerprint(base)
+    print("состояние: \(info.kind), обучено \(info.trained.joined(separator: ",")), база файла "
+          + "\(info.baseFingerprint.prefix(12))… — \(info.baseFingerprint == here ? "та же" : "ДРУГАЯ (\(here.prefix(12))…)")")
+}
 // поштучные результаты ПОСЛЕДНЕЙ оценки — в отчёт, для парного бутстрэпа
 var perRow: [Double] = []
 EmbeddingMetrics.perRowObserver = { perRow = $0 }
@@ -288,6 +316,16 @@ if let mode {
     report["eval_peak_gb"] = Double(GPU.peakMemory) / 1e9
 }
 report["footprint_gb"] = footprintGB() - f0
+if case .state = mode, let state = base.initialState {
+    report["state_numbers"] = state.wkv.size
+    report["state_abs_max"] = Double(MLX.abs(state.wkv).max().item(Float.self))
+    if let path = args.stateOut {
+        let parts: [StateTrainableSet.Part] = args.stateParts == "all" ? StateTrainableSet.Part.allCases : [.wkv]
+        try StateFile.save(state, base: base, to: URL(fileURLWithPath: expand(path)), kind: .tuned,
+                           trained: parts, note: (args.model as NSString).lastPathComponent)
+    }
+}
+if let path = args.headOut { try model.saveHead(to: URL(fileURLWithPath: expand(path))) }
 report["seed"] = Int(args.seed); report["per_row"] = perRow
 if let out = args.out {
     try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])

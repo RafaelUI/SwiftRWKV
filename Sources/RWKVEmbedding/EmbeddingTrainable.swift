@@ -72,6 +72,12 @@ public enum BaseTrainingMode: Sendable, Equatable {
     /// Обучаются навешенные LoRA/QLoRA-адаптеры и голова. Путь для моделей,
     /// которые уже не влезают в full-FT на Apple Silicon.
     case lora
+    /// State-tuning: база заморожена целиком, обучаются начальное состояние
+    /// (`StateTrainableSet`, по умолчанию только матрица WKV) и голова.
+    /// `learningRateScale` — во сколько раз шаг состояния крупнее шага стадии
+    /// (он же шаг головы): состояние стартует с нуля и требует шаг на порядки
+    /// крупнее, чем веса.
+    case state(learningRateScale: Float = 1, parts: [StateTrainableSet.Part] = [.wkv])
 }
 
 public enum EmbeddingTrainable {
@@ -95,7 +101,7 @@ public enum EmbeddingTrainable {
         let bb = model.backbone
         guard !bb.rwkvqBackedKeys.isEmpty else { return nil }
         switch mode {
-        case .frozen, .lora: return nil
+        case .frozen, .lora, .state: return nil
         case .topLayers(let n):
             // верхние слои развёрнуты в плотные (`unpackTopLayers`) — обучать можно:
             // низ остаётся сжатым и замороженным
@@ -146,6 +152,14 @@ public enum EmbeddingTrainable {
                          "режим .lora без адаптеров — сначала LoRA.add(...)")
             bb.trainLayers = Set(0 ..< bb.cfg.nLayer)
             return CompositeTrainableSet([LoRATrainableSet(bb), headSet])
+
+        case .state(let scale, let parts):
+            // Состояние входит в каждый слой с нулевого: градиент идёт через
+            // всю глубину (множество само переводит слои на дифференцируемое
+            // ядро). На .rwkvq — через сжатые проекции их собственным VJP.
+            let stateSet = StateTrainableSet(bb, train: parts,
+                                             learningRateScale: scale == 1 ? nil : scale)
+            return CompositeTrainableSet([stateSet, headSet])
         }
     }
 }

@@ -60,6 +60,15 @@ final class EmbeddingSequentialTests: XCTestCase {
                 model.backbone.loraB[t] = (MLXRandom.normal(b.shape) * 0.05).asType(b.dtype)
             }
         }
+        if case .state = mode {
+            // ненулевое состояние: на нулях часть градиентов вырождена
+            MLXRandom.seed(77)
+            let z = model.backbone.zeroInitialState()
+            model.backbone.initialState = RWKVBatchState(
+                wkv: MLXRandom.normal(z.wkv.shape) * 0.05,
+                tmixShift: MLXRandom.normal(z.tmixShift.shape) * 0.5,
+                cmixShift: MLXRandom.normal(z.cmixShift.shape) * 0.5)
+        }
         let set = EmbeddingTrainable.make(model: model, mode: mode)
         return (model, set, set.initialParameters())
     }
@@ -110,7 +119,9 @@ final class EmbeddingSequentialTests: XCTestCase {
 
     func testTripletGradientsMatchAutogradInEveryMode() {
         for (what, mode) in [("голова", BaseTrainingMode.frozen), ("верхний слой", .topLayers(1)),
-                             ("два верхних слоя", .topLayers(2)), ("вся база", .full), ("адаптеры", .lora)] {
+                             ("два верхних слоя", .topLayers(2)), ("вся база", .full), ("адаптеры", .lora),
+                             ("состояние", .state()),
+                             ("состояние со сдвигами", .state(parts: StateTrainableSet.Part.allCases))] {
             for symmetric in [false, true] {
                 let (model, set, ps) = prepare(mode)
                 let b = triplets()
@@ -124,8 +135,22 @@ final class EmbeddingSequentialTests: XCTestCase {
         }
     }
 
+    /// Режим состояния: в множестве состояние (с множителем шага) и голова,
+    /// база в него не входит; все слои идут дифференцируемым ядром.
+    func testStateModeTrainsStateAndHeadOnly() {
+        let (model, set, _) = prepare(.state(learningRateScale: 50))
+        let L = model.backbone.cfg.nLayer
+        XCTAssertEqual(set.parameterNames, (0 ..< L).map { "blocks.\($0).state0.wkv" } + EmbeddingHead.parameterNames)
+        XCTAssertEqual(set.learningRateScales, [Float](repeating: 50, count: L) + [1, 1, 1, 1])
+        XCTAssertEqual(model.backbone.trainLayers, Set(0 ..< L))
+        XCTAssertNil(prepare(.state()).1.learningRateScales, "множитель 1 — как без множителей")
+        XCTAssertNil(EmbeddingTrainable.unsupportedReason(model: model, mode: .state()))
+        XCTAssertEqual(prepare(.state(parts: StateTrainableSet.Part.allCases)).1.parameterNames.count, 3 * L + 4,
+                       "заказаны все части состояния")
+    }
+
     func testClassificationGradientsMatchAutograd() {
-        for (what, mode) in [("вся база", BaseTrainingMode.full), ("адаптеры", .lora)] {
+        for (what, mode) in [("вся база", BaseTrainingMode.full), ("адаптеры", .lora), ("состояние", .state())] {
             let (model, set, ps) = prepare(mode)
             let b = classification()
             check("классификация, \(what)", set, ps, bound: mode == .lora ? 2e-2 : 1e-5,
@@ -144,7 +169,7 @@ final class EmbeddingSequentialTests: XCTestCase {
     func testBodyChunksGiveTheSameGradient() {
         defer { SequentialBody.probe = nil }
         for (what, mode) in [("вся база", BaseTrainingMode.full), ("адаптеры", .lora),
-                             ("два верхних слоя", .topLayers(2))] {
+                             ("два верхних слоя", .topLayers(2)), ("состояние", .state())] {
             for (chunk, expected) in [(40, 2 + 3 + 3), (16, 9), (1000, 3)] {
                 let (model, set, ps) = prepare(mode)
                 let b = triplets()

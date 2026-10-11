@@ -221,14 +221,15 @@ extension LoRAFinetune {
     /// блокам. `parameters` — fp32-мастер адаптеров; подстановка в модель идёт
     /// внутри каждого grad-замыкания (контракт `GradientProvider`).
     static func sequentialGradients(
-        _ bb: X070Backbone, set: LoRATrainableSet, parameters: [MLXArray],
+        _ bb: X070Backbone, set: TrainableSet, parameters: [MLXArray],
         batch: LoRABatch, lossChunk: Int
     ) -> (loss: MLXArray, gradients: [MLXArray]) {
         sequentialGradientCalls += 1
         let T = batch.x.shape[1], B = batch.x.shape[0]
         let plan = SequentialBody.Plan(names: set.parameterNames, nLayer: bb.cfg.nLayer)
         precondition(plan.above.isEmpty && plan.stem.isEmpty && plan.first != nil,
-                     "обратный проход по блокам: у LoRA все параметры принадлежат блокам")
+                     "обратный проход по блокам языковой модели: все параметры обязаны принадлежать "
+                     + "блокам (адаптеры LoRA, начальное состояние)")
 
         // ── 1. прямой проход без градиента: входы обучаемых блоков ──
         set.inject(parameters)

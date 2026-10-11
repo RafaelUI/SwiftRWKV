@@ -92,9 +92,17 @@ public protocol RWKVBlockContext: AnyObject {
     /// после» пришлось бы делать разными сборками, а это нарушение
     /// дисциплины A/B.
     var castWKVOutput: Bool { get }
+
+    /// Подключённое начальное состояние этого слоя (батч 1) либо nil — см.
+    /// `InitialState.swift`. Блок берёт из него h_in и сдвиги ТОЛЬКО там, где
+    /// вызывающий своих не передал.
+    var initialState: InitialLayerState? { get }
 }
 
 public extension RWKVBlockContext {
+    /// Умолчание: подключённого начального состояния нет (голова реранкера
+    /// стартует с того, что ей передали).
+    var initialState: InitialLayerState? { nil }
     /// Умолчание для всех реализаций, кроме бэкбона: не приводить.
     /// Голова реранкера живёт своей жизнью и в этот эксперимент не входит.
     var castWKVOutput: Bool { false }
@@ -308,12 +316,17 @@ func rwkvFrozenLayerNorm(_ ctx: RWKVBlockContext, _ T: Int) -> Bool {
 func rwkvBlockForward(_ x0: MLXArray, _ vFirst: MLXArray?,
                       _ ctx: RWKVBlockContext) -> (MLXArray, MLXArray) {
     let fast = rwkvFrozenLayerNorm(ctx, x0.shape[1])
+    // Подключённое начальное состояние: [1, …] транслируется на батч ЗДЕСЬ,
+    // внутри блока, — vjp блока сам суммирует градиент состояния по строкам.
+    // Без состояния вызовы те же, что были (nil ⇒ старт с нуля).
+    let s0 = ctx.initialState?.broadcast(batch: x0.shape[0])
     let (h, vf, _) = rwkvTmixForward(
         layerNorm(x0, ctx.param("ln1.weight"), ctx.param("ln1.bias"), fast: fast),
-        vFirst, ctx)
+        vFirst, ctx, shiftPrev: s0?.tmixShift, hIn: s0?.wkv)
     var x = x0 + h
     x = x + rwkvCmixForward(
-        layerNorm(x, ctx.param("ln2.weight"), ctx.param("ln2.bias"), fast: fast), ctx)
+        layerNorm(x, ctx.param("ln2.weight"), ctx.param("ln2.bias"), fast: fast), ctx,
+        shiftPrev: s0?.cmixShift)
     return (x, vf)
 }
 
@@ -329,12 +342,15 @@ func rwkvBlockForwardWithState(
     cmixPrev: MLXArray?, endIdx: MLXArray?
 ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
     let fast = rwkvFrozenLayerNorm(ctx, x0.shape[1])
+    // Явное состояние вытесняет подключённое — по каждой части отдельно.
+    let s0 = (hIn == nil || tmixPrev == nil || cmixPrev == nil)
+        ? ctx.initialState?.broadcast(batch: x0.shape[0]) : nil
     let x1 = layerNorm(x0, ctx.param("ln1.weight"), ctx.param("ln1.bias"), fast: fast)
-    let (h, vf, hOut) = rwkvTmixForward(x1, vFirst, ctx, shiftPrev: tmixPrev,
-                                        hIn: hIn, mask: mask, wantState: true)
+    let (h, vf, hOut) = rwkvTmixForward(x1, vFirst, ctx, shiftPrev: tmixPrev ?? s0?.tmixShift,
+                                        hIn: hIn ?? s0?.wkv, mask: mask, wantState: true)
     var x = x0 + h
     let x2 = layerNorm(x, ctx.param("ln2.weight"), ctx.param("ln2.bias"), fast: fast)
-    x = x + rwkvCmixForward(x2, ctx, shiftPrev: cmixPrev)
+    x = x + rwkvCmixForward(x2, ctx, shiftPrev: cmixPrev ?? s0?.cmixShift)
     return (x, vf, hOut!, gatherLast(x1, endIdx), gatherLast(x2, endIdx))
 }
 
@@ -380,6 +396,8 @@ final class BackboneBlockContext: RWKVBlockContext {
     func groupNormHeads(_ x: MLXArray) -> MLXArray { backbone.groupNormRaw(x) }
 
     var castWKVOutput: Bool { backbone.castWKVOutputToComputeDType }
+
+    var initialState: InitialLayerState? { backbone.initialLayers?[layer] }
 
     var frozenKernels: FrozenPassKernels {
         backbone.rwkvqBaseDType != nil ? backbone.frozenPassKernels : []
