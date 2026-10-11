@@ -356,6 +356,18 @@ What this establishes is that a quantised base fine-tunes no worse than the
 dense one; one seed does not order the three rows. Training the head alone on
 a frozen base does not move the metric in 300 steps on either base.
 
+QLoRA on larger REDUCTION bases, 128 tokens, 200 held out, M4 16 GB, single
+run — a feasibility check, not a recipe:
+
+| base | batch | steps | MRR before → after | s / step | MLX peak |
+|---|---|---|---|---|---|
+| 0.4B | 4 | 100 | 0.020 → 0.518 | 2.93 | 5.79 GB |
+| 1.5B | 2 | 50 | 0.031 → 0.158 | 4.14 | 7.41 GB |
+
+1.5B fits, barely: batch 2 already peaks at 7.4 GB and touches swap. A
+contrastive batch that small has almost no in-batch negatives; use GradCache
+for anything real at this size.
+
 Vectors from the quantised path stay at cosine 0.9999 to the same weights run
 densely.
 

@@ -141,36 +141,38 @@ var report: [String: Any] = ["model": args.model, "mode": args.mode, "task": tas
                              "train": train.count, "eval": heldOut.count, "steps": args.steps,
                              "batch": args.batch, "max_tokens": args.maxTokens, "quantised": quantised]
 
-GPU.resetPeakMemory()
-t = Date()
-let before = EmbeddingFinetune.evaluate(model: model, tokenizer: tok, stage: stage)
-let evalSeconds = Date().timeIntervalSince(t)
-print(String(format: "до обучения: %@ | оценка %.1f с (%.1f мс на строку) | пик MLX %.2f ГБ",
-             before.description, evalSeconds, evalSeconds * 1e3 / Double(heldOut.count),
-             Double(GPU.peakMemory) / 1e9))
-report["before"] = before.headline; report["eval_seconds"] = evalSeconds
-report["eval_peak_gb"] = Double(GPU.peakMemory) / 1e9
-
 if let mode {
+    // Оценку до и после делает сама стадия (`EmbeddingFinetune.run`) — отдельно
+    // её здесь не гоняем, иначе отложенная выборка считалась бы трижды.
     GPU.resetPeakMemory()
     t = Date()
-    var lastLoss: Float = .nan
     let results = try EmbeddingFinetune.run(model: model, tokenizer: tok, mode: mode, stages: [stage],
                                             onStep: { _, s in
-        lastLoss = s.loss
         if s.step % 50 == 0 || s.step == 1 {
-            print(String(format: "  шаг %d: лосс %.4f, %.1f с", s.step, s.loss, Date().timeIntervalSince(t)))
+            print(String(format: "  шаг %d: лосс %.4f, %.1f с от начала стадии", s.step, s.loss,
+                         Date().timeIntervalSince(t)))
             fflush(stdout)
         }
     })
     let r = results[0]
+    print("до обучения: \(r.before?.description ?? "—")")
     print(String(format: "после обучения: %@ | %d шагов за %.1f с (%.2f с/шаг) | пик MLX %.2f ГБ, footprint +%.2f ГБ",
                  r.after?.description ?? "—", r.steps, r.seconds, r.seconds / Double(max(1, r.steps)),
                  Double(GPU.peakMemory) / 1e9, footprintGB() - f0))
+    report["before"] = r.before?.headline ?? Double.nan
     report["after"] = r.after?.headline ?? Double.nan
     report["final_loss"] = Double(r.finalLoss); report["train_seconds"] = r.seconds
     report["train_peak_gb"] = Double(GPU.peakMemory) / 1e9
-    _ = lastLoss
+} else {
+    GPU.resetPeakMemory()
+    t = Date()
+    let before = EmbeddingFinetune.evaluate(model: model, tokenizer: tok, stage: stage)
+    let evalSeconds = Date().timeIntervalSince(t)
+    print(String(format: "оценка: %@ | %.1f с (%.1f мс на строку) | пик MLX %.2f ГБ",
+                 before.description, evalSeconds, evalSeconds * 1e3 / Double(heldOut.count),
+                 Double(GPU.peakMemory) / 1e9))
+    report["before"] = before.headline; report["eval_seconds"] = evalSeconds
+    report["eval_peak_gb"] = Double(GPU.peakMemory) / 1e9
 }
 report["footprint_gb"] = footprintGB() - f0
 if let out = args.out {

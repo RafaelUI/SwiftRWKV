@@ -496,6 +496,15 @@ The cost is that of quantisation, not of the quantised arithmetic: the same
 quantised weights run as a dense model score 0.803 where the compressed path
 scores 0.813 (layer 11, 16 epochs).
 
+Larger quantised bases, same slice, 32 epochs, two seeds (no dense models of
+these sizes were available to compare against):
+
+| base | mid layer (12) | last layer (23) | whole run, M4 16 GB |
+|---|---|---|---|
+| 0.4B REDUCTION | 0.926 | 0.849 | 7.4 min |
+| 0.4B COMPRESSION | 0.919 | 0.842 | 7.6 min |
+| 1.5B REDUCTION | 0.953 | 0.929 | 24 min |
+
 Scores are less reproducible across batch sizes than on a dense base: about
 1% of the score range between batch 1 and batch 8, against 1e-4. The
 quantised path multiplies in fp16 with fp16 accumulation; a dense model, even
