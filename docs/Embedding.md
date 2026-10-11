@@ -249,6 +249,71 @@ The price is a second forward pass (+18…37% time). Set
 `stage.sequentialBackward = false` when memory is not the constraint. Under
 GradCache the switch has no effect.
 
+The footprints in that table are peaks of the whole process, and with a
+held-out set the peak was not in training at all: the evaluation before
+training ran before the MLX cache limit was applied (LoRA row: 2.40 GB for the
+process, 1.83 GB in steady training). The stage now applies
+`config.cacheLimitGB` before the first evaluation.
+
+### Memory: fitting a budget
+
+Where a step's peak goes (0.1B dense, LoRA, 4 triplets of 512 tokens, all
+three parts at full length — 1.52 GB of MLX memory):
+
+| | GB | scales with |
+|---|---|---|
+| model, adapter masters, Adam moments | 0.31 | the trainable set (whole base: 1.56 + 0.38 of gradients) |
+| inputs of every block, all three parts | 0.36 | layers × tokens of the **whole batch** × D × 4 bytes |
+| backward of one block: recomputed activations and cotangents | 0.87 | ~140 fp32 tensors of [tokens, D] — tokens of **one part** |
+
+The activations are the peak, and they are fp32 from layer 0 on (the WKV
+kernel returns fp32 into the residual stream). Two knobs shrink them without
+touching the arithmetic, a third trades memory back for time:
+
+```swift-skip
+stage.bodyChunkTokens = 1024      // rows of a part go through the body in pieces of ≤ 1024 tokens
+stage.traceStride = 2             // keep every 2nd block input, recompute the rest
+SequentialBody.pipelined = true   // asyncEval after each block instead of eval (process-wide)
+```
+
+- `bodyChunkTokens` — rows inside the body do not interact, so a part can be
+  cut into row pieces; the loss still sees the whole batch. The backward peak
+  is then set by the piece, not by the batch. Per-token cost on 0.1B is flat
+  down to ~1024 tokens per piece and +16% at 512; on 0.4B it is flat (+3% at
+  512). Same gradient up to summation order (1.5e-6 against autograd).
+- `traceStride` — block inputs are kept for every N-th block and the others
+  are recomputed segment by segment during the backward pass. Bit-identical
+  gradient; costs up to one more forward pass.
+- `SequentialBody.pipelined` — the CPU builds the next block's graph while the
+  GPU computes the current one. Bit-identical; −8…−14% step time, but two
+  blocks overlap in memory (about what doubling `bodyChunkTokens` costs).
+
+Step time and peak physical footprint of the process, training only, all three
+parts padded to the full length (worst case; `embed-run --eval 0`, M4):
+
+| 8 triplets × 1024 tokens | as is | chunk 2048 | chunk 1024 | chunk 1024, stride 2 | chunk 1024, stride 4 | chunk 2048, pipelined |
+|---|---|---|---|---|---|---|
+| 0.1B dense, LoRA | 15.7 s, 3.62 GB | 15.5 s, 2.45 GB | 17.5 s, 2.09 GB | | 22.3 s, 1.38 GB | 14.1 s, 2.83 GB |
+| 0.1B dense, whole base | 18.5 s, 5.12 GB | | 20.3 s, 3.50 GB | 21.8 s, 3.07 GB | | |
+| 0.1B dense, top 4 layers | 8.9 s, 3.71 GB | | 10.4 s, 1.95 GB | | | |
+| 0.1B REDUCTION, QLoRA | 16.4 s, 3.62 GB | | 17.5 s, 2.06 GB | | | |
+| 0.4B REDUCTION, QLoRA | 49.3 s, 5.84 GB | | 50.3 s, 4.01 GB | 58.4 s, 2.81 GB | 62.5 s, 2.21 GB | |
+
+| 8 triplets × 512 tokens | as is | chunk 1024 | chunk 512 | chunk 1024, pipelined |
+|---|---|---|---|---|
+| 0.1B dense, LoRA | 7.9 s, 2.46 GB | 7.8 s, 1.50 GB | 9.2 s, 1.33 GB | 7.1 s, 1.84 GB |
+| 0.1B dense, whole base | 9.1 s, 3.94 GB | 9.0 s, 2.93 GB | | 8.4 s, 3.43 GB |
+| 0.4B REDUCTION, QLoRA | 24.0 s, 3.69 GB | 24.0 s, 2.68 GB | 24.8 s, 2.46 GB | |
+
+Without the knobs, memory and time follow the tokens of the batch: 8 × 512 and
+4 × 1024 cost the same. Head-only training needs no backward pass through the
+body and stays under 1.9 GB in every cell above.
+
+Evaluation is a separate budget: `EmbeddingMetrics.embedAll` runs 16 texts per
+batch through the whole body in one graph, about 0.14 GB per 1024 tokens of
+the batch on top of the model — at 512 tokens it is already above a chunked
+training step.
+
 ### GradCache
 
 Contrastive losses want large batches, because the batch *is* the pool of
