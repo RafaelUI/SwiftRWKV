@@ -37,7 +37,7 @@ struct Args {
     var sequential = true
     var cacheGB = 0.25
     var seed: UInt64 = 0
-    var stateLR: Float = 1.0
+    var stateLR: Float = 3e-4
     var stateParts = "wkv"
     var stateOut: String? = nil
     var headOut: String? = nil

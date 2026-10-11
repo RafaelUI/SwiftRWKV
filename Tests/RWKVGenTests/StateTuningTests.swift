@@ -298,7 +298,7 @@ final class StateTuningTests: XCTestCase {
         let c = StateTuneConfig()
         XCTAssertEqual(c.train, [.wkv])
         XCTAssertTrue(c.sequentialBackward)
-        XCTAssertEqual(c.lr, 1.0); XCTAssertEqual(c.lrMin, 0.01); XCTAssertEqual(c.gradClip, 0)
+        XCTAssertEqual(c.lr, 3e-4); XCTAssertEqual(c.lrMin, 3e-5); XCTAssertEqual(c.gradClip, 0)
     }
 
     /// Обучение идёт по блокам, выключатель даёт то же состояние, лосс падает,

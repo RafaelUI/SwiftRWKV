@@ -198,10 +198,13 @@ public final class StateTrainableSet: TrainableSet {
 // ───────────────────────────────────────────────────────────────────────
 
 public struct StateTuneConfig: Sendable {
-    /// Состояние — не веса: оно стартует с нуля, и шаг Adam ему нужен на
-    /// порядки крупнее, чем адаптерам (RWKV-PEFT: 1 → 0.01).
-    public var lr: Float = 1.0
-    public var lrMin: Float = 0.01
+    /// Шаг — замеренный в rwkv-metal (`lora/state_tune.py`), а не перенесённый:
+    /// с шагом 1 → 0.01, который принято называть для state-tuning, состояние
+    /// разрушает модель (g1d 0.1B, лосс на отложенных окнах 3.228 → 3.374 уже
+    /// при 1e-2; 3.176 при 3e-4). Adam двигает каждое число состояния на ~lr
+    /// за шаг, а полезный сдвиг мал.
+    public var lr: Float = 3e-4
+    public var lrMin: Float = 3e-5
     public var schedule: LRSchedule = .cosine
     public var warmupSteps = 10
     public var maxSteps = 500

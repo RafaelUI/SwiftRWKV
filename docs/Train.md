@@ -367,7 +367,7 @@ let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
 let ids = MLXArray((0 ..< 65).map { Int32($0 % 60000) }, [1, 65])
 let batch: LoRABatch = (x: ids[0..., 0 ..< 64], y: ids[0..., 1 ... 64])   // T % 16 == 0
 
-var config = StateTuneConfig()           // lr 1 -> 0.01 (cosine), WKV only
+var config = StateTuneConfig()           // lr 3e-4 -> 3e-5 (cosine), WKV only
 config.maxSteps = 500
 let (result, state) = StateTuning.run(base, nextBatch: { batch }, config: config)
 print(result.finalLoss, state.wkv.shape)

@@ -74,9 +74,8 @@ public enum BaseTrainingMode: Sendable, Equatable {
     case lora
     /// State-tuning: база заморожена целиком, обучаются начальное состояние
     /// (`StateTrainableSet`, по умолчанию только матрица WKV) и голова.
-    /// `learningRateScale` — во сколько раз шаг состояния крупнее шага стадии
-    /// (он же шаг головы): состояние стартует с нуля и требует шаг на порядки
-    /// крупнее, чем веса.
+    /// `learningRateScale` — отношение шага состояния к шагу стадии (он же шаг
+    /// головы): у состояния свой масштаб шага (замер — `StateTuneConfig.lr`).
     case state(learningRateScale: Float = 1, parts: [StateTrainableSet.Part] = [.wkv])
 }
 
