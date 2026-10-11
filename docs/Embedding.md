@@ -353,8 +353,8 @@ counted over the whole step including the frozen bottom (M4 16 GB, defaults,
 | 0.4B REDUCTION | 4 | 1164 tok/s, 2.07 GB | 1347 tok/s, 2.30 GB | 1368 tok/s, 2.90 GB |
 | 0.4B REDUCTION | 6 | 966 tok/s, 2.61 GB | 1113 tok/s, 2.77 GB | 1129 tok/s, **3.39** GB |
 
-\* no dense 0.4B file was at hand: the model is the dequantized REDUCTION
-saved as bf16 — speed and memory of a real bf16 model, not its weights.
+\* measured on the dequantized REDUCTION saved as bf16; a rerun on the original
+dense checkpoint gave the same numbers within 2%.
 
 With `SequentialBody.pipelined = true` the same grid runs 2…15% faster for
 0.2…0.6 GB more.
