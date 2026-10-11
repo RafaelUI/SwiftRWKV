@@ -109,6 +109,11 @@ run "цели куска берутся с начала последовател
     "$LF" 'let targets = batch.y[0..., from ..< to].reshaped([-1]).asType(.int32)
                 let piece' 'let targets = batch.y[0..., 0 ..< (to - from)].reshaped([-1]).asType(.int32)
                 let piece'
+run "кусок лосса не делится на батч (по блокам)" \
+    "$SB" 'let step = lossPieceTokens(chunk: lossChunk, batch: B, length: T)' \
+          'let step = lossPieceTokens(chunk: lossChunk, batch: 1, length: T)'
+run "кусок лосса считается на строку" \
+    "$LF" 'chunk > 0 ? Swift.max(1, chunk / Swift.max(1, batch)) : length' 'chunk > 0 ? chunk : length'
 
 FILTER='EmbeddingSequentialTests'
 EO=Sources/RWKVEmbedding/EmbeddingObjective.swift

@@ -44,8 +44,10 @@ public struct LoRAConfig: Sendable {
     public var logEvery: Int
     /// true ⇒ блочный gradient checkpoint (−~45% пик памяти / +~22% времени).
     public var useBlockCheckpoint: Bool
-    /// Голова и лосс по кускам из стольких позиций (0 — целиком); см.
-    /// `LoRAFinetune.languageModelLoss`. Память длинной последовательности.
+    /// Голова и лосс по кускам из стольких позиций НА ВЕСЬ БАТЧ (0 — целиком):
+    /// по длине кусок берётся в `lossChunkTokens / B` позиций
+    /// (`LoRAFinetune.lossPieceTokens`), так что логитов в куске столько же
+    /// при любом батче. См. `LoRAFinetune.languageModelLoss`.
     public var lossChunkTokens: Int = 256
     /// Обратный проход по блокам с вычислением после каждого (см.
     /// SequentialBackward.swift): память одного блока вместо нескольких.
@@ -114,8 +116,18 @@ public enum LoRAFinetune {
     /// обучаемой подмены): чекпоинт дифференцирует по явным входам, и до
     /// обучаемой головы (претрейн) градиент через него не дошёл бы. Короткая
     /// последовательность (T <= chunk) идёт прежним путём побитно.
-    static func languageModelLoss(_ bb: X070Backbone, _ batch: LoRABatch, chunk: Int = 0) -> MLXArray {
+    /// Сколько позиций по длине в одном куске головы: `chunk` — это бюджет
+    /// позиций на ВЕСЬ батч, кусок логитов — [B · позиции, 65536] в fp32. Пока
+    /// кусок считался на строку, пик шага при батче держала голова (0.1B,
+    /// 8 × 512: 3.06 ГБ footprint при куске 256 на строку против 2.04 ГБ при
+    /// 32). Батч 1 — как раньше.
+    static func lossPieceTokens(chunk: Int, batch: Int, length: Int) -> Int {
+        chunk > 0 ? Swift.max(1, chunk / Swift.max(1, batch)) : length
+    }
+
+    static func languageModelLoss(_ bb: X070Backbone, _ batch: LoRABatch, chunk chunkBudget: Int = 0) -> MLXArray {
         let T0 = batch.x.shape[1]
+        let chunk = lossPieceTokens(chunk: chunkBudget, batch: batch.x.shape[0], length: T0)
         if chunk > 0, T0 > chunk, bb.headIsConstant {
             let h = bb.body(batch.x)                        // [B,T,D]
             let B = h.shape[0], V = bb.cfg.vocab

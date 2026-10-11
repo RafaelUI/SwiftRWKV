@@ -102,6 +102,27 @@ final class SequentialBackwardTests: XCTestCase {
         }
     }
 
+    /// Кусок лосса — бюджет позиций на ВЕСЬ батч: по длине он в B раз короче,
+    /// и логитов в куске столько же при любом батче.
+    func testLossPieceShrinksWithBatch() {
+        XCTAssertEqual(LoRAFinetune.lossPieceTokens(chunk: 256, batch: 1, length: 512), 256)
+        XCTAssertEqual(LoRAFinetune.lossPieceTokens(chunk: 256, batch: 8, length: 512), 32)
+        XCTAssertEqual(LoRAFinetune.lossPieceTokens(chunk: 4, batch: 8, length: 512), 1)
+        XCTAssertEqual(LoRAFinetune.lossPieceTokens(chunk: 0, batch: 8, length: 512), 512)
+        defer { SequentialBody.probe = nil }
+        for (B, pieces) in [(1, 3), (2, 6), (4, 12)] {        // T = 48, бюджет 16 позиций
+            let (bb, cfg) = model()
+            let set = LoRATrainableSet(bb)
+            let ps = set.initialParameters()
+            var n = 0
+            SequentialBody.probe = { if $0 == "loss" { n += 1 } }
+            let r = LoRAFinetune.sequentialGradients(bb, set: set, parameters: ps, batch: batch(cfg, B: B),
+                                                     lossChunk: 16)
+            eval([r.loss] + r.gradients)
+            XCTAssertEqual(n, pieces, "батч \(B)")
+        }
+    }
+
     /// После счёта в модели — значения адаптеров, а не трассеры градиента:
     /// модель считается дальше и даёт то же, что до вызова.
     func testModelIsLeftWithPlainAdapters() {
@@ -176,8 +197,8 @@ final class SequentialBackwardTests: XCTestCase {
             print(String(format: "ЛОСС КУСКАМИ по %d: %.6f против %.6f; худший градиент %.1e", chunk, loss, lossRef, worst))
             XCTAssertEqual(loss, lossRef, accuracy: Swift.abs(lossRef) * 1e-5)
         }
-        // T <= куска — прежний путь побитно
-        let (same, gSame) = whole(bb, set, ps, b, chunk: 48)
+        // весь батч (2 × 48 позиций) помещается в кусок — прежний путь побитно
+        let (same, gSame) = whole(bb, set, ps, b, chunk: 96)
         XCTAssertEqual(same, lossRef)
         for (r, g) in zip(gRef, gSame) { XCTAssertEqual(MLX.abs(r - g).max().item(Float.self), 0) }
     }

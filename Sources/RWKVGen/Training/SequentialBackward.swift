@@ -240,7 +240,7 @@ extension LoRAFinetune {
         eval(h)
         let V = bb.cfg.vocab
         let scale = MLXArray(Float(1) / Float(B * T))
-        let step = lossChunk > 0 ? lossChunk : T
+        let step = lossPieceTokens(chunk: lossChunk, batch: B, length: T)
         var total = MLXArray(Float(0))
         var pieces: [MLXArray] = []
         var from = 0
@@ -253,6 +253,7 @@ extension LoRAFinetune {
                                      reduction: .sum).asType(.float32)]
             }, primals: [h[0..., from ..< to]], cotangents: [scale])
             eval(value[0], g[0])
+            SequentialBody.probe?("loss")
             total = total + value[0]
             pieces.append(g[0])
             from = to
