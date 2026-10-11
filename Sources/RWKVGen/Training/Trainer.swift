@@ -114,8 +114,10 @@ public final class Trainer<Batch> {
 
             // ── накопление градиентов ──
             current = nextBatch()
+            SequentialBody.probe?("batch")
             var (vals, grads) = vg(params)
             eval(vals + grads)
+            SequentialBody.probe?("gradient")
             var lossVal = vals[0]
 
             for _ in 1 ..< cfg.gradAccum {
@@ -148,6 +150,7 @@ public final class Trainer<Batch> {
                 params[i] = params[i] - lr * upd
             }
             eval(params + m + v)
+            SequentialBody.probe?("adam")
 
             lastLoss = lossVal.item(Float.self)
             step += 1

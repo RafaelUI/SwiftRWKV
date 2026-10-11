@@ -75,40 +75,68 @@ public enum EmbeddingObjective {
     /// Сколько раз градиент посчитан этим путём (счётчик для тестов).
     nonisolated(unsafe) static var sequentialCalls = 0
 
+    /// Куски, на которые режутся пачки при `chunkTokens > 0`: строки пачки
+    /// идут через тело по `max(1, chunkTokens / T)` штук. В теле строки друг
+    /// от друга не зависят, так что это тот же счёт; пик обратного прохода
+    /// блока (~140–165 тензоров [строки·T, D] в fp32) берётся с куска, а не
+    /// с пачки, и перестаёт расти с батчем. Лосс по-прежнему видит весь батч.
+    static func pieces(of groups: [(idx: MLXArray, pool: MLXArray)], chunkTokens: Int)
+        -> [(group: Int, idx: MLXArray, pool: MLXArray)] {
+        var out: [(group: Int, idx: MLXArray, pool: MLXArray)] = []
+        for (gi, grp) in groups.enumerated() {
+            let B = grp.idx.shape[0], T = grp.idx.shape[1]
+            let rows = chunkTokens > 0 ? Swift.max(1, chunkTokens / Swift.max(1, T)) : B
+            if rows >= B { out.append((gi, grp.idx, grp.pool)); continue }
+            var from = 0
+            while from < B {
+                let to = Swift.min(from + rows, B)
+                out.append((gi, grp.idx[from ..< to], grp.pool[from ..< to]))
+                from = to
+            }
+        }
+        return out
+    }
+
     /// (лосс, градиенты в порядке `trainable.parameterNames`). `groups` —
     /// пачки, которые модель векторизует порознь (якоря, положительные, …);
-    /// `loss` получает их векторы в том же порядке.
+    /// `loss` получает их векторы в том же порядке. `chunkTokens` — см. `pieces`.
     static func sequentialValueAndGrad(
         model: EmbeddingModel, trainable: TrainableSet, parameters: [MLXArray],
-        groups: [(idx: MLXArray, pool: MLXArray)],
+        groups: [(idx: MLXArray, pool: MLXArray)], chunkTokens: Int = 0, traceStride: Int = 1,
         loss: @escaping ([MLXArray]) -> MLXArray
     ) -> (loss: MLXArray, gradients: [MLXArray]) {
         sequentialCalls += 1
         let bb = model.backbone
         let plan = SequentialBody.Plan(names: trainable.parameterNames, nLayer: bb.cfg.nLayer)
+        let parts = pieces(of: groups, chunkTokens: chunkTokens)
 
-        // 1. прямой проход каждой пачки без градиента
+        // 1. прямой проход каждого куска без градиента
         trainable.inject(parameters)
-        let traces = groups.map { SequentialBody.forward(bb, ids: $0.idx, plan: plan) }
+        let traces = parts.map { SequentialBody.forward(bb, ids: $0.idx, plan: plan, stride: traceStride) }
 
         // 2. всё, что над телом: ln_out, пулинг, голова, лосс — по выходам
         //    последнего блока и по параметрам «над телом» (голова, ln_out)
         let above = plan.above
-        let n = groups.count
+        let n = parts.count
         let (value, g) = vjp({ ins in
             var current = parameters
             for (j, i) in above.enumerated() { current[i] = ins[n + j] }
             trainable.inject(current)
-            let vectors = (0 ..< n).map { model.embedFromTop(ins[$0], poolIndex: groups[$0].pool) }
+            var byGroup = [[MLXArray]](repeating: [], count: groups.count)
+            for (c, part) in parts.enumerated() {
+                byGroup[part.group].append(model.embedFromTop(ins[c], poolIndex: part.pool))
+            }
+            let vectors = byGroup.map { $0.count == 1 ? $0[0] : concatenated($0, axis: 0) }
             return [loss(vectors).asType(.float32)]
         }, primals: traces.map { $0.top } + above.map { parameters[$0] },
            cotangents: [MLXArray(Float(1))])
         trainable.inject(parameters)
         eval(value + g)
+        SequentialBody.probe?("above")
         var grads = [MLXArray?](repeating: nil, count: parameters.count)
         for (j, i) in above.enumerated() { grads[i] = g[n + j] }
 
-        // 3. блоки сверху вниз, пачка за пачкой
+        // 3. блоки сверху вниз, кусок за куском
         for (k, trace) in traces.enumerated() {
             SequentialBody.backward(bb, trace: trace, dTop: g[k], parameters: parameters, plan: plan,
                                     inject: { trainable.inject($0) }, grads: &grads)
@@ -121,13 +149,14 @@ public enum EmbeddingObjective {
     /// Провайдер градиента триплетных задач обратным проходом по блокам.
     public static func sequentialProvider(
         model: EmbeddingModel, trainable: TrainableSet,
-        temperature: Float = 0.05, symmetric: Bool
+        temperature: Float = 0.05, symmetric: Bool, chunkTokens: Int = 0, traceStride: Int = 1
     ) -> GradientProvider<TripletBatch> {
         { params, batch in
             sequentialValueAndGrad(
                 model: model, trainable: trainable, parameters: params,
                 groups: [(batch.anchorIdx, batch.anchorPool), (batch.positiveIdx, batch.positivePool),
                          (batch.negativeIdx, batch.negativePool)],
+                chunkTokens: chunkTokens, traceStride: traceStride,
                 loss: { v in
                     tripletPoolLoss(anchor: v[0], positive: v[1], negative: v[2],
                                     temperature: temperature, symmetric: symmetric)
@@ -137,7 +166,8 @@ public enum EmbeddingObjective {
 
     /// То же для zero-shot классификации: якоря и кандидаты — две пачки.
     public static func sequentialClassificationProvider(
-        model: EmbeddingModel, trainable: TrainableSet, temperature: Float = 0.05
+        model: EmbeddingModel, trainable: TrainableSet, temperature: Float = 0.05,
+        chunkTokens: Int = 0, traceStride: Int = 1
     ) -> GradientProvider<ClassificationBatch> {
         { params, batch in
             let B = batch.candidateIdx.shape[0], K = batch.candidateIdx.shape[1]
@@ -146,6 +176,7 @@ public enum EmbeddingObjective {
                 model: model, trainable: trainable, parameters: params,
                 groups: [(batch.anchorIdx, batch.anchorPool),
                          (batch.candidateIdx.reshaped([B * K, T]), batch.candidatePool.reshaped([B * K]))],
+                chunkTokens: chunkTokens, traceStride: traceStride,
                 loss: { v in
                     zeroShotClassificationLoss(anchor: v[0], candidates: v[1].reshaped([B, K, -1]),
                                                mask: batch.mask, targetIndex: batch.targetIndex,

@@ -35,6 +35,22 @@ import MLXNN          // crossEntropy
 
 public enum SequentialBody {
 
+    /// Отметки фаз для приборов памяти: вызывается ВНЕ трассировки градиента,
+    /// сразу после очередного eval (после прямого прохода пачки, после
+    /// каждого блока обратного прохода, после основания). По умолчанию nil.
+    /// Прибор снаружи читает активную память и пик MLX между отметками —
+    /// так пик шага раскладывается по статьям без eval внутри трассировки.
+    nonisolated(unsafe) public static var probe: ((String) -> Void)? = nil
+
+    /// ОПЫТ (по умолчанию выключено): после блока — `asyncEval` вместо `eval`,
+    /// то есть CPU строит граф следующего блока, пока GPU считает этот (как
+    /// `DecodePipeline` на декоде). Счёт тот же; меняется только, ждёт ли CPU.
+    nonisolated(unsafe) public static var pipelined = false
+
+    @inline(__always) static func settle(_ arrays: [MLXArray]) {
+        if pipelined { asyncEval(arrays) } else { eval(arrays) }
+    }
+
     /// Куда относится каждый параметр обучаемого множества.
     public struct Plan {
         public let nLayer: Int
@@ -71,11 +87,37 @@ public enum SequentialBody {
         /// Выход последнего блока — до ln_out.
         public internal(set) var top: MLXArray
         init(ids: MLXArray, top: MLXArray) { self.ids = ids; self.top = top }
+
+        /// Вход блока `l`, которого в записи нет (запись с шагом, см. `forward`):
+        /// блоки от ближайшего записанного ниже считаются заново, их входы
+        /// кладутся в запись и уходят по мере обратного прохода. Тот же счёт
+        /// на тех же числах, что в первом прямом проходе, — вход побитно тот же.
+        func restoreInput(_ l: Int, _ bb: X070Backbone) {
+            guard blockInput[l] == nil else { return }
+            guard let from = blockInput.keys.filter({ $0 < l }).max() else {
+                preconditionFailure("нет записанного входа ниже блока \(l)")
+            }
+            var x = blockInput[from]!
+            for j in from ..< l {
+                let (xo, _) = bb.blockForward(x, j > 0 ? vFirst : nil, j)
+                eval(xo)
+                x = xo
+                blockInput[j + 1] = x
+                SequentialBody.probe?("retrace")
+            }
+        }
     }
 
     /// Прямой проход без градиента; хранит входы блоков, через которые пойдёт
     /// градиент. Модель должна уже видеть текущие параметры (`inject`).
-    public static func forward(_ bb: X070Backbone, ids: MLXArray, plan: Plan) -> Trace {
+    ///
+    /// `stride > 1` — запись с шагом: хранится вход каждого `stride`-го блока
+    /// (считая от нижнего обучаемого), остальные восстанавливаются в обратном
+    /// проходе пересчётом отрезка (`Trace.restoreInput`). Память входов блоков
+    /// (L · токены · D · 4 байта на каждую пачку — у 0.4B при 8 триплетах по
+    /// 1024 токена это 2.4 ГБ) делится на `stride`; цена — (stride − 1) / stride
+    /// ещё одного прямого прохода.
+    public static func forward(_ bb: X070Backbone, ids: MLXArray, plan: Plan, stride: Int = 1) -> Trace {
         let first = plan.first ?? plan.nLayer
         precondition(Set(first ..< plan.nLayer).isSubset(of: bb.trainLayers),
                      "слои \(first)..<\(plan.nLayer) обязаны идти дифференцируемым ядром (trainLayers)")
@@ -84,14 +126,15 @@ public enum SequentialBody {
         let trace = Trace(ids: ids, top: x)
         var vFirst: MLXArray? = nil
         for l in 0 ..< plan.nLayer {
-            if l >= first { trace.blockInput[l] = x }
+            if l >= first && (l - first) % Swift.max(1, stride) == 0 { trace.blockInput[l] = x }
             let (xo, vf) = bb.blockForward(x, vFirst, l)
-            eval(xo, vf)
+            settle([xo, vf])
             x = xo
             vFirst = vf
         }
         trace.vFirst = vFirst
         trace.top = x
+        probe?("forward")
         return trace
     }
 
@@ -113,6 +156,7 @@ public enum SequentialBody {
 
         for l in stride(from: plan.nLayer - 1, through: first, by: -1) {
             let idx = plan.byLayer[l] ?? []
+            trace.restoreInput(l, bb)
             let xin = trace.blockInput[l]!
             let hasV = l > 0
             // У нижнего обучаемого блока котангенты по входу никому не нужны:
@@ -145,8 +189,9 @@ public enum SequentialBody {
                 if hasV { dv = dv.map { $0 + g[1] } ?? g[1]; ready.append(dv!) }
             }
             for (j, i) in idx.enumerated() { add(i, g[nData + j]); ready.append(grads[i]!) }
-            eval(ready)
+            settle(ready)
             trace.blockInput[l] = nil
+            probe?("block \(l)")
         }
 
         if stemNeeded {
@@ -161,6 +206,7 @@ public enum SequentialBody {
             inject(parameters)
             for (j, i) in idx.enumerated() { add(i, g[j]) }
             eval(idx.map { grads[$0]! })
+            probe?("stem")
         }
     }
 }

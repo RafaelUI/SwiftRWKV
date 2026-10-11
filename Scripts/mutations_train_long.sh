@@ -134,8 +134,8 @@ run "параметры над телом в лосс не подставляю�
 run "вектор над телом без ln_out" \
     "$ED" 'let h = backbone.finalNorm(x, T: x.shape[1])' 'let h = x'
 run "пулинг пачки взят у якорей" \
-    "$EO" 'let vectors = (0 ..< n).map { model.embedFromTop(ins[$0], poolIndex: groups[$0].pool) }' \
-          'let vectors = (0 ..< n).map { model.embedFromTop(ins[$0], poolIndex: groups[0].pool) }'
+    "$EO" 'byGroup[part.group].append(model.embedFromTop(ins[c], poolIndex: part.pool))' \
+          'byGroup[part.group].append(model.embedFromTop(ins[c], poolIndex: parts[0].pool))'
 run "кандидаты классификации не собраны по строкам" \
     "$EO" 'zeroShotClassificationLoss(anchor: v[0], candidates: v[1].reshaped([B, K, -1]),' \
           'zeroShotClassificationLoss(anchor: v[0], candidates: v[1].reshaped([K, B, -1]).transposed(1, 0, 2),'
@@ -145,6 +145,42 @@ run "стадия: режим действует и под GradCache наобо�
     "$EF" ': stage.sequentialBackward
                 ? EmbeddingObjective.sequentialProvider(' ': !stage.sequentialBackward
                 ? EmbeddingObjective.sequentialProvider('
+
+echo "── эмбеддер: тело по строкам, запись входов с шагом, потолок кэша до оценки ──"
+run "куски по строкам не режутся" \
+    "$EO" 'let rows = chunkTokens > 0 ? Swift.max(1, chunkTokens / Swift.max(1, T)) : B' 'let rows = B'
+run "неполный последний кусок потерян" \
+    "$EO" 'while from < B {' 'while from + rows <= B {'
+run "пулинг куска взят с первых строк пачки" \
+    "$EO" 'out.append((gi, grp.idx[from ..< to], grp.pool[from ..< to]))' \
+          'out.append((gi, grp.idx[from ..< to], grp.pool[0 ..< to - from]))'
+run "векторы кусков собраны в обратном порядке" \
+    "$EO" 'byGroup[part.group].append(model.embedFromTop(ins[c], poolIndex: part.pool))' \
+          'byGroup[part.group].insert(model.embedFromTop(ins[c], poolIndex: part.pool), at: 0)'
+run "стадия не передаёт bodyChunkTokens" \
+    "$EF" 'symmetric: symmetric,
+                    chunkTokens: stage.bodyChunkTokens, traceStride: stage.traceStride)' 'symmetric: symmetric,
+                    chunkTokens: 0, traceStride: stage.traceStride)'
+run "стадия не передаёт traceStride" \
+    "$EF" 'symmetric: symmetric,
+                    chunkTokens: stage.bodyChunkTokens, traceStride: stage.traceStride)' 'symmetric: symmetric,
+                    chunkTokens: stage.bodyChunkTokens, traceStride: 1)'
+run "запись с шагом хранит все входы" \
+    "$SB" 'if l >= first && (l - first) % Swift.max(1, stride) == 0 { trace.blockInput[l] = x }' \
+          'if l >= first { trace.blockInput[l] = x }'
+run "пересчёт входа идёт без v_first" \
+    "$SB" 'let (xo, _) = bb.blockForward(x, j > 0 ? vFirst : nil, j)' \
+          'let (xo, _) = bb.blockForward(x, j > 0 ? vFirst.map { MLXArray.zeros($0.shape, dtype: $0.dtype) } : nil, j)'
+run "пересчёт входа идёт от самого нижнего записанного" \
+    "$SB" 'blockInput.keys.filter({ $0 < l }).max()' 'blockInput.keys.filter({ $0 < l }).min()'
+run "пересчитанный вход положен блоку ниже" \
+    "$SB" 'blockInput[j + 1] = x' 'blockInput[j + 1] = blockInput[j]!'
+run "потолок кэша ставится только в цикле обучения" \
+    "$EF" '        applyCacheLimit(stage.config)
+
+        let before' '        let before'
+run "потолок кэша 0 понимается как «без кэша»" \
+    "$EF" 'if cfg.cacheLimitGB > 0 { MLX.Memory.cacheLimit' 'if cfg.cacheLimitGB >= 0 { MLX.Memory.cacheLimit'
 
 echo
 echo "Итог: смотри строки НЕ ПОЙМАНА выше."

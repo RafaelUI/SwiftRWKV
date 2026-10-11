@@ -22,6 +22,9 @@ import RWKVEmbedding
 //                       квантованной проекции — не веса, обучать нечего)
 //          full       — вся база и голова (только плотная база)
 //          none       — только оценка
+//
+//  Для замеров: --limit N (не читать JSONL целиком), --log-every 1 (время
+//  каждого шага), --guard ГБ (выход, если footprint процесса выше порога).
 // ───────────────────────────────────────────────────────────────────────
 
 struct Args {
@@ -34,6 +37,13 @@ struct Args {
     var cacheGB = 0.25
     var seed: UInt64 = 0
     var out: String? = nil
+    var limit: Int? = nil          // читать не больше стольких строк JSONL (иначе файл целиком в память)
+    var logEvery = 50              // печать шага; 1 — время каждого шага (замеры)
+    var guardGB = 0.0              // > 0: footprint выше порога — выход (замер под свопом негоден)
+    var probe = false              // память по фазам шага (SequentialBody.probe)
+    var chunkTokens = 0            // EmbeddingStage.bodyChunkTokens
+    var traceStride = 1            // EmbeddingStage.traceStride
+    var pipelineAB = false         // A/B в одном процессе: чётные шаги — SequentialBody.pipelined
 }
 
 func parse() -> Args {
@@ -60,6 +70,14 @@ func parse() -> Args {
         case "--cache-gb": a.cacheGB = Double(v()) ?? a.cacheGB
         case "--seed": a.seed = UInt64(v()) ?? a.seed
         case "--out": a.out = v()
+        case "--limit": a.limit = Int(v())
+        case "--log-every": a.logEvery = max(1, Int(v()) ?? a.logEvery)
+        case "--guard": a.guardGB = Double(v()) ?? a.guardGB
+        case "--probe": a.probe = true
+        case "--chunk-tokens": a.chunkTokens = Int(v()) ?? a.chunkTokens
+        case "--trace-stride": a.traceStride = Int(v()) ?? a.traceStride
+        case "--pipeline-ab": a.pipelineAB = true
+        case "--pipeline": SequentialBody.pipelined = v() != "0"
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!)
             exit(2)
@@ -105,13 +123,41 @@ guard let tok = WorldTokenizer(vocabURL: URL(fileURLWithPath: expand(args.vocab)
 }
 
 let f0 = footprintGB()
+// Пик footprint по фазам (опрос каждые 2 мс): пик всего процесса, который даёт
+// `/usr/bin/time -l`, не говорит, где он случился — на загрузке и первом шаге
+// (сборка ядер, первое касание весов) или в установившемся обучении.
+final class FootprintWatch: @unchecked Sendable {
+    private var peak = 0.0
+    private let lock = NSLock()
+    init(guardGB: Double) {
+        let t = Thread { [self] in
+            while true {
+                let f = footprintGB()
+                if guardGB > 0 && f > guardGB {
+                    print(String(format: "ПРЕДОХРАНИТЕЛЬ: footprint %.1f ГБ выше порога %.1f — выход", f, guardGB))
+                    fflush(stdout); exit(3)
+                }
+                lock.lock(); if f > peak { peak = f }; lock.unlock()
+                usleep(2000)
+            }
+        }
+        t.stackSize = 1 << 16
+        t.start()
+    }
+    /// Пик с прошлого вызова; отсчёт начинается заново.
+    func take() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        let p = peak; peak = 0; return p
+    }
+}
+let watch = FootprintWatch(guardGB: args.guardGB)
 var t = Date()
 let (base, quantised) = try loadBase(args.model)
 print(String(format: "база: %@, L=%d D=%d; загрузка %.1f с; MLX активная %.2f ГБ, footprint +%.2f ГБ",
              quantised ? ".rwkvq" : "плотная", base.cfg.nLayer, base.cfg.nEmbd,
              Date().timeIntervalSince(t), Double(GPU.activeMemory) / 1e9, footprintGB() - f0))
 
-let rows = try EmbeddingDataset.loadJSONL(path: expand(args.data), limit: nil, tasks: [task])
+let rows = try EmbeddingDataset.loadJSONL(path: expand(args.data), limit: args.limit, tasks: [task])
 guard rows.count >= args.eval + 16 else { print("строк задачи \(task) всего \(rows.count)"); exit(2) }
 // отложенные строки — с конца, обучающие — с начала: не пересекаются
 let heldOut = Array(rows.suffix(args.eval))
@@ -143,24 +189,65 @@ var stage = EmbeddingStage(
 
 stage.sequentialBackward = args.sequential
 stage.config.cacheLimitGB = args.cacheGB
+stage.config.logEvery = args.logEvery
+stage.bodyChunkTokens = args.chunkTokens
+stage.traceStride = args.traceStride
 var report: [String: Any] = ["model": args.model, "mode": args.mode, "task": task.rawValue,
                              "train": train.count, "eval": heldOut.count, "steps": args.steps,
                              "batch": args.batch, "max_tokens": args.maxTokens, "quantised": quantised]
 
+if args.probe {
+    // Отметка: активная память MLX после фазы и пик MLX ЗА фазу (сбрасывается).
+    // Разность пика и активной памяти до фазы — её временное потребление.
+    var stepNo = 0
+    var before = Double(GPU.activeMemory) / 1e9
+    SequentialBody.probe = { name in
+        if name == "batch" { stepNo += 1 }
+        let active = Double(GPU.activeMemory) / 1e9, peak = Double(GPU.peakMemory) / 1e9
+        if stepNo == 3 {       // третий шаг: установившийся (моменты Adam заведены, ядра собраны)
+            print(String(format: "  ПРИБОР %-10@ активная %.3f  пик за фазу %.3f  (+%.3f к началу фазы)  кэш %.3f",
+                         name as NSString, active, peak, peak - before, Double(GPU.cacheMemory) / 1e9))
+        }
+        before = active
+        GPU.resetPeakMemory()
+    }
+}
 if let mode {
     // Оценку до и после делает сама стадия (`EmbeddingFinetune.run`) — отдельно
     // её здесь не гоняем, иначе отложенная выборка считалась бы трижды.
     GPU.resetPeakMemory()
     t = Date()
+    var last = Date(), abTime: [[Double]] = [[], []], abPeak: [[Double]] = [[], []]
     let results = try EmbeddingFinetune.run(model: model, tokenizer: tok, mode: mode, stages: [stage],
                                             onStep: { _, s in
-        if s.step % 50 == 0 || s.step == 1 {
-            print(String(format: "  шаг %d: лосс %.4f, %.1f с от начала стадии", s.step, s.loss,
+        if args.pipelineAB {
+            // шаг s.step только что кончился в режиме (s.step - 1) % 2; следующий — в другом
+            let arm = (s.step - 1) % 2
+            if s.step > 2 {
+                abTime[arm].append(Date().timeIntervalSince(last))
+                abPeak[arm].append(Double(GPU.peakMemory) / 1e9)
+            }
+            SequentialBody.pipelined = s.step % 2 == 1
+            GPU.resetPeakMemory()
+            last = Date()
+        }
+        if s.step == 1 {
+            print(String(format: "  пик footprint до конца первого шага (загрузка, оценка, сборка ядер): %.2f ГБ",
+                         watch.take()))
+        }
+        if s.step % args.logEvery == 0 || s.step == 1 {
+            print(String(format: "  шаг %d: лосс %.4f, %.2f с от начала стадии", s.step, s.loss,
                          Date().timeIntervalSince(t)))
             fflush(stdout)
         }
     })
     let r = results[0]
+    if args.pipelineAB {
+        func med(_ a: [Double]) -> Double { a.isEmpty ? .nan : a.sorted()[a.count / 2] }
+        print(String(format: "КОНВЕЙЕР A/B (чередование шагов, медианы): eval после блока %.3f с, пик MLX %.2f ГБ | asyncEval %.3f с, пик MLX %.2f ГБ | шагов %d + %d",
+                     med(abTime[0]), med(abPeak[0]), med(abTime[1]), med(abPeak[1]), abTime[0].count, abTime[1].count))
+    }
+    print(String(format: "пик footprint со второго шага: %.2f ГБ", watch.take()))
     print("до обучения: \(r.before?.description ?? "—")")
     print(String(format: "после обучения: %@ | %d шагов за %.1f с (%.2f с/шаг) | пик MLX %.2f ГБ, footprint +%.2f ГБ",
                  r.after?.description ?? "—", r.steps, r.seconds, r.seconds / Double(max(1, r.steps)),

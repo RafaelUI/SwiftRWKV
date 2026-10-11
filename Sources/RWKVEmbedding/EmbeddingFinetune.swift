@@ -62,6 +62,17 @@ public struct EmbeddingStage {
     /// тот же градиент при памяти одного блока одной пачки, ценой второго
     /// прямого прохода. Под GradCache не действует.
     public var sequentialBackward: Bool = true
+    /// >0 ⇒ при обратном проходе по блокам строки пачки идут через тело
+    /// кусками не больше стольких токенов (строк в куске — `bodyChunkTokens / T`,
+    /// не меньше одной). Пик шага тогда не растёт с батчем: 0.1B, адаптеры,
+    /// 8 триплетов × 1024 — 3.6 ГБ без кусков. Лосс видит весь батч; градиент
+    /// тот же с точностью до порядка сложения. 0 — пачка целиком.
+    public var bodyChunkTokens: Int = 0
+    /// >1 ⇒ при обратном проходе по блокам хранится вход каждого
+    /// `traceStride`-го блока, остальные пересчитываются (`SequentialBody.forward`).
+    /// Память входов блоков делится на `traceStride` ценой до одного лишнего
+    /// прямого прохода; градиент побитно тот же. 1 — хранить все.
+    public var traceStride: Int = 1
     public var temperature: Float
     public var maxTokens: Int?
     public var maxChars: Int
@@ -273,7 +284,8 @@ public enum EmbeddingFinetune {
                 : stage.sequentialBackward
                 ? EmbeddingObjective.sequentialProvider(
                     model: model, trainable: trainable,
-                    temperature: stage.temperature, symmetric: symmetric)
+                    temperature: stage.temperature, symmetric: symmetric,
+                    chunkTokens: stage.bodyChunkTokens, traceStride: stage.traceStride)
                 : nil
 
             let trainer = Trainer<TripletBatch>(
@@ -302,7 +314,8 @@ public enum EmbeddingFinetune {
                 config: stage.config,
                 gradient: stage.sequentialBackward
                     ? EmbeddingObjective.sequentialClassificationProvider(
-                        model: model, trainable: trainable, temperature: stage.temperature)
+                        model: model, trainable: trainable, temperature: stage.temperature,
+                        chunkTokens: stage.bodyChunkTokens, traceStride: stage.traceStride)
                     : nil)
             return trainer.run(isCancelled: isCancelled, onStep: onStep)
         }

@@ -137,6 +137,171 @@ final class EmbeddingSequentialTests: XCTestCase {
         }
     }
 
+    /// Тело по строкам (`bodyChunkTokens`): пачки режутся на куски строк, каждый
+    /// идёт через тело порознь, лосс видит весь батч. Градиент тот же, что у
+    /// автограда; кусков ровно столько, сколько следует из длин пачек (16 / 32 /
+    /// 48 токенов при трёх строках), включая неполный последний.
+    func testBodyChunksGiveTheSameGradient() {
+        defer { SequentialBody.probe = nil }
+        for (what, mode) in [("вся база", BaseTrainingMode.full), ("адаптеры", .lora),
+                             ("два верхних слоя", .topLayers(2))] {
+            for (chunk, expected) in [(40, 2 + 3 + 3), (16, 9), (1000, 3)] {
+                let (model, set, ps) = prepare(mode)
+                let b = triplets()
+                var forwards = 0
+                SequentialBody.probe = { if $0 == "forward" { forwards += 1 } }
+                check("\(what), куски по \(chunk) токенов", set, ps, bound: mode == .lora ? 2e-2 : 1e-5,
+                      eager: { EmbeddingObjective.tripletLoss(model, b, temperature: 0.05, symmetric: true) },
+                      sequential: {
+                          EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                                symmetric: true, chunkTokens: chunk)(ps, b)
+                      })
+                XCTAssertEqual(forwards, expected, "\(what): кусков при \(chunk) токенах")
+            }
+        }
+        // классификация: пачка кандидатов [B·K, T] режется так же
+        let (model, set, ps) = prepare(.full)
+        let b = classification()
+        var forwards = 0
+        SequentialBody.probe = { if $0 == "forward" { forwards += 1 } }
+        check("классификация, куски по 32 токена", set, ps,
+              eager: { EmbeddingObjective.classificationLoss(model, b, temperature: 0.05) },
+              sequential: {
+                  EmbeddingObjective.sequentialClassificationProvider(model: model, trainable: set,
+                                                                      temperature: 0.05, chunkTokens: 32)(ps, b)
+              })
+        XCTAssertEqual(forwards, 2 + 3, "якоря 2 × 32 — по строке, кандидаты 6 × 16 — по две")
+    }
+
+    /// Запись входов блоков с шагом (`traceStride`): недостающие входы
+    /// пересчитываются в обратном проходе — тем же счётом на тех же числах,
+    /// поэтому градиент ПОБИТНО тот же, что при записи всех входов; пересчётов
+    /// ровно столько, сколько входов не записано.
+    func testTraceStrideGivesBitIdenticalGradient() {
+        defer { SequentialBody.probe = nil }
+        for (what, mode, first) in [("вся база", BaseTrainingMode.full, 0), ("адаптеры", .lora, 0),
+                                    ("два верхних слоя", .topLayers(2), 1)] {
+            let (model, set, ps) = prepare(mode)
+            let b = triplets()
+            func run(_ stride: Int, chunk: Int = 0) -> ([MLXArray], Int) {
+                var retraced = 0
+                SequentialBody.probe = { if $0 == "retrace" { retraced += 1 } }
+                set.inject(ps)
+                let r = EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                              symmetric: false, chunkTokens: chunk,
+                                                              traceStride: stride)(ps, b)
+                eval([r.loss] + r.gradients)
+                return ([r.loss] + r.gradients, retraced)
+            }
+            let (ref, none) = run(1)
+            XCTAssertEqual(none, 0, "\(what): при записи всех входов пересчитывать нечего")
+            let layers = 3 - first                     // блоков, через которые идёт градиент
+            for stride in [2, 3, 100] {
+                let (got, retraced) = run(stride)
+                let stored = (layers + stride - 1) / stride
+                XCTAssertEqual(retraced, 3 * (layers - stored), "\(what), шаг \(stride): пересчётов на три пачки")
+                for (i, (x, y)) in zip(ref, got).enumerated() {
+                    XCTAssertEqual(MLX.abs(x.asType(.float32) - y.asType(.float32)).max().item(Float.self), 0,
+                                   "\(what), шаг \(stride): выход \(i) обязан быть побитно тем же")
+                }
+            }
+            // вместе с кусками по строкам — тоже побитно против кусков без шага
+            let (refChunk, _) = run(1, chunk: 16)
+            let (gotChunk, _) = run(2, chunk: 16)
+            for (x, y) in zip(refChunk, gotChunk) {
+                XCTAssertEqual(MLX.abs(x.asType(.float32) - y.asType(.float32)).max().item(Float.self), 0, what)
+            }
+        }
+        // пять блоков, шаг 2: записаны входы 0, 2, 4; вход блока 3 считается от
+        // блока 2 (ближайшего записанного), а не от нижнего — по одному
+        // пересчёту на каждый из двух незаписанных входов каждой из трёх пачек
+        do {
+            let model = makeModel(nLayer: 5)
+            let set = EmbeddingTrainable.make(model: model, mode: .full)
+            let ps = set.initialParameters()
+            let b = triplets()
+            func run(_ stride: Int) -> ([MLXArray], Int) {
+                var retraced = 0
+                SequentialBody.probe = { if $0 == "retrace" { retraced += 1 } }
+                set.inject(ps)
+                let r = EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                              symmetric: false, traceStride: stride)(ps, b)
+                eval([r.loss] + r.gradients)
+                return ([r.loss] + r.gradients, retraced)
+            }
+            let (ref, _) = run(1)
+            let (got, retraced) = run(2)
+            XCTAssertEqual(retraced, 3 * 2, "пять блоков, шаг 2")
+            for (x, y) in zip(ref, got) {
+                XCTAssertEqual(MLX.abs(x.asType(.float32) - y.asType(.float32)).max().item(Float.self), 0, "пять блоков")
+            }
+        }
+        // запись действительно реже: при шаге 2 на трёх блоках хранятся входы блоков 0 и 2
+        let (model, set, ps) = prepare(.full)
+        set.inject(ps)
+        let plan = SequentialBody.Plan(names: set.parameterNames, nLayer: 3)
+        let ids = triplets().anchorIdx
+        XCTAssertEqual(SequentialBody.forward(model.backbone, ids: ids, plan: plan).blockInput.keys.sorted(), [0, 1, 2])
+        XCTAssertEqual(SequentialBody.forward(model.backbone, ids: ids, plan: plan, stride: 2).blockInput.keys.sorted(), [0, 2])
+        XCTAssertEqual(SequentialBody.forward(model.backbone, ids: ids, plan: plan, stride: 9).blockInput.keys.sorted(), [0])
+        XCTAssertEqual(EmbeddingStage(task: .retrieval, train: []).traceStride, 1, "умолчание")
+    }
+
+    /// Конвейер (`SequentialBody.pipelined`): после блока — asyncEval вместо
+    /// eval. Граф тот же, меняется только, ждёт ли CPU, — выход побитно тот же,
+    /// в том числе вместе с кусками по строкам и записью с шагом.
+    func testPipelinedBackwardIsBitIdentical() {
+        XCTAssertFalse(SequentialBody.pipelined, "умолчание")
+        defer { SequentialBody.pipelined = false }
+        for (what, mode) in [("вся база", BaseTrainingMode.full), ("адаптеры", .lora)] {
+            for (chunk, stride) in [(0, 1), (16, 2)] {
+                let (model, set, ps) = prepare(mode)
+                let b = triplets()
+                func run(_ pipelined: Bool) -> [MLXArray] {
+                    SequentialBody.pipelined = pipelined
+                    set.inject(ps)
+                    let r = EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                                  symmetric: true, chunkTokens: chunk,
+                                                                  traceStride: stride)(ps, b)
+                    eval([r.loss] + r.gradients)
+                    return [r.loss] + r.gradients
+                }
+                let plain = run(false), piped = run(true)
+                XCTAssertGreaterThan(MLX.abs(plain[1]).max().item(Float.self), 0)
+                for (i, (x, y)) in zip(plain, piped).enumerated() {
+                    XCTAssertEqual(MLX.abs(x.asType(.float32) - y.asType(.float32)).max().item(Float.self), 0,
+                                   "\(what), куски \(chunk), шаг \(stride): выход \(i)")
+                }
+            }
+        }
+    }
+
+    /// Стадия передаёт `bodyChunkTokens` в обратный проход; умолчание — без кусков.
+    func testStagePassesBodyChunkTokens() throws {
+        let tok = try EmbeddingFinetuneTests().loadWorldTokenizerOrSkip()
+        let rows = try EmbeddingFinetuneTests().slice().filter { $0.task == .retrieval }
+        try XCTSkipIf(rows.count < 8, "мало строк retrieval в срезе")
+        defer { SequentialBody.probe = nil }
+        func forwards(chunk: Int?, stride: Int = 1) throws -> Int {
+            let model = makeModel(vocab: 65536)
+            let set = EmbeddingTrainable.make(model: model, mode: .topLayers(2))
+            var stage = EmbeddingStage(task: .retrieval, train: Array(rows.prefix(4)),
+                                       config: TrainingConfig(lr: 1e-3, maxSteps: 1, cacheLimitGB: 0, logEvery: 0),
+                                       batchSize: 2, maxTokens: 48, maxChars: 200)
+            if let chunk { stage.bodyChunkTokens = chunk }
+            stage.traceStride = stride
+            var n = 0, retraced = 0
+            SequentialBody.probe = { if $0 == "forward" { n += 1 }; if $0 == "retrace" { retraced += 1 } }
+            _ = try EmbeddingFinetune.runStage(model: model, tokenizer: tok, trainable: set, stage: stage)
+            XCTAssertEqual(retraced > 0, stride > 1, "traceStride из стадии")
+            return n
+        }
+        XCTAssertEqual(EmbeddingStage(task: .retrieval, train: []).bodyChunkTokens, 0, "умолчание")
+        XCTAssertEqual(try forwards(chunk: nil), 3, "три пачки целиком")
+        XCTAssertEqual(try forwards(chunk: 1), 6, "по строке: две строки в каждой из трёх пачек")
+        XCTAssertEqual(try forwards(chunk: nil, stride: 2), 3)
+    }
+
     /// Квантованная база с адаптерами (QLoRA).
     func testGradientsMatchAutogradOnQuantisedBase() throws {
         let bb = try X070Backbone.load(fromRwkvq: try RwkvqFileTests.sourcePath("compression"))
