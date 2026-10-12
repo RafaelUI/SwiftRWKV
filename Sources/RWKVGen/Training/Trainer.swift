@@ -83,6 +83,11 @@ public final class Trainer<Batch> {
         if cfg.cacheLimitGB > 0 {
             MLX.GPU.set(cacheLimit: Int(cfg.cacheLimitGB * 1e9))
         }
+        // Конвейер — настройка ЭТОГО запуска, а не процесса: включается на
+        // время цикла и возвращается как было.
+        let savedPipelined = SequentialBody.pipelined
+        SequentialBody.pipelined = cfg.pipelined
+        defer { SequentialBody.pipelined = savedPipelined }
 
         if params.isEmpty {
             params = trainable.initialParameters()

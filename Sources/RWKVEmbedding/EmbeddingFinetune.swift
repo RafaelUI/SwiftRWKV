@@ -82,6 +82,15 @@ public struct EmbeddingStage {
     public var seed: UInt64
     /// Оценивать классификацию на полном пуле из 25 меток.
     public var evaluateOnFullPool: Bool
+    /// Потолок кэша MLX на время ОЦЕНКИ, ГБ. nil — тот же, что у обучения
+    /// (`config.cacheLimitGB`, умолчание 0.25); `.infinity` — без потолка
+    /// (до предела памяти MLX). Оценка — одни прямые проходы, и потолок
+    /// заставляет MLX возвращать системе и заново брать буферы активаций на
+    /// каждом блоке: замер 14.10 — +11.5 % к прямому проходу одним графом и
+    /// +18 % к проходу по блокам (0.4B REDUCTION, 8 × 512). Шагу обучения тот
+    /// же потолок почти ничего не стоит. Цена снятия — кэш входит в footprint
+    /// процесса. После оценки ставится потолок обучения.
+    public var evaluationCacheLimitGB: Double? = nil
 
     public init(task: EmbeddingTask,
                 train: [EmbeddingSample],
@@ -178,7 +187,7 @@ public enum EmbeddingFinetune {
         applyCacheLimit(stage.config)
 
         let before = stage.heldOut.isEmpty ? nil
-            : evaluate(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
+            : evaluateUnderCacheLimit(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
 
         let t0 = Date()
         let result = train(model: model, tokenizer: tokenizer, trainable: trainable,
@@ -187,7 +196,7 @@ public enum EmbeddingFinetune {
         let seconds = Date().timeIntervalSince(t0)
 
         let after = stage.heldOut.isEmpty ? nil
-            : evaluate(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
+            : evaluateUnderCacheLimit(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
 
         return StageResult(task: stage.task, before: before, after: after,
                            finalLoss: result.finalLoss, steps: result.steps,
@@ -195,6 +204,19 @@ public enum EmbeddingFinetune {
     }
 
     /// Потолок кэша MLX из конфигурации стадии (0 — не трогать).
+    /// Оценка под своим потолком кэша (`EmbeddingStage.evaluationCacheLimitGB`);
+    /// после неё — потолок обучения.
+    static func evaluateUnderCacheLimit(model: EmbeddingModel, tokenizer: WorldTokenizer,
+                                        stage: EmbeddingStage, terminator: Int) -> EmbeddingEvaluation {
+        guard let gb = stage.evaluationCacheLimitGB else {
+            return evaluate(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
+        }
+        let saved = MLX.Memory.cacheLimit
+        MLX.Memory.cacheLimit = gb.isInfinite ? MLX.Memory.memoryLimit : Int(gb * 1e9)
+        defer { MLX.Memory.cacheLimit = saved }
+        return evaluate(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
+    }
+
     static func applyCacheLimit(_ cfg: TrainingConfig) {
         if cfg.cacheLimitGB > 0 { MLX.Memory.cacheLimit = Int(cfg.cacheLimitGB * 1e9) }
     }

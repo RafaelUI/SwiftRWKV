@@ -273,7 +273,7 @@ touching the arithmetic, a third trades memory back for time:
 ```swift-skip
 stage.bodyChunkTokens = 1024      // rows of a part go through the body in pieces of ≤ 1024 tokens
 stage.traceStride = 2             // keep every 2nd block input, recompute the rest
-SequentialBody.pipelined = true   // asyncEval after each block instead of eval (process-wide)
+stage.config.pipelined = true     // asyncEval after each block instead of eval (off by default)
 ```
 
 - `bodyChunkTokens` — rows inside the body do not interact, so a part can be
@@ -284,9 +284,15 @@ SequentialBody.pipelined = true   // asyncEval after each block instead of eval 
 - `traceStride` — block inputs are kept for every N-th block and the others
   are recomputed segment by segment during the backward pass. Bit-identical
   gradient; costs up to one more forward pass.
-- `SequentialBody.pipelined` — the CPU builds the next block's graph while the
-  GPU computes the current one. Bit-identical; −8…−14% step time, but two
-  blocks overlap in memory (about what doubling `bodyChunkTokens` costs).
+- `config.pipelined` (`TrainingConfig`; also on `LoRAConfig` and
+  `StateTuneConfig`) — the CPU builds the next block's graph while the GPU
+  computes the current one. Bit-identical; −8…−14% step time, but two blocks
+  overlap in memory (about what doubling `bodyChunkTokens` costs). Off by
+  default, since memory is the scarce resource on a phone. It applies to its
+  own run only: the trainer switches it on for the loop and restores the
+  previous setting after. `SequentialBody.pipelined` is the underlying
+  process-wide switch; leave it alone unless you drive `SequentialBody`
+  yourself.
 
 Step time and peak physical footprint of the process, training only, all three
 parts padded to the full length (worst case; `embed-run --eval 0`, M4):
@@ -356,7 +362,7 @@ counted over the whole step including the frozen bottom (M4 16 GB, defaults,
 \* measured on the dequantized REDUCTION saved as bf16; a rerun on the original
 dense checkpoint gave the same numbers within 2%.
 
-With `SequentialBody.pipelined = true` the same grid runs 2…15% faster for
+With `config.pipelined = true` the same grid runs 2…15% faster for
 0.2…0.6 GB more.
 
 ### GradCache

@@ -42,6 +42,15 @@ public struct TrainingConfig: Sendable {
     // ── Логирование ──────────────────────────────────────────────────
     public var logEvery: Int
 
+    // ── Расписание вычислений ────────────────────────────────────────
+    /// Конвейер обратного прохода по блокам (`SequentialBody`): после блока —
+    /// `asyncEval` вместо `eval`, CPU строит граф следующего блока, пока GPU
+    /// считает этот. Счёт побитно тот же. Включается на время `Trainer.run` и
+    /// возвращается как было. По умолчанию ВЫКЛЮЧЕН: замер 13.10 — на верхних
+    /// слоях +2…15 % ток/с за +0.2…0.6 ГБ пика, на адаптерах 0.4B выигрыш не
+    /// подтверждён; под бюджет памяти айфона память дороже.
+    public var pipelined: Bool = false
+
     public init(lr: Float = 1e-4,
                 lrMin: Float = 0,
                 schedule: LRSchedule = .constant,
@@ -54,13 +63,15 @@ public struct TrainingConfig: Sendable {
                 maxSteps: Int = 1000,
                 gradAccum: Int = 1,
                 cacheLimitGB: Double = 0.25,
-                logEvery: Int = 10) {
+                logEvery: Int = 10,
+                pipelined: Bool = false) {
         self.lr = lr; self.lrMin = lrMin; self.schedule = schedule
         self.warmupSteps = warmupSteps; self.gradClip = gradClip
         self.weightDecay = weightDecay
         self.beta1 = beta1; self.beta2 = beta2; self.adamEps = adamEps
         self.maxSteps = maxSteps; self.gradAccum = gradAccum
         self.cacheLimitGB = cacheLimitGB; self.logEvery = logEvery
+        self.pipelined = pipelined
     }
 
     /// LR на шаге `step` (0-based).

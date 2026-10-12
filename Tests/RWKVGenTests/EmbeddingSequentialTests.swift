@@ -301,6 +301,75 @@ final class EmbeddingSequentialTests: XCTestCase {
         }
     }
 
+    /// Публичный выключатель конвейера — `TrainingConfig.pipelined`: по
+    /// умолчанию выключен; включённый действует ТОЛЬКО на время своего запуска
+    /// (счётчик `asyncEval` растёт, процессная настройка после — прежняя), и
+    /// обучение с ним даёт побитно те же параметры.
+    func testPipelineIsPerRunConfigAndOffByDefault() {
+        XCTAssertFalse(TrainingConfig().pipelined)
+        XCTAssertFalse(LoRAConfig().pipelined)
+        XCTAssertFalse(StateTuneConfig().pipelined)
+        XCTAssertFalse(EmbeddingStage(task: .retrieval, train: []).config.pipelined)
+        XCTAssertTrue({ var c = LoRAConfig(); c.pipelined = true; return c.training.pipelined }())
+        XCTAssertTrue({ var c = StateTuneConfig(); c.pipelined = true; return c.training.pipelined }())
+        XCTAssertFalse(SequentialBody.pipelined)
+
+        func train(_ pipelined: Bool) -> ([MLXArray], Int) {
+            let (model, set, _) = prepare(.lora)
+            let b = triplets()
+            var cfg = TrainingConfig(lr: 1e-3, maxSteps: 3, cacheLimitGB: 0, logEvery: 0)
+            cfg.pipelined = pipelined
+            let calls = SequentialBody.asyncEvalCalls, outside = SequentialBody.pipelined
+            let trainer = Trainer<TripletBatch>(
+                trainable: set,
+                objective: { EmbeddingObjective.tripletLoss(model, $0, temperature: 0.05, symmetric: false) },
+                nextBatch: { b }, config: cfg,
+                gradient: EmbeddingObjective.sequentialProvider(model: model, trainable: set,
+                                                                temperature: 0.05, symmetric: false))
+            trainer.run()
+            XCTAssertEqual(SequentialBody.pipelined, outside, "запуск не вернул процессную настройку")
+            return (trainer.currentParameters, SequentialBody.asyncEvalCalls - calls)
+        }
+        let (plain, plainCalls) = train(false)
+        let (piped, pipedCalls) = train(true)
+        XCTAssertEqual(plainCalls, 0, "выключенный конвейер всё равно звал asyncEval")
+        XCTAssertGreaterThan(pipedCalls, 0, "включённый конвейер не дошёл до обратного прохода")
+        for (i, (x, y)) in zip(plain, piped).enumerated() {
+            XCTAssertEqual(MLX.abs(x - y).max().item(Float.self), 0, "параметр \(i)")
+        }
+        // запуск подчиняется своей конфигурации, а не процессной настройке
+        SequentialBody.pipelined = true
+        defer { SequentialBody.pipelined = false }
+        XCTAssertEqual(train(false).1, 0, "процессная настройка перебила конфигурацию запуска")
+    }
+
+    /// Потолок кэша на время оценки (`EmbeddingStage.evaluationCacheLimitGB`):
+    /// оценка идёт под ним, после неё — прежний; nil — оценка под потолком
+    /// обучения; `.infinity` — до предела памяти MLX.
+    func testEvaluationCacheLimit() throws {
+        let tok = try EmbeddingFinetuneTests().loadWorldTokenizerOrSkip()
+        let rows = try EmbeddingFinetuneTests().slice().filter { $0.task == .retrieval }
+        try XCTSkipIf(rows.count < 12, "мало строк retrieval в срезе")
+        let saved = MLX.Memory.cacheLimit
+        defer { MLX.Memory.cacheLimit = saved; EmbeddingFinetune.evaluationProbe = nil }
+        XCTAssertNil(EmbeddingStage(task: .retrieval, train: []).evaluationCacheLimitGB, "умолчание")
+        for (limit, want) in [(nil, 0.25), (0.5, 0.5), (Double.infinity, -1.0)] as [(Double?, Double)] {
+            let model = makeModel(vocab: 65536)
+            var stage = EmbeddingStage(task: .retrieval, train: Array(rows.prefix(8)), heldOut: Array(rows.suffix(4)),
+                                       config: TrainingConfig(lr: 1e-4, maxSteps: 1, cacheLimitGB: 0.25, logEvery: 0),
+                                       batchSize: 2, maxTokens: 32)
+            stage.evaluationCacheLimitGB = limit
+            var seen: [Int] = []
+            EmbeddingFinetune.evaluationProbe = { seen.append(MLX.Memory.cacheLimit) }
+            _ = try EmbeddingFinetune.runStage(model: model, tokenizer: tok,
+                                               trainable: EmbeddingTrainable.make(model: model, mode: .frozen),
+                                               stage: stage)
+            let expected = want < 0 ? MLX.Memory.memoryLimit : Int(want * 1e9)
+            XCTAssertEqual(seen, [expected, expected], "оценки до и после, потолок \(String(describing: limit))")
+            XCTAssertEqual(MLX.Memory.cacheLimit, Int(0.25e9), "после оценки не вернулся потолок обучения")
+        }
+    }
+
     /// Стадия передаёт `bodyChunkTokens` в обратный проход; умолчание — без кусков.
     func testStagePassesBodyChunkTokens() throws {
         let tok = try EmbeddingFinetuneTests().loadWorldTokenizerOrSkip()

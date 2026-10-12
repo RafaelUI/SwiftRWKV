@@ -214,6 +214,8 @@ public struct StateTuneConfig: Sendable {
     public var adamEps: Float = 1e-8
     public var train: [StateTrainableSet.Part] = [.wkv]
     public var sequentialBackward = true
+    /// Конвейер обратного прохода по блокам (`TrainingConfig.pipelined`); выключен.
+    public var pipelined = false
     public var lossChunkTokens = 256
     public var cacheLimitGB = 0.25
     public var logEvery = 20
@@ -224,7 +226,7 @@ public struct StateTuneConfig: Sendable {
         TrainingConfig(lr: lr, lrMin: lrMin, schedule: schedule, warmupSteps: warmupSteps,
                        gradClip: gradClip, weightDecay: 0, beta1: beta1, beta2: beta2,
                        adamEps: adamEps, maxSteps: maxSteps, gradAccum: 1,
-                       cacheLimitGB: cacheLimitGB, logEvery: logEvery)
+                       cacheLimitGB: cacheLimitGB, logEvery: logEvery, pipelined: pipelined)
     }
 }
 

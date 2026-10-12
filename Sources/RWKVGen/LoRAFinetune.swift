@@ -55,6 +55,8 @@ public struct LoRAConfig: Sendable {
     /// Умолчание — включено (решение владельца 11.10): +4…6 % времени шага
     /// за половину пика памяти на длинной последовательности.
     public var sequentialBackward: Bool = true
+    /// Конвейер обратного прохода по блокам (`TrainingConfig.pipelined`); выключен.
+    public var pipelined: Bool = false
     /// Спад LR после warmup. Исторический дефолт — .constant (плоско).
     public var schedule: LRSchedule
     public var lrMin: Float
@@ -79,7 +81,7 @@ public struct LoRAConfig: Sendable {
                        warmupSteps: warmupSteps, gradClip: gradClip,
                        weightDecay: weightDecay, beta1: beta1, beta2: beta2,
                        adamEps: adamEps, maxSteps: maxSteps, gradAccum: gradAccum,
-                       cacheLimitGB: cacheLimitGB, logEvery: logEvery)
+                       cacheLimitGB: cacheLimitGB, logEvery: logEvery, pipelined: pipelined)
     }
 }
 

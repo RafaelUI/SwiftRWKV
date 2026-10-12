@@ -42,10 +42,18 @@ public enum SequentialBody {
     /// так пик шага раскладывается по статьям без eval внутри трассировки.
     nonisolated(unsafe) public static var probe: ((String) -> Void)? = nil
 
-    /// ОПЫТ (по умолчанию выключено): после блока — `asyncEval` вместо `eval`,
-    /// то есть CPU строит граф следующего блока, пока GPU считает этот (как
-    /// `DecodePipeline` на декоде). Счёт тот же; меняется только, ждёт ли CPU.
+    /// Конвейер: после блока — `asyncEval` вместо `eval`, то есть CPU строит
+    /// граф следующего блока, пока GPU считает этот (как `DecodePipeline` на
+    /// декоде). Счёт тот же; меняется только, ждёт ли CPU. Настройка уровня
+    /// ПРОЦЕССА, по умолчанию выключена; обучение включает её на время своего
+    /// запуска по `TrainingConfig.pipelined` (`LoRAConfig.pipelined`,
+    /// `StateTuneConfig.pipelined`, `EmbeddingStage.config.pipelined`) — туда
+    /// и стоит ходить, а не сюда.
     nonisolated(unsafe) public static var pipelined = false
+
+    /// Сколько раз `settle` ушёл в `asyncEval` — по числам конвейер не виден
+    /// (счёт побитно тот же), поэтому тесты проверяют путь по счётчику.
+    nonisolated(unsafe) public internal(set) static var asyncEvalCalls = 0
 
     /// ОПЫТ (по умолчанию 1 — прежнее поведение): в ПРЯМОМ проходе вычислять
     /// граф не после каждого блока, а после каждого `forwardSettleEvery`-го (и
@@ -55,7 +63,7 @@ public enum SequentialBody {
     nonisolated(unsafe) public static var forwardSettleEvery = 1
 
     @inline(__always) static func settle(_ arrays: [MLXArray]) {
-        if pipelined { asyncEval(arrays) } else { eval(arrays) }
+        if pipelined { asyncEvalCalls += 1; asyncEval(arrays) } else { eval(arrays) }
     }
 
     /// Куда относится каждый параметр обучаемого множества.
