@@ -408,6 +408,16 @@ base.initialState = nil
   free-form `note`, and the base fingerprint. A different architecture is
   always refused; a different base throws `StateFile.Failure.otherBase` unless
   `allowOtherBase: true`.
+- **What it buys** (measured with the rwkv-metal reference, which computes the
+  same gradient): on Russian prose a trained state lowers held-out loss by
+  0.066 on 0.1B (3.22 -> 3.16) and by 0.05 on 0.4B, the same over a dense base
+  and over `reduction` / `compression`. A state trained on one of these bases
+  and attached to another (`allowOtherBase: true`) keeps 94…100% of the gain.
+  The learning rate is the sensitive part: the often-quoted 1 -> 0.01 destroys
+  the model; 3e-4 is the measured default. As an embedder trained from a
+  language-model checkpoint it reaches the quality of the top 2 layers with 24
+  times fewer numbers but diverged in one run of nine — see
+  `docs/state-tuning.md` in rwkv-metal for the tables.
 - **The fingerprint** (`StateFile.baseFingerprint`) is a sha256 over the
   contract, the small tensors of the base and row 0 of two projections, through
   bf16 (rows of compressed `.rwkvq` projections through fp16). The same base
