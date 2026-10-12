@@ -45,6 +45,11 @@ struct Args {
     var headIn: String? = nil
     var allowOtherBase = false
     var forwardAB = 0
+    var pipeline = false
+    var evalCacheGB: Double? = nil
+    var thenState = 0
+    var thenStateLR: Float = 3e-4
+    var thenHead = false
     var out: String? = nil
     var limit: Int? = nil          // читать не больше стольких строк JSONL (иначе файл целиком в память)
     var logEvery = 50              // печать шага; 1 — время каждого шага (замеры)
@@ -97,7 +102,11 @@ func parse() -> Args {
         case "--pipeline-ab": a.pipelineAB = true
         case "--unpack": a.unpack = Int(v())
         case "--eval-tokens": EmbeddingMetrics.evaluationBatchTokens = Int(v()) ?? EmbeddingMetrics.evaluationBatchTokens
-        case "--pipeline": SequentialBody.pipelined = v() != "0"
+        case "--pipeline": a.pipeline = v() != "0"
+        case "--eval-cache-gb": a.evalCacheGB = Double(v())          // inf — без потолка
+        case "--then-state": a.thenState = Int(v()) ?? 0
+        case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
+        case "--then-head": a.thenHead = true        // контроль: на второй стадии вместо состояния — голова
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!)
             exit(2)
@@ -223,7 +232,8 @@ if let path = args.stateIn {
 }
 // поштучные результаты ПОСЛЕДНЕЙ оценки — в отчёт, для парного бутстрэпа
 var perRow: [Double] = []
-EmbeddingMetrics.perRowObserver = { perRow = $0 }
+var allRows: [[Double]] = []           // поштучные результаты ВСЕХ оценок по порядку
+EmbeddingMetrics.perRowObserver = { perRow = $0; allRows.append($0) }
 if let m = mode, let why = EmbeddingTrainable.unsupportedReason(model: model, mode: m) {
     print(why); exit(2)
 }
@@ -239,6 +249,8 @@ stage.config.cacheLimitGB = args.cacheGB
 stage.config.logEvery = args.logEvery
 if let c = args.chunkTokens { stage.bodyChunkTokens = c }
 stage.traceStride = args.traceStride
+stage.config.pipelined = args.pipeline
+stage.evaluationCacheLimitGB = args.evalCacheGB
 var report: [String: Any] = ["model": args.model, "mode": args.mode, "task": task.rawValue,
                              "train": train.count, "eval": heldOut.count, "steps": args.steps,
                              "batch": args.batch, "max_tokens": args.maxTokens, "quantised": quantised]
@@ -351,6 +363,66 @@ if let mode {
     report["after"] = r.after?.headline ?? Double.nan
     report["final_loss"] = Double(r.finalLoss); report["train_seconds"] = r.seconds
     report["train_peak_gb"] = Double(GPU.peakMemory) / 1e9
+
+    if args.thenState > 0 {
+        // ВТОРАЯ СТАДИЯ: начальное состояние ВМЕСТО строки инструкции поверх
+        // только что обученного эмбеддера. Из запросов убирается «Instruct: …\n
+        // Query: », база и голова заморожены, обучается только состояние (WKV)
+        // на тех же обучающих строках без инструкции. Три оценки на одних и тех
+        // же отложенных строках: с инструкцией (конец первой стадии), без
+        // инструкции и без состояния, без инструкции с обученным состоянием.
+        func strip(_ s: EmbeddingSample) -> EmbeddingSample {
+            guard let r = s.anchor.range(of: "\nQuery: ") else { return s }
+            return EmbeddingSample(anchor: String(s.anchor[r.upperBound...]), positive: s.positive,
+                                   negative: s.negative, task: s.task)
+        }
+        let trainS = train.map(strip), heldS = heldOut.map(strip)
+        let changed = zip(heldOut, heldS).filter { $0.anchor != $1.anchor }.count
+        let saved = zip(heldOut, heldS).map {
+            tok.encode($0.anchor).count - tok.encode($1.anchor).count
+        }
+        let instructRows = perRow
+        var stage2 = EmbeddingStage(
+            task: task, train: trainS, heldOut: heldS,
+            config: TrainingConfig(lr: args.thenStateLR, lrMin: args.thenStateLR / 10, schedule: .cosine,
+                                   warmupSteps: min(50, args.thenState / 5), gradClip: 0,
+                                   maxSteps: args.thenState),
+            batchSize: args.batch, maxTokens: args.maxTokens, maxChars: args.maxChars, seed: args.seed &+ 1)
+        stage2.config.logEvery = args.logEvery
+        stage2.config.cacheLimitGB = args.cacheGB
+        if let c = args.chunkTokens { stage2.bodyChunkTokens = c }
+        stage2.traceStride = args.traceStride
+        stage2.evaluationCacheLimitGB = args.evalCacheGB
+        base.trainLayers = []
+        // Контроль (--then-head): те же шаги на тех же строках без инструкции,
+        // но обучается голова, а состояния нет, — чтобы прибавку состояния не
+        // спутать с прибавкой от лишних шагов дообучения.
+        let stateSet: TrainableSet = args.thenHead ? EmbeddingHeadTrainableSet(model.head) : StateTrainableSet(base)
+        let numbers = stateSet.initialParameters().reduce(0) { $0 + $1.size }
+        print("ВТОРАЯ СТАДИЯ: \(args.thenHead ? "КОНТРОЛЬ, голова" : "состояние") вместо инструкции — у \(changed) из "
+              + "\(heldOut.count) запросов снята строка инструкции (\(saved.reduce(0, +) / max(1, saved.count)) "
+              + "токенов на запрос); обучается \(numbers) чисел, шаг \(args.thenStateLR), \(args.thenState) шагов")
+        let t2 = Date()
+        let r2 = try EmbeddingFinetune.runStage(model: model, tokenizer: tok, trainable: stateSet, stage: stage2,
+                                                onStep: { s in
+            if s.step % args.logEvery == 0 {
+                print(String(format: "  шаг %d: лосс %.4f, %.2f с от начала стадии", s.step, s.loss,
+                             Date().timeIntervalSince(t2)))
+                fflush(stdout)
+            }
+        })
+        print("с инструкцией (после первой стадии): \(r.after?.description ?? "—")")
+        print("без инструкции, без состояния: \(r2.before?.description ?? "—")")
+        print("без инструкции, \(args.thenHead ? "голова дообучена (контроль)" : "с состоянием"): \(r2.after?.description ?? "—")")
+        report["instruct"] = r.after?.headline ?? Double.nan
+        report["stripped"] = r2.before?.headline ?? Double.nan
+        report["stripped_state"] = r2.after?.headline ?? Double.nan
+        report["instruct_tokens"] = Double(saved.reduce(0, +)) / Double(max(1, saved.count))
+        report["per_row_instruct"] = instructRows
+        if allRows.count >= 2 { report["per_row_stripped"] = allRows[allRows.count - 2] }
+        report["state_final_loss"] = Double(r2.finalLoss)
+        report["second_stage"] = args.thenHead ? "head" : "state"
+    }
 } else {
     if args.cacheGB > 0 { MLX.Memory.cacheLimit = Int(args.cacheGB * 1e9) }
     _ = EmbeddingMetrics.embedAll(model: model, tokenizer: tok, texts: ["прогрев"])   // первое касание весов — не в замер
