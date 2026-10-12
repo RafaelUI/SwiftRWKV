@@ -323,6 +323,28 @@ the body block by block. 32 held-out rows of 1024 tokens, peak MLX memory:
 0.1B 1.85 → 0.84 GB, 0.4B REDUCTION 2.17 → 1.15 GB; evaluation takes 10…29%
 longer than one graph over 16 rows did.
 
+Most of that time is not the block-by-block pass but MLX's buffer-cache
+ceiling. Freed GPU buffers normally stay in a cache for reuse; a ceiling makes
+MLX hand them back to the system and allocate fresh ones for the next block.
+Evaluation is forward passes only, so that churn is a visible share of it; a
+training step is dominated by the backward pass and does not notice (≤ 1% for
+top-layer training). The cache counts towards the process footprint, so lifting
+the ceiling costs memory. `stage.evaluationCacheLimitGB` sets a ceiling for
+evaluation alone (nil — the training one, `.infinity` — none). Retrieval
+evaluation of 300 queries (900 texts up to 512 tokens), two rounds with arms
+interleaved, time and peak footprint of the whole process:
+
+| ceiling | 0.1B REDUCTION | 0.4B REDUCTION |
+|---|---|---|
+| 0.25 GB (default) | 45.2 / 45.4 s, 1.04 GB | 137.3 / 143.7 s, 1.47 GB |
+| 1 GB | 42.8 / 44.2 s, 1.78 GB | 129.7 / 139.5 s, 2.22 GB |
+| none | 42.3 / 43.6 s, 3.30 GB | 130.1 / 137.0 s, 4.58 GB |
+
+The ceiling costs evaluation 4…7% of time and saves 2.3…3.1 GB. 1 GB is as
+fast as no ceiling within noise and stays under 2.3 GB; without a ceiling a
+0.4B evaluation goes past a 3 GB budget. The default is left at the training
+ceiling because memory is the constraint this library is tuned for.
+
 ### Training top layers over a quantized base
 
 Adapters on a 0.1B or 0.4B model carry too few parameters to be worth it; the
