@@ -8,7 +8,8 @@ RWKV-7 is a linear-attention (RNN-style) language model: constant memory per
 generated token and no quadratic attention, which makes it a good fit for running
 *and adapting* models directly on a phone or Mac. SwiftRWKV exposes one canonical
 backbone (`X070Backbone`, a faithful port of official RWKV-7 "Goose" x070) and
-builds inference, generation, and two fine-tuning paths on top of it.
+builds inference, generation, embeddings, reranking and several ways of
+adapting a model on top of it — over a dense base or a quantised `.rwkvq` one.
 
 ```swift
 import RWKVGen
@@ -30,7 +31,8 @@ print(out.text)
 
 - **Text generation** — `generate(prompt:maxTokens:config:onToken:)` with
   temperature, top-k, top-p and repetition penalties, seeded and reproducible,
-  streaming with stop strings and cancellation. Greedy by default.
+  streaming with stop strings and cancellation; the sampler can run entirely on
+  the GPU. Greedy by default.
 - **Inference** — a parallel pass for whole sequences and a recurrent one with
   O(1) memory per token; prefill uses the parallel pass and is measured 94×
   faster than folding the prompt token by token.
@@ -38,18 +40,29 @@ print(out.text)
   listwise training and an indexed serving path.
 - **Embeddings** — pooling, a trainable head, contrastive losses, GradCache,
   curriculum stages and retrieval metrics.
-- **Quantised `.rwkvq` base** — sidecar format from
-  [rwkv-quant](https://github.com/RafaelUI/rwkv-quant) with a fused Metal
-  dequantisation kernel; inference, reranking and embeddings all run on it
-  unchanged.
-- **LoRA / QLoRA fine-tuning** — for larger models (≈600M+); 4/8-bit quantized base.
-- **N-layer partial fine-tuning** — full-weight training of the top N layers on a
-  frozen, disk-cached lower stack; for smaller models (≤400M).
+- **Quantised `.rwkvq` base** — the format from
+  [rwkv-quant](https://github.com/RafaelUI/rwkv-quant), opened directly or
+  through a sidecar, with fused Metal dequantisation; inference, reranking and
+  embeddings run on it unchanged, and it can be trained over — adapters, the
+  top layers (unpacked to dense, the bottom stays compressed) or a state.
+- **LoRA / QLoRA fine-tuning** — for larger models (≈600M+); 4/8-bit quantized
+  base or a `.rwkvq` one.
+- **Top-layer training** — full-weight training of the top N layers for smaller
+  models (≤400M), where adapters carry too few parameters; also over a `.rwkvq`
+  base. The classic path (`X070PartialFinetune`) caches the frozen lower stack
+  on disk.
+- **State-tuning** — the base frozen, only the initial state of the recurrence
+  trained (0.1B: 0.59 M numbers), kept in its own file with a fingerprint of the
+  base; a trained state and a folded prompt are one pluggable object.
 - **Pre-training from scratch** — x070 initialisation, `.bin` token streams, a
   shared trainer with LR schedules and resumable checkpoints.
 - **Custom Metal WKV-7 kernel** — forward + a hand-written differentiable
-  (gradient-checkpointed) backward, verified bit-exact against a reference.
-- **fp32 training, bf16 weights** — matches how RWKV-7 World was trained.
+  (gradient-checkpointed) backward, verified bit-exact against a reference;
+  dedicated decode kernels for one token.
+- **Memory-bounded training** — backward block by block (one block in memory,
+  the same gradient), rows of a batch through the body in pieces, block inputs
+  recorded with a stride; fp32 trainable weights over a bf16 (dense) or fp16
+  (`.rwkvq`) base.
 
 ## Requirements
 
@@ -63,7 +76,7 @@ Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/RafaelUI/SwiftRWKV", from: "0.2.0"),
+    .package(url: "https://github.com/RafaelUI/SwiftRWKV", from: "0.2.4"),
 ],
 targets: [
     .target(name: "YourApp", dependencies: [
@@ -78,45 +91,62 @@ targets: [
 
 Or in Xcode: **File → Add Package Dependencies…** → paste the repo URL.
 
+The latest tag is `0.2.4`. State-tuning, top-layer training over `.rwkvq` and
+the memory levers above are on `main` and not tagged yet.
+
 ## Project layout
 
 ```
 Sources/
-├── RWKVKernel/                  # custom Metal WKV-7 kernel (low-level)
+├── RWKVKernel/                  # custom Metal WKV-7 kernels (low-level)
 │   ├── WKV7.swift               #   forward + chunk forward + constants (CHUNK=16, HEAD_SIZE=64)
 │   ├── WKV7Step.swift           #   single-token step, boundary state
+│   ├── WKV7DecodeKernels.swift  #   decode: one-token WKV step and tmix tail in one launch
 │   ├── WKV7Train.swift          #   differentiable checkpointed backward (CustomFunction)
-│   └── WKV7Reference.swift      #   naive recurrent DPLR — autograd ground-truth for tests
+│   ├── WKV7Reference.swift      #   naive recurrent DPLR — autograd ground-truth for tests
+│   └── Ablation.swift           #   subtractive ablation of a training step (instrument)
 ├── RWKVQuant/                   # .rwkvq quantised base (independent of the backbone)
-│   ├── RwkvqSidecar.swift       #   format, manifest, x070↔world naming
-│   └── RwkvqDequant.swift       #   fused Metal dequantisation, one launch
+│   ├── RwkvqFile.swift          #   reading .rwkvq directly
+│   ├── RwkvqSidecar.swift       #   sidecar format, manifest, x070↔world naming
+│   ├── RwkvqFullConvert.swift   #   the whole x070 weight dictionary from a self-contained sidecar
+│   ├── RwkvqDequant.swift       #   fused Metal dequantisation, one launch
+│   ├── RwkvqNative.swift        #   repacking into MLX's native quantised container
+│   └── RwkvqSb6GEMV / SymGEMV / SymRows.swift   # projection kernels per preset
 ├── RWKVGen/                     # backbone, inference, generation, training
 │   ├── X070Backbone.swift       #   canonical RWKV-7 backbone + split + training hooks
 │   ├── RWKVBlock.swift          #   one block, shared by the backbone and the rerank head
 │   ├── RWKVBatchState.swift     #   batched boundary state, masks, right-padding
+│   ├── InitialState.swift       #   pluggable initial state, state-tuning, state files
 │   ├── X070Generation.swift     #   RWKVState + prefill / step (streaming)
 │   ├── Sampling.swift           #   SamplingConfig, seeded sampler, penalties
+│   ├── GPUSampler.swift         #   the same sampler without a CPU read per token
 │   ├── Generate.swift           #   generation loop: stop conditions, byte-safe streaming
 │   ├── WorldTokenizer.swift     #   RWKV World trie tokenizer
 │   ├── RwkvqBase.swift          #   attaching a .rwkvq sidecar to the backbone
+│   ├── RwkvqStandaloneLoad.swift#   a backbone from one .rwkvq file, no dense file needed
 │   ├── LoRA.swift               #   LoRA/QLoRA spec, add/merge/save/load, base quantization
 │   ├── LoRAFinetune.swift       #   LoRA training loop (LM objective)
 │   ├── X070PartialFinetune.swift#   N-layer partial fine-tune (boundary cache + train)
 │   ├── Checkpoint.swift         #   gradient-checkpoint primitive
 │   └── Training/                #   shared trainer, LR schedules, trainable sets,
-│                                #   x070 init, token streams, pre-training
+│                                #   backward block by block, x070 init, token
+│                                #   streams, pre-training
 ├── RWKVEmbedding/               # text vectors: pooling, head, contrastive losses,
 │                                # GradCache, curriculum, metrics, checkpoints
 ├── RWKVRerank/                  # cross-encoder reranker: head over state, state
 │                                # cache, listwise training, indexed serving
-└── RerankRun/                   # executable: data → cache → training → report
+├── RerankRun/                   # executable rerank-run: data → cache → training → report
+├── EmbedRun/                    # executable embed-run: one embedding stage, evaluation, A/B instruments
+└── DecodeBench/                 # executable decode-bench: decode and training-step benchmarks
 ```
 
-Five importable modules. `import RWKVGen` covers inference, generation and every
-training path — it pulls in `RWKVKernel` and `RWKVQuant` itself. Import
-`RWKVRerank` or `RWKVEmbedding` for those tasks, `RWKVQuant` alone only to read
-a sidecar without a model, and `RWKVKernel` only to call the `wkv7*` kernels
-directly.
+Four library products. `import RWKVGen` covers inference, generation and every
+training path — it links `RWKVKernel` and `RWKVQuant` itself. Import
+`RWKVRerank` or `RWKVEmbedding` for those tasks, and `RWKVQuant` alone only to
+read a sidecar without a model. `RWKVKernel` is an internal target, not a
+product: the kernels are reached through `RWKVGen`. Three executables —
+`rerank-run`, `embed-run`, `decode-bench` — are the runners and instruments the
+numbers in the docs come from.
 
 ## Documentation
 
@@ -126,12 +156,16 @@ run (`Scripts/check_docs.sh`) so they cannot silently rot:
 - **[docs/Inference.md](docs/Inference.md)** — the two passes, generation and
   sampling, streaming and stop conditions, the quantised `.rwkvq` backend, and
   the measured numbers with the conditions they were measured under.
-- **[docs/Train.md](docs/Train.md)** — loading and converting checkpoints,
-  LoRA/QLoRA, N-layer partial fine-tuning, pre-training, the shared trainer.
+- **[docs/Train.md](docs/Train.md)** — the shared trainer and trainable sets,
+  LoRA/QLoRA (also over `.rwkvq`), N-layer partial fine-tuning, pre-training.
+- **[docs/state-tuning.md](docs/state-tuning.md)** — training the initial state,
+  attaching it and folding prompts, the state file and base fingerprint, and
+  what it buys: quality, transfer between a model and its `.rwkvq` files, cost.
 - **[docs/reranker.md](docs/reranker.md)** — data, state cache, training the
   head, layer sweeps, serving.
 - **[docs/Embedding.md](docs/Embedding.md)** — pooling, heads, losses,
-  GradCache, curriculum, metrics.
+  GradCache, curriculum, metrics, memory of a training step, training over a
+  `.rwkvq` base, a state in place of the instruction.
 
 Design decisions and their reasoning are in
 [ARCHITECTURE.md](ARCHITECTURE.md); the working log of what is measured, what
@@ -140,8 +174,9 @@ is missing and what was tried and rejected is in
 
 ## Status
 
-Experimental, but validated end to end on a real RWKV-7 World 0.1B rather than
-on toys. 418 tests, plus mutation suites that deliberately break the code and
+Experimental, but validated end to end on real models rather than on toys —
+RWKV-7 World 0.1B, g1d 0.1B / 0.4B dense and as `.rwkvq`, and 1.5B / 2.9B for
+inference. 564 tests, plus mutation suites that deliberately break the code and
 require the tests to notice — the interesting failures in this problem are
 silent, so "the tests pass" is not by itself evidence.
 
@@ -149,7 +184,9 @@ What is checked: WKV-7 kernel parity (bit-exact against a reference), the
 hand-written backward against autograd, logits parity with the Python
 implementation on real weights, the recurrent decode against the parallel pass
 (7.4e-7 relative), the partial-fine-tune split (Δ = 0), `.rwkvq` dequantisation
-bit-for-bit against a Python reference, and end-to-end fine-tuning runs.
+bit-for-bit against a Python reference, gradients of the block-by-block
+backward and of the state against autograd, state files and base fingerprints
+against the rwkv-metal reference, and end-to-end fine-tuning runs.
 
 API may still change before a stable release.
 

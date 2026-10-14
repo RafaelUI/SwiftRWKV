@@ -348,82 +348,24 @@ opaque to autograd and runs only in the recurrent step.
 
 ## State-tuning and pluggable initial states
 
-RWKV is an RNN: a sequence does not have to start from zeros. The starting
-state is a pluggable object here — trained (state-tuning), folded from a prompt,
-or one on top of the other — kept in its own small file. Code:
-`Sources/RWKVGen/InitialState.swift`; the reference is rwkv-metal
-(`docs/state-tuning.md` there), and the file format and base fingerprint are
-the same in both, bit for bit.
-
-A trained state and a state after a prompt are one type, `RWKVBatchState` with
-batch 1: `wkv` `[L, 1, H, S, S]` (fp32), `tmixShift` and `cmixShift`
-`[L, 1, 1, D]`. State-tuning trains only `wkv` by default, as RWKV-PEFT does —
-0.1B: 589,824 numbers, 0.4B: 1,572,864, 1.5B: 3,145,728. The two shift vectors
-are 3% on top and act on the first token of each layer only; `train:` turns
-them on.
+The base stays frozen and only the initial state of the recurrence is trained —
+by default the WKV matrix of every layer (0.1B: 0.59 M numbers, 0.4B: 1.57 M).
+A trained state and a state folded from a prompt are one object, attached with
+`backbone.initialState = state`; it lives in its own file (`StateFile`) with a
+fingerprint of the base it was made on.
 
 ```swift
 let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
 let ids = MLXArray((0 ..< 65).map { Int32($0 % 60000) }, [1, 65])
 let batch: LoRABatch = (x: ids[0..., 0 ..< 64], y: ids[0..., 1 ... 64])   // T % 16 == 0
-
-var config = StateTuneConfig()           // lr 3e-4 -> 3e-5 (cosine), WKV only
-config.maxSteps = 500
-let (result, state) = StateTuning.run(base, nextBatch: { batch }, config: config)
-print(result.finalLoss, state.wkv.shape)
-
-// its own file, with the fingerprint of the base it was trained on
-let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
-try StateFile.save(state, base: base, to: url, note: "world 0.1b")
-
-// later, on the same base
-let (loaded, info) = try StateFile.load(url, base: base)
-base.initialState = loaded               // body / prefill / embedder start from it
-print(info.kind, info.trained)
-
-let cached = base.foldPrompt([510, 261, 0])          // attached -> prompt -> cache
-_ = base.bodyWithState(batch.x, state: cached)       // an explicit state wins
-base.initialState = nil
+let (_, state) = StateTuning.run(base, nextBatch: { batch }, config: StateTuneConfig())
+base.initialState = state                // body / prefill / embedder start from it
 ```
 
-- **Attaching.** `backbone.initialState = state` splits the state by layer; a
-  block takes `h_in` and the shifts from it only where the caller passed none —
-  each part separately. `body`, the embedder, `prefill` and the reranker's
-  prefix encoding therefore start from the attached state, and "trained ->
-  system prompt -> cache" is plain continuation with no code of its own.
-  `startState()` gives the same start to step-by-step decoding. An attached
-  zero state changes nothing, bit for bit.
-- **Memory and cost.** The state of a layer is a parameter of its own block
-  (`blocks.N.state0.wkv`), so `SequentialBody` runs the step backward block by
-  block with one block in memory, and the gradient equals autograd over the
-  whole graph. The state enters every layer from layer 0 up, so the gradient
-  goes through the full depth: there is no frozen bottom on fast kernels, and a
-  step costs about as much as adapters on every layer.
-- **Embedding.** `BaseTrainingMode.state(learningRateScale:parts:)` trains the
-  state and the pooling head. The two want very different step sizes — the state
-  starts from zero — so the mode carries a multiplier on the stage learning
-  rate (`TrainableSet.learningRateScales`).
-- **The file.** `StateFile` writes three fp32 tensors and metadata: format,
-  version, the contract (layers, D, heads, head size), `kind`, `trained`, a
-  free-form `note`, and the base fingerprint. A different architecture is
-  always refused; a different base throws `StateFile.Failure.otherBase` unless
-  `allowOtherBase: true`.
-- **What it buys** (measured with the rwkv-metal reference, which computes the
-  same gradient): on Russian prose a trained state lowers held-out loss by
-  0.066 on 0.1B (3.22 -> 3.16) and by 0.05 on 0.4B, the same over a dense base
-  and over `reduction` / `compression`. A state trained on one of these bases
-  and attached to another (`allowOtherBase: true`) keeps 94…100% of the gain.
-  The learning rate is the sensitive part: the often-quoted 1 -> 0.01 destroys
-  the model; 3e-4 is the measured default. As an embedder trained from a
-  language-model checkpoint it reaches the quality of the top 2 layers with 24
-  times fewer numbers but diverged in one run of nine — see
-  `docs/state-tuning.md` in rwkv-metal for the tables.
-- **The fingerprint** (`StateFile.baseFingerprint`) is a sha256 over the
-  contract, the small tensors of the base and row 0 of two projections, through
-  bf16 (rows of compressed `.rwkvq` projections through fp16). The same base
-  loaded as bf16 and as fp32 gives one value; a dense model, its `reduction`
-  file and its `compression` file are three different bases. Adapters, a
-  trainable override and the attached state are not part of it.
+The full guide — attaching and prompt caches, the file and the fingerprint,
+the embedder mode, the learning rate (the often-quoted 1 -> 0.01 destroys the
+model; 3e-4 is measured) and the measured quality, transfer between a model and
+its `.rwkvq` files, and cost — is **[state-tuning.md](state-tuning.md)**.
 
 ## Partial fine-tuning: top-N layers plus a classifier
 
@@ -587,11 +529,10 @@ legitimate training input.
 
 ## Not done
 
-- **No sampler**, so nothing here can be evaluated by generating text; see
-  [Inference.md](Inference.md).
-- **No runner for embeddings.** The reranker has `rerank-run` end to end;
-  embedding curricula are library-only and leave no incremental report, so a
-  run killed halfway leaves no trace.
+- **Embedding curricula have no runner.** `embed-run` runs one stage (and the
+  two-stage "state in place of the instruction" measurement) and writes a
+  report; a multi-stage curriculum is library-only and leaves no incremental
+  report, so a run killed halfway leaves no trace.
 - **Reranker training does not expose resumption.** `Trainer` supports it;
   `RerankTraining` does not surface it. Deliberately deferred while training
   takes seconds.
@@ -604,6 +545,8 @@ legitimate training input.
   `RerankDataset` does this correctly and the code transfers by copying.
 - **No tokeniser for non-World vocabularies**, which limits pretraining on a
   custom vocabulary: Swift has no equivalent of HuggingFace `tokenizers`.
+## Fixed defects worth knowing
+
 - **Fixed 10.10: NaN gradients and GPU faults on real models.** Training a
   real model at T >= 32 used to fail intermittently — NaN in the gradients of
   the lowest layers, or a dead process with a Metal command-buffer error

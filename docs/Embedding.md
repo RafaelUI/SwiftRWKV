@@ -162,6 +162,8 @@ let model = EmbeddingModel(backbone: base)
 // .topLayers(N) — the top N backbone layers plus ln_out, and the head.
 // .full   — the whole backbone and the head.
 // .lora   — attached LoRA/QLoRA adapters and the head.
+// .state  — the initial state of the recurrence and the head; the base stays
+//           frozen (see state-tuning.md).
 let trainable = EmbeddingTrainable.make(model: model, mode: .topLayers(4))
 print(trainable.parameterNames.count)
 ```
@@ -348,7 +350,7 @@ ceiling because memory is the constraint this library is tuned for.
 ### A trained state in place of the instruction
 
 The query side of a task carries an instruction line (`Instruct: …\nQuery: …`).
-An initial state (`BaseTrainingMode.state`, see `docs/Train.md`) can stand in for
+An initial state (`BaseTrainingMode.state`, see [state-tuning.md](state-tuning.md)) can stand in for
 it: train the embedder as usual, then remove the line from the queries, freeze
 the base and the head, and train only the state on the same rows; attach the
 state (`backbone.initialState`) when embedding queries. `embed-run --then-state N`
@@ -527,10 +529,12 @@ The last row is causality, and it is exact rather than approximate.
 ### On a quantised base (`.rwkvq`)
 
 `EmbeddingModel(backbone:)` takes a backbone opened with
-`X070Backbone.load(fromRwkvq:)`. Two modes apply: `.frozen` and `.lora`
-(QLoRA — the base stays compressed, gradients reach the adapters through the
-quantised projections). `.full` and `.topLayers` are refused: the projections
-are codes, not weights (`EmbeddingTrainable.unsupportedReason`).
+`X070Backbone.load(fromRwkvq:)`. `.frozen`, `.lora` (QLoRA — the base stays
+compressed, gradients reach the adapters through the quantised projections) and
+`.state` apply as they are. `.topLayers(N)` applies once the top N layers are
+unpacked (`unpackTopLayers(N)`, [above](#training-top-layers-over-a-quantized-base));
+without that, and `.full` always, are refused: the projections are codes, not
+weights (`EmbeddingTrainable.unsupportedReason`).
 
 `embed-run` measures one stage end to end. 0.1B, LitRetrieval retrieval rows:
 2000 train, 300 held out (a pool of 600 candidates), 200 steps of 8 triplets,

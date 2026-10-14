@@ -121,6 +121,8 @@ func doc_Embedding_3() throws {
     // .topLayers(N) — the top N backbone layers plus ln_out, and the head.
     // .full   — the whole backbone and the head.
     // .lora   — attached LoRA/QLoRA adapters and the head.
+    // .state  — the initial state of the recurrence and the head; the base stays
+    //           frozen (see state-tuning.md).
     let trainable = EmbeddingTrainable.make(model: model, mode: .topLayers(4))
     print(trainable.parameterNames.count)
 }
@@ -707,24 +709,8 @@ func doc_Train_7() throws {
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
     let ids = MLXArray((0 ..< 65).map { Int32($0 % 60000) }, [1, 65])
     let batch: LoRABatch = (x: ids[0..., 0 ..< 64], y: ids[0..., 1 ... 64])   // T % 16 == 0
-
-    var config = StateTuneConfig()           // lr 3e-4 -> 3e-5 (cosine), WKV only
-    config.maxSteps = 500
-    let (result, state) = StateTuning.run(base, nextBatch: { batch }, config: config)
-    print(result.finalLoss, state.wkv.shape)
-
-    // its own file, with the fingerprint of the base it was trained on
-    let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
-    try StateFile.save(state, base: base, to: url, note: "world 0.1b")
-
-    // later, on the same base
-    let (loaded, info) = try StateFile.load(url, base: base)
-    base.initialState = loaded               // body / prefill / embedder start from it
-    print(info.kind, info.trained)
-
-    let cached = base.foldPrompt([510, 261, 0])          // attached -> prompt -> cache
-    _ = base.bodyWithState(batch.x, state: cached)       // an explicit state wins
-    base.initialState = nil
+    let (_, state) = StateTuning.run(base, nextBatch: { batch }, config: StateTuneConfig())
+    base.initialState = state                // body / prefill / embedder start from it
 }
 
 func doc_Train_8() throws {
@@ -1191,4 +1177,60 @@ func doc_reranker_8() throws {
         queries: ["how do bees make honey", "who invented the steam engine"],
         index: index)
     print(scores.count)
+}
+
+func doc_state_tuning_0() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    let ids = MLXArray((0 ..< 65).map { Int32($0 % 60000) }, [1, 65])
+    let batch: LoRABatch = (x: ids[0..., 0 ..< 64], y: ids[0..., 1 ... 64])   // T % 16 == 0
+
+    var config = StateTuneConfig()           // lr 3e-4 -> 3e-5 (cosine), WKV only
+    config.maxSteps = 500
+    let (result, state) = StateTuning.run(base, nextBatch: { batch }, config: config)
+    print(result.finalLoss, state.wkv.shape)
+
+    // its own file, with the fingerprint of the base it was trained on
+    let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
+    try StateFile.save(state, base: base, to: url, note: "world 0.1b")
+}
+
+func doc_state_tuning_1() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
+    let (loaded, info) = try StateFile.load(url, base: base)   // checks the base
+    base.initialState = loaded               // body / prefill / embedder start from it
+    print(info.kind, info.trained)
+
+    let cached = base.foldPrompt([510, 261, 0])                 // attached -> prompt -> cache
+    let x = MLXArray((0 ..< 16).map { Int32($0 + 100) }, [1, 16])
+    _ = base.bodyWithState(x, state: cached)                    // an explicit state wins
+    var decode = base.startState()                              // step-by-step decoding from it
+    _ = decode
+    base.initialState = nil                                     // detach
 }
