@@ -41,8 +41,10 @@ print(out.text)
 - **Embeddings** — pooling, a trainable head, contrastive losses, GradCache,
   curriculum stages and retrieval metrics.
 - **Quantised `.rwkvq` base** — the format from
-  [rwkv-quant](https://github.com/RafaelUI/rwkv-quant), opened directly or
-  through a sidecar, with fused Metal dequantisation; inference, reranking and
+  [rwkv-quant](https://github.com/RafaelUI/rwkv-quant), opened directly with
+  `X070Backbone.load(fromRwkvq:)` — no dense checkpoint needed — with fused
+  Metal dequantisation (an `export_mlx` sidecar is an optional cache, and
+  self-contained only when it is a full export); inference, reranking and
   embeddings run on it unchanged, and it can be trained over — adapters, the
   top layers (unpacked to dense, the bottom stays compressed) or a state.
 - **LoRA / QLoRA fine-tuning** — for larger models (≈600M+); 4/8-bit quantized
@@ -107,8 +109,8 @@ Sources/
 │   └── Ablation.swift           #   subtractive ablation of a training step (instrument)
 ├── RWKVQuant/                   # .rwkvq quantised base (independent of the backbone)
 │   ├── RwkvqFile.swift          #   reading .rwkvq directly
-│   ├── RwkvqSidecar.swift       #   sidecar format, manifest, x070↔world naming
-│   ├── RwkvqFullConvert.swift   #   the whole x070 weight dictionary from a self-contained sidecar
+│   ├── RwkvqSidecar.swift       #   the opened base (from .rwkvq or an export_mlx sidecar), manifest, naming
+│   ├── RwkvqFullConvert.swift   #   the whole x070 weight dictionary from a full export
 │   ├── RwkvqDequant.swift       #   fused Metal dequantisation, one launch
 │   ├── RwkvqNative.swift        #   repacking into MLX's native quantised container
 │   └── RwkvqSb6GEMV / SymGEMV / SymRows.swift   # projection kernels per preset
@@ -122,7 +124,7 @@ Sources/
 │   ├── GPUSampler.swift         #   the same sampler without a CPU read per token
 │   ├── Generate.swift           #   generation loop: stop conditions, byte-safe streaming
 │   ├── WorldTokenizer.swift     #   RWKV World trie tokenizer
-│   ├── RwkvqBase.swift          #   attaching a .rwkvq sidecar to the backbone
+│   ├── RwkvqBase.swift          #   attaching a .rwkvq base to an already-loaded dense backbone
 │   ├── RwkvqStandaloneLoad.swift#   a backbone from one .rwkvq file, no dense file needed
 │   ├── LoRA.swift               #   LoRA/QLoRA spec, add/merge/save/load, base quantization
 │   ├── LoRAFinetune.swift       #   LoRA training loop (LM objective)
@@ -143,7 +145,7 @@ Sources/
 Four library products. `import RWKVGen` covers inference, generation and every
 training path — it links `RWKVKernel` and `RWKVQuant` itself. Import
 `RWKVRerank` or `RWKVEmbedding` for those tasks, and `RWKVQuant` alone only to
-read a sidecar without a model. `RWKVKernel` is an internal target, not a
+read a `.rwkvq` or a sidecar without a model. `RWKVKernel` is an internal target, not a
 product: the kernels are reached through `RWKVGen`. Three executables —
 `rerank-run`, `embed-run`, `decode-bench` — are the runners and instruments the
 numbers in the docs come from.

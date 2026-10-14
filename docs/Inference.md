@@ -645,9 +645,13 @@ the note on `baseDType` below.
 
 ### Attaching a quantised base to a dense backbone
 
-The same file (or the optional `export_mlx` **sidecar**, which holds the
-loader layout ready-made) can also be attached to a dense backbone, which is
-then told to read from it instead of from its own copies:
+The usual route is the one above — `load(fromRwkvq:)`, no dense file. The same
+`.rwkvq` (or an `export_mlx` **sidecar**, an optional cache that holds the
+loader layout ready-made) can also be attached to an already-loaded dense
+backbone, which is then told to read from it instead of from its own copies.
+Attaching needs only the quantised projections, so it also works with an old,
+partial sidecar; building a whole model from a sidecar needs a full export
+(see "Not done").
 
 ```swift
 let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
@@ -893,14 +897,16 @@ moved.
   because the dequantise-per-call path is the right trade for *QLoRA* (the
   base must stay compressed) and the wrong one for inference; the two uses
   have not been separated in the API yet.
-- **A quantised model still needs the dense weights.** `attachRwkvq` attaches
-  to an already-loaded dense backbone, and the sidecar this package reads
-  carries only the sb6 tensors. Note this is now a limitation *of this
-  package*, not of the format: `.rwkvq` has held every tensor since the full
-  export landed, and `rwkv-quant`'s `codec` can read it and build either
-  loader layout without torch. Wiring that up here is pending — see
-  `RwkvqSidecar`, whose manifest parser also still assumes every entry is a
-  2-D quantised tensor and will reject a full-export manifest.
+- **An old sidecar is not self-contained.** `X070Backbone.load(fromRwkvq:)`
+  builds a model from the `.rwkvq` alone (above), and a sidecar from a *full*
+  `export_mlx` export — every tensor, not only the quantised projections —
+  works the same through `load(fromSidecar:)`. A sidecar exported before the
+  full export landed (August 2026) holds only the sb6 projections: it can only
+  be attached to an already-loaded dense backbone (`attachRwkvq`), and
+  `load(fromSidecar:)` refuses it — with `RwkvqError.missingBuffer(…,
+  "manifest")` for the first dense tensor it lacks, which does not say in so
+  many words that the export is partial. Re-export, or load the `.rwkvq`
+  directly.
 - **The backbone is not recorded in any checkpoint.** A reranker or embedding
   head loaded onto the wrong backbone differs in neither shape nor contract.
 - **Prefill is single-sequence.** It runs the parallel pass, but for one

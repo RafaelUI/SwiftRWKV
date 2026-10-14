@@ -261,8 +261,10 @@ rather than formatted strings, or they cannot be plotted.
 
 ## RWKVQuant
 
-**Responsibility.** The `.rwkvq` (`gw_mode="sb6"`) quantized-base backend: load
-the exported sidecar and reconstruct dense weights on the fly.
+**Responsibility.** The `.rwkvq` quantized-base backend: read `.rwkvq` directly
+(`RwkvqFile`, since 08.10) or an optional `export_mlx` sidecar, and reconstruct
+dense weights on the fly — every layout the format uses (sb6, sym, asym, rtn,
+dense).
 
 Kept separate from `RWKVCore` because it owns a file format, a manifest, and its
 own Metal kernel. A build that never touches quantized weights should not carry
@@ -312,7 +314,9 @@ quantised tensor with `xbits`/`gw_gs`/`gw_sb`, so a full-export manifest — whi
 also carries 1-D norms and `(1,1,C)` token-shift multipliers — is rejected
 outright. Making that parser kind-aware is the prerequisite for consuming
 `.rwkvq` here, and it has to happen anyway: the sidecar format grew those
-entries too.
+entries too. *(Fixed 08.08: the parser reads the kind of every entry and
+`dequantize` unpacks all of them, so a full-export sidecar is self-contained;
+an export older than that still holds only the sb6 projections.)*
 
 **Dequantised weights are transient and must not be cached** remains true *for
 QLoRA*, and false as a general rule — for inference the transient is the whole
