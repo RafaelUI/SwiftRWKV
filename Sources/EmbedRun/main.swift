@@ -37,6 +37,7 @@ struct Args {
     var sequential = true
     var cacheGB = 0.25
     var seed: UInt64 = 0
+    var dtype = "bf16"
     var stateLR: Float = 3e-4
     var stateParts = "wkv"
     var stateOut: String? = nil
@@ -106,7 +107,8 @@ func parse() -> Args {
         case "--eval-cache-gb": a.evalCacheGB = Double(v())          // inf — без потолка
         case "--then-state": a.thenState = Int(v()) ?? 0
         case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
-        case "--then-head": a.thenHead = true        // контроль: на второй стадии вместо состояния — голова
+        case "--then-head": a.thenHead = true
+        case "--dtype": a.dtype = v()                          // плотная база: bf16 | fp16 | fp32        // контроль: на второй стадии вместо состояния — голова
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!)
             exit(2)
@@ -128,7 +130,18 @@ func footprintGB() -> Double {
     return ok == KERN_SUCCESS ? Double(info.phys_footprint) / 1e9 : 0
 }
 
-func loadBase(_ path: String) throws -> (X070Backbone, quantised: Bool) {
+/// Тип плотной базы (`--dtype`): bf16 — прежнее умолчание; fp16 — тот же тип,
+/// в котором считает база из .rwkvq, чтобы плечи «плотная против сжатой»
+/// отличались только квантованием; fp32 — опорная точка.
+func denseDType(_ s: String) -> DType {
+    switch s {
+    case "fp16", "float16": return .float16
+    case "fp32", "float32": return .float32
+    default: return .bfloat16
+    }
+}
+
+func loadBase(_ path: String, dtype: DType = .bfloat16) throws -> (X070Backbone, quantised: Bool) {
     let p = expand(path)
     if p.hasSuffix(".rwkvq") { return (try X070Backbone.load(fromRwkvq: p), true) }
     let weights = try loadArrays(url: URL(fileURLWithPath: p))
@@ -139,7 +152,7 @@ func loadBase(_ path: String) throws -> (X070Backbone, quantised: Bool) {
     let cfg = X070Config(nLayer: nLayer, nEmbd: weights["ln_out.weight"]!.shape[0],
                          headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
                          vocab: weights["head.weight"]!.shape[0])
-    return (X070Backbone(weights: weights, cfg: cfg), false)
+    return (X070Backbone(weights: weights, cfg: cfg, computeDType: dtype), false)
 }
 
 let args = parse()
@@ -181,7 +194,7 @@ final class FootprintWatch: @unchecked Sendable {
 }
 let watch = FootprintWatch(guardGB: args.guardGB)
 var t = Date()
-let (base, quantised) = try loadBase(args.model)
+let (base, quantised) = try loadBase(args.model, dtype: denseDType(args.dtype))
 print(String(format: "база: %@, L=%d D=%d; загрузка %.1f с; MLX активная %.2f ГБ, footprint +%.2f ГБ",
              quantised ? ".rwkvq" : "плотная", base.cfg.nLayer, base.cfg.nEmbd,
              Date().timeIntervalSince(t), Double(GPU.activeMemory) / 1e9, footprintGB() - f0))
@@ -449,6 +462,7 @@ if case .state = mode, let state = base.initialState {
 }
 if let path = args.headOut { try model.saveHead(to: URL(fileURLWithPath: expand(path))) }
 report["seed"] = Int(args.seed); report["per_row"] = perRow
+report["dtype"] = quantised ? "rwkvq" : args.dtype
 if let out = args.out {
     try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
         .write(to: URL(fileURLWithPath: expand(out)))
