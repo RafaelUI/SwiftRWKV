@@ -345,6 +345,34 @@ fast as no ceiling within noise and stays under 2.3 GB; without a ceiling a
 0.4B evaluation goes past a 3 GB budget. The default is left at the training
 ceiling because memory is the constraint this library is tuned for.
 
+### A trained state in place of the instruction
+
+The query side of a task carries an instruction line (`Instruct: …\nQuery: …`).
+An initial state (`BaseTrainingMode.state`, see `docs/Train.md`) can stand in for
+it: train the embedder as usual, then remove the line from the queries, freeze
+the base and the head, and train only the state on the same rows; attach the
+state (`backbone.initialState`) when embedding queries. `embed-run --then-state N`
+runs exactly this after the first stage (`--then-head` is the control: the same
+steps train the head instead).
+
+0.1B, top 4 layers, retrieval, three seeds, MRR over 300 queries, paired
+bootstrap:
+
+| base | with instruction | without | without + state | without + head (control) | state − with instruction |
+|---|---|---|---|---|---|
+| dense | 0.759 | 0.752 | 0.758 | 0.754 | −0.001 [−0.012; +0.010] |
+| REDUCTION | 0.757 | 0.748 | 0.756 | 0.750 | −0.000 [−0.012; +0.011] |
+
+The state restores the quality with the instruction and saves 17.8 tokens per
+query. On this data the instruction is the same for every query, so dropping it
+costs little in the first place (−0.007…−0.009), and the state's edge over the
+control (+0.004…+0.007) is at the edge of significance. State lr 1e-4; 1e-3
+made things worse (0.704 against 0.745 without the instruction). In this
+measurement the state is attached to the model, so it applies to every text —
+documents included, which never had the instruction. Attaching it to queries
+only, the way the instruction was used, needs the attached state switched per
+text and was not measured.
+
 ### Training top layers over a quantized base
 
 Adapters on a 0.1B or 0.4B model carry too few parameters to be worth it; the
