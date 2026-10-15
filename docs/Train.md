@@ -540,9 +540,6 @@ legitimate training input.
 - **The backbone is fingerprinted only in state files** (`StateFile`). Adapter
   and head checkpoints still are not: a head trained on one backbone and loaded
   onto another differs in neither shape nor contract.
-- **Reservoir sampling is missing from `EmbeddingDataset.loadJSONL`**, so a
-  slice of a large corpus is its beginning rather than a sample.
-  `RerankDataset` does this correctly and the code transfers by copying.
 - **No tokeniser for non-World vocabularies**, which limits pretraining on a
   custom vocabulary: Swift has no equivalent of HuggingFace `tokenizers`.
 ## Fixed defects worth knowing

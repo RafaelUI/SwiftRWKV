@@ -146,6 +146,19 @@ Rows with broken UTF-8 or an unknown task are skipped silently: in a corpus of
 this size isolated garbage is normal, and aborting a load because of it is
 worse than skipping it.
 
+`limit` alone takes the first `limit` matching rows and stops reading there. With
+`sampleSeed:` it takes a uniform sample of the whole file instead (reservoir
+sampling, reproducible per seed; the task filter applies first) — a slice of a
+large corpus is then a sample rather than its beginning, at the price of
+reading the whole file. `embed-run --limit N --sample-seed S` does the same.
+
+```swift
+let sample = try EmbeddingDataset.loadJSONL(path: "~/data/litretrieval.jsonl",
+                                            limit: 2000, tasks: [.retrieval],
+                                            sampleSeed: 1)
+print(sample.count)
+```
+
 For classification the candidate labels are parsed out of the anchor. Note
 that the README of LitRetrieval claims 7 emotions while the data holds a
 closed pool of **25**, with 7 per row — the data is the source of truth, and

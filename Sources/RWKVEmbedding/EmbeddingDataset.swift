@@ -54,8 +54,17 @@ public enum EmbeddingDataset {
     /// Строки с битым UTF-8 и незнакомым `task` пропускаются молча: в корпусе
     /// такого размера одиночный мусор — норма, и падать из-за него посреди
     /// загрузки хуже, чем пропустить.
+    ///
+    /// `sampleSeed` — как набирать `limit` строк. nil (умолчание, прежнее
+    /// поведение): первые `limit` подходящих строк, файл дочитывается только до
+    /// них. Значение: равномерная выборка по ВСЕМУ файлу (резервуар, Algorithm
+    /// R), воспроизводимая по сиду, — срез большого корпуса тогда выборка, а не
+    /// его начало; цена — файл читается целиком. Фильтр `tasks` действует до
+    /// выборки. Порядок строк в выборке — порядок резервуара, не файла. Тот же
+    /// алгоритм, что в `RerankDataset.loadJSONL`.
     public static func loadJSONL(path: String, limit: Int? = nil,
-                                 tasks: Set<EmbeddingTask>? = nil) throws -> [EmbeddingSample] {
+                                 tasks: Set<EmbeddingTask>? = nil,
+                                 sampleSeed: UInt64? = nil) throws -> [EmbeddingSample] {
         let expanded = (path as NSString).expandingTildeInPath
         guard FileManager.default.fileExists(atPath: expanded) else {
             throw EmbeddingDataError.fileNotFound(expanded)
@@ -70,15 +79,30 @@ public enum EmbeddingDataset {
         var buffer = Data()
         let chunkSize = 1 << 20
         var raw = [UInt8](repeating: 0, count: chunkSize)
+        // резервуар: выборка по всему файлу (только при limit и sampleSeed)
+        let reservoir = limit != nil && sampleSeed != nil
+        var rng = SplitMix64(state: sampleSeed ?? 0)
+        var seen = 0
+
+        func offer(_ s: EmbeddingSample) {
+            guard reservoir, let l = limit else { out.append(s); return }
+            seen += 1
+            if out.count < l {
+                out.append(s)
+            } else {
+                let j = rng.below(seen)
+                if j < l { out[j] = s }
+            }
+        }
 
         func drain(_ finalize: Bool) {
             while let nl = buffer.firstIndex(of: 0x0A) {
                 let line = buffer[buffer.startIndex ..< nl]
                 buffer.removeSubrange(buffer.startIndex ... nl)
-                if let s = parse(line) { out.append(s) }
-                if let l = limit, out.count >= l { return }
+                if let s = parse(line) { offer(s) }
+                if !reservoir, let l = limit, out.count >= l { return }
             }
-            if finalize, !buffer.isEmpty, let s = parse(buffer) { out.append(s) }
+            if finalize, !buffer.isEmpty, let s = parse(buffer) { offer(s) }
         }
 
         func parse(_ data: Data) -> EmbeddingSample? {
@@ -98,7 +122,7 @@ public enum EmbeddingDataset {
             if n <= 0 { break }
             buffer.append(contentsOf: raw[0 ..< n])
             drain(false)
-            if let l = limit, out.count >= l { break }
+            if !reservoir, let l = limit, out.count >= l { break }
         }
         drain(true)
         if let l = limit, out.count > l { out = Array(out.prefix(l)) }
@@ -250,6 +274,17 @@ struct SplitMix64 {
         z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
         z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
         return z ^ (z >> 31)
+    }
+
+    /// Равномерное целое в `0 ..< n` — отбрасыванием смещённого хвоста, а не
+    /// остатком (`next() % n` перекошен к малым значениям).
+    mutating func below(_ n: Int) -> Int {
+        precondition(n > 0)
+        let bound = UInt64(n)
+        let limit = UInt64.max - (UInt64.max % bound) - 1
+        var r = next()
+        while r > limit { r = next() }
+        return Int(r % bound)
     }
 }
 

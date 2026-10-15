@@ -735,4 +735,63 @@ final class EmbeddingFinetuneTests: XCTestCase {
         let tok = WorldTokenizer(vocabURL: URL(fileURLWithPath: p))
         return try XCTUnwrap(tok, "словарь World не прочитался: \(p)")
     }
+
+    // ── Выборка строк из JSONL ───────────────────────────────────────
+
+    func jsonl(_ n: Int, tasks: [String] = ["retrieval"]) throws -> String {
+        let lines = (0 ..< n).map { i -> String in
+            let t = tasks[i % tasks.count]
+            return #"{"anchor":"a\#(i)","positive":"p\#(i)","negative":"n\#(i)","task":"\#(t)"}"#
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("emb_sample_\(UUID().uuidString).jsonl")
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url.path
+    }
+
+    /// Без сида — прежнее поведение: первые `limit` строк по порядку.
+    func testLimitWithoutSeedIsFirstRows() throws {
+        let path = try jsonl(100)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let rows = try EmbeddingDataset.loadJSONL(path: path, limit: 10)
+        XCTAssertEqual(rows.map(\.anchor), (0 ..< 10).map { "a\($0)" })
+        XCTAssertEqual(try EmbeddingDataset.loadJSONL(path: path).count, 100)
+        // сид без limit ничего не меняет: всё, по порядку
+        XCTAssertEqual(try EmbeddingDataset.loadJSONL(path: path, sampleSeed: 3).map(\.anchor),
+                       (0 ..< 100).map { "a\($0)" })
+    }
+
+    /// С сидом — выборка по всему файлу: воспроизводима, зависит от сида, не
+    /// совпадает с началом, достаёт до конца файла, без повторов.
+    func testLimitWithSeedSamplesTheWholeFile() throws {
+        let path = try jsonl(500)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let a = try EmbeddingDataset.loadJSONL(path: path, limit: 50, sampleSeed: 1)
+        let b = try EmbeddingDataset.loadJSONL(path: path, limit: 50, sampleSeed: 1)
+        let c = try EmbeddingDataset.loadJSONL(path: path, limit: 50, sampleSeed: 2)
+        XCTAssertEqual(a.count, 50)
+        XCTAssertEqual(a.map(\.anchor), b.map(\.anchor), "один сид дал разные выборки")
+        XCTAssertNotEqual(a.map(\.anchor), c.map(\.anchor), "разные сиды дали одну выборку")
+        XCTAssertEqual(Set(a.map(\.anchor)).count, 50, "повторы в выборке")
+        XCTAssertNotEqual(Set(a.map(\.anchor)), Set((0 ..< 50).map { "a\($0)" }), "выборка -- это начало файла")
+        let idx = a.compactMap { Int($0.anchor.dropFirst()) }
+        XCTAssertGreaterThan(idx.max() ?? 0, 400, "в выборку не попало ничего из конца файла")
+        // равномерность: доля из второй половины файла около половины
+        let late = idx.filter { $0 >= 250 }.count
+        XCTAssertTrue((12 ... 38).contains(late), "из второй половины \(late) из 50")
+        // limit больше файла -- весь файл
+        XCTAssertEqual(try EmbeddingDataset.loadJSONL(path: path, limit: 900, sampleSeed: 1).count, 500)
+    }
+
+    /// Фильтр задач действует ДО выборки: в выборке только нужная задача, и её
+    /// столько, сколько просили.
+    func testTaskFilterAppliesBeforeSampling() throws {
+        let path = try jsonl(300, tasks: ["retrieval", "sts", "classification"])
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let rows = try EmbeddingDataset.loadJSONL(path: path, limit: 30, tasks: [.sts], sampleSeed: 7)
+        XCTAssertEqual(rows.count, 30)
+        XCTAssertTrue(rows.allSatisfy { $0.task == .sts })
+        XCTAssertGreaterThan(rows.compactMap { Int($0.anchor.dropFirst()) }.max() ?? 0, 200)
+    }
+
 }

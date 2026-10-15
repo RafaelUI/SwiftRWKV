@@ -53,6 +53,7 @@ struct Args {
     var thenHead = false
     var out: String? = nil
     var limit: Int? = nil          // читать не больше стольких строк JSONL (иначе файл целиком в память)
+    var sampleSeed: UInt64? = nil  // с --limit: равномерная выборка по всему файлу (резервуар), а не первые строки
     var logEvery = 50              // печать шага; 1 — время каждого шага (замеры)
     var guardGB = 0.0              // > 0: footprint выше порога — выход (замер под свопом негоден)
     var probe = false              // память по фазам шага (SequentialBody.probe)
@@ -108,6 +109,7 @@ func parse() -> Args {
         case "--then-state": a.thenState = Int(v()) ?? 0
         case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
         case "--then-head": a.thenHead = true
+        case "--sample-seed": a.sampleSeed = UInt64(v())
         case "--dtype": a.dtype = v()                          // плотная база: bf16 | fp16 | fp32        // контроль: на второй стадии вместо состояния — голова
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!)
@@ -199,7 +201,8 @@ print(String(format: "база: %@, L=%d D=%d; загрузка %.1f с; MLX а�
              quantised ? ".rwkvq" : "плотная", base.cfg.nLayer, base.cfg.nEmbd,
              Date().timeIntervalSince(t), Double(GPU.activeMemory) / 1e9, footprintGB() - f0))
 
-let rows = try EmbeddingDataset.loadJSONL(path: expand(args.data), limit: args.limit, tasks: [task])
+let rows = try EmbeddingDataset.loadJSONL(path: expand(args.data), limit: args.limit, tasks: [task],
+                                          sampleSeed: args.sampleSeed)
 guard rows.count >= args.eval + 16 else { print("строк задачи \(task) всего \(rows.count)"); exit(2) }
 // отложенные строки — с конца, обучающие — с начала: не пересекаются
 let heldOut = Array(rows.suffix(args.eval))
