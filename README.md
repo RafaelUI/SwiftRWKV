@@ -178,7 +178,7 @@ is missing and what was tried and rejected is in
 
 Experimental, but validated end to end on real models rather than on toys —
 RWKV-7 World 0.1B, g1d 0.1B / 0.4B dense and as `.rwkvq`, and 1.5B / 2.9B for
-inference. 564 tests, plus mutation suites that deliberately break the code and
+inference. 566 tests, plus mutation suites that deliberately break the code and
 require the tests to notice — the interesting failures in this problem are
 silent, so "the tests pass" is not by itself evidence.
 
