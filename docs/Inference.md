@@ -902,10 +902,10 @@ moved.
   `export_mlx` export — every tensor, not only the quantised projections —
   works the same through `load(fromSidecar:)`. A sidecar exported before the
   full export landed (August 2026) holds only the sb6 projections: it can only
-  be attached to an already-loaded dense backbone (`attachRwkvq`), and
-  `load(fromSidecar:)` refuses it — with `RwkvqError.missingBuffer(…,
-  "manifest")` for the first dense tensor it lacks, which does not say in so
-  many words that the export is partial. Re-export, or load the `.rwkvq`
+  be attached to an already-loaded dense backbone (`attachRwkvq`).
+  `load(fromSidecar:)` (and `load(fromRwkvq:)` given a sidecar path) refuses it
+  with `RwkvqError.partialExport`, whose message says what is missing and what
+  to do instead: re-export with a full `export_mlx`, or load the `.rwkvq`
   directly.
 - **The backbone is not recorded in any checkpoint.** A reranker or embedding
   head loaded onto the wrong backbone differs in neither shape nor contract.

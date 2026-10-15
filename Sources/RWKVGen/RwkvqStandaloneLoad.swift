@@ -165,6 +165,13 @@ extension X070Backbone {
                             computeDType: DType = .float16,
                             baseDType: DType? = .float16,
                             useNativeKernel: Bool = false) throws -> X070Backbone {
+        // Полный экспорт несёт плотные параметры (нормы, миксы token-shift —
+        // раскладка dense); неполный — одни сжатые проекции. Без этой проверки
+        // неполный отказывал на первом же недостающем тензоре с
+        // missingBuffer(…, "manifest"), не называя причины.
+        guard sidecar.tensors.values.contains(where: { $0.kind == .dense }) else {
+            throw RwkvqError.partialExport(tensors: sidecar.tensors.count)
+        }
         try checkRwkvqTargets(sidecar.tensors, rwkvqTargetWorldKeys(nLayer: sidecar.nLayer))
 
         var weights = try sidecar.buildDenseWeights(computeDType: computeDType)

@@ -373,6 +373,44 @@ final class RwkvqModelTests: XCTestCase {
         }
     }
 
+    /// Сайдкар неполного экспорта (одни sb6-проекции, без версии формата):
+    /// собрать из него модель — отказ с ПРИЧИНОЙ и подсказкой, а не
+    /// missingBuffer на первом недостающем тензоре; тем же путём идёт
+    /// load(fromRwkvq:) с путём к сайдкару. Подключить его к плотной модели —
+    /// можно (это проверяет RwkvqBaseTests на той же фикстуре).
+    func testPartialSidecarIsRefusedWithTheReason() throws {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Develop/SwiftRWKV/.testdata/0.1B_reduction.rwkvq_mlx").path
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: path + ".safetensors"), "нет фикстуры \(path)")
+        let partial = try RwkvqSidecar(path: path)
+        XCTAssertFalse(partial.tensors.values.contains { $0.kind == .dense }, "фикстура должна быть неполной")
+        // путь к сайдкару без суффикса — load(fromRwkvq:) уводит его в load(fromSidecar:)
+        for attempt in [{ try X070Backbone.load(fromSidecar: partial) },
+                        { try X070Backbone.load(fromRwkvq: path) }] as [() throws -> X070Backbone] {
+            XCTAssertThrowsError(try attempt()) { error in
+                guard case RwkvqError.partialExport(let n) = error else {
+                    return XCTFail("ожидался partialExport, пришло: \(error)")
+                }
+                XCTAssertEqual(n, partial.tensors.count)
+                let text = "\(error)"
+                for hint in ["неполный экспорт", "load(fromRwkvq:)", "attachRwkvq", "export_mlx"] {
+                    XCTAssertTrue(text.contains(hint), "в тексте нет «\(hint)»: \(text)")
+                }
+            }
+        }
+    }
+
+    /// Полный экспорт проверку проходит: модель собирается.
+    func testFullSidecarStillLoads() throws {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Develop/SwiftRWKV/.testdata/rwkvq2_compression.rwkvq_mlx").path
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: path + ".safetensors"), "нет фикстуры \(path)")
+        let full = try RwkvqSidecar(path: path)
+        XCTAssertTrue(full.tensors.values.contains { $0.kind == .dense })
+        let bb = try X070Backbone.load(fromSidecar: full)
+        XCTAssertEqual(bb.cfg.nLayer, full.nLayer)
+    }
+
     // ── Перекладка в родной контейнер полосами ───────────────────────
 
     /// Перекладка sb6 в контейнер MLX идёт полосами строк (иначе пик

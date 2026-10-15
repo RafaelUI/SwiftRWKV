@@ -28,6 +28,10 @@ public enum RwkvqError: Error, CustomStringConvertible {
     case missingBuffer(tensor: String, buffer: String)
     case shapeMismatch(tensor: String, expected: [Int], got: [Int])
     case unsupportedKind(tensor: String, kind: String)
+    /// Сайдкар неполного экспорта: одни сжатые проекции, без плотных
+    /// параметров (так писал `export_mlx` до августа 2026). Подключить к уже
+    /// загруженной плотной модели его можно, собрать из него модель — нет.
+    case partialExport(tensors: Int)
 
     public var description: String {
         switch self {
@@ -41,6 +45,12 @@ public enum RwkvqError: Error, CustomStringConvertible {
             return "\(t): ожидалась форма \(e), в сайдкаре \(g)"
         case .unsupportedKind(let t, let k):
             return "\(t): \(k)"
+        case .partialExport(let n):
+            return "сайдкар — неполный экспорт: в нём \(n) тензоров, и все — сжатые проекции, без норм и "
+                + "прочих плотных параметров (так писал export_mlx до августа 2026). Собрать из него модель "
+                + "нельзя: переэкспортируйте полным export_mlx либо откройте .rwkvq напрямую — "
+                + "X070Backbone.load(fromRwkvq:). К уже загруженной плотной модели его можно подключить "
+                + "attachRwkvq."
         }
     }
 }
