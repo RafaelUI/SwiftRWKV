@@ -52,7 +52,7 @@ public struct RerankTrainConfig: Sendable {
     }
 }
 
-public struct RerankEpochReport: Sendable {
+public struct RerankEpochReport: Sendable, Equatable, Codable {
     public var epoch: Int
     public var loss: Float
     public var metrics: RankingMetrics?
@@ -76,6 +76,36 @@ public struct RerankTrainResult: Sendable {
     /// самом частом случае. Голова и условия её обучения обязаны ехать в
     /// одном файле.
     public var contract: [String: String]
+    /// false — обучение отменено (`isCancelled`) после эпохи `epochs.count`;
+    /// с тем же `checkpoint` оно продолжится с этого места.
+    public var completed: Bool = true
+}
+
+public enum RerankResumeError: Error, CustomStringConvertible {
+    case otherRun(String)
+    case corrupt(String)
+
+    public var description: String {
+        switch self {
+        case .otherRun(let p):
+            return "\(p): чекпоинт другого обучения (конфигурация, кэш, контракт или голова не те); "
+                + "продолжать его этим значило бы смешать два обучения"
+        case .corrupt(let s): return "чекпоинт обучения реранкера повреждён: \(s)"
+        }
+    }
+}
+
+/// То, что кроме тензоров нужно продолжению: отчёты эпох, лучшая эпоха,
+/// стартовые числа. В метаданных файла чекпоинта (`state`), JSON.
+struct RerankResumeState: Codable {
+    var key: String
+    var reports: [RerankEpochReport]
+    var stepsDone: Int
+    var bestScore: Double?
+    var bestEpoch: Int
+    var before: RankingMetrics?
+    var firstLoss: Float
+    var lastLoss: Float
 }
 
 public enum RerankTraining {
@@ -143,6 +173,8 @@ public enum RerankTraining {
         _ model: Reranker, trainCache: StateCache, evalCache: StateCache? = nil,
         config: RerankTrainConfig = RerankTrainConfig(),
         contract: [String: String]? = nil,
+        checkpoint: URL? = nil,
+        isCancelled: (() -> Bool)? = nil,
         onEpoch: ((RerankEpochReport) -> Void)? = nil,
         onStep: ((TrainingStep) -> Void)? = nil
     ) throws -> RerankTrainResult {
@@ -215,21 +247,51 @@ public enum RerankTraining {
         let trainer = Trainer<[Int]>(trainable: trainable, objective: objective,
                                      nextBatch: nextBatch, config: tcfg)
 
-        var before: RankingMetrics? = nil
-        if let evalCache {
-            before = try RerankMetrics.evaluate(head, cache: evalCache,
-                                                slots: evalSlots)
+        // ── Возобновление ──
+        //
+        // Чекпоинт — ОДИН файл после каждой эпохи: тензоры тренера (параметры,
+        // моменты Adam, шаг), лучшие параметры и в метаданных — отчёты эпох и
+        // стартовые числа. Один файл, а не несколько: обрыв между записями
+        // нескольких оставил бы их от разных эпох. Пишется во временный и
+        // подменяется. Порядок данных не хранится: он целиком задан сидом, и
+        // продолжение прокручивает ровно столько батчей, сколько шагов
+        // сделано, — поэтому числа побитно те же, что без обрыва.
+        let resumeKey = Self.resumeKey(config: config, head: head, trainCache: trainCache,
+                                       evalCache: evalCache, contract: want,
+                                       trainSlots: trainSlots)
+        var saved: RerankResumeState? = nil
+        var savedArrays: [String: MLXArray] = [:]
+        if let checkpoint, FileManager.default.fileExists(atPath: checkpoint.path) {
+            let (arrays, md) = try loadArraysAndMetadata(url: checkpoint)
+            guard let raw = md["state"]?.data(using: .utf8),
+                  let st = try? JSONDecoder().decode(RerankResumeState.self, from: raw) else {
+                throw RerankResumeError.corrupt("\(checkpoint.lastPathComponent): нет состояния")
+            }
+            guard st.key == resumeKey else { throw RerankResumeError.otherRun(checkpoint.path) }
+            saved = st
+            savedArrays = arrays
         }
 
-        // Стартовый лосс — на ПЕРВОМ батче, до единого шага. У zero-init
-        // головы он обязан быть ровно ln(C); если нет, дело в данных или в
-        // проводке, и дальше идти незачем.
-        let firstLoss: Float = {
-            let probe = Array(order.prefix(Swift.min(config.batchSize, n)))
-            let l = objective(probe)
-            eval(l)
-            return l.item(Float.self)
-        }()
+        var before: RankingMetrics? = nil
+        var firstLoss: Float = .nan
+        if let saved {
+            before = saved.before
+            firstLoss = saved.firstLoss
+        } else {
+            if let evalCache {
+                before = try RerankMetrics.evaluate(head, cache: evalCache,
+                                                    slots: evalSlots)
+            }
+            // Стартовый лосс — на ПЕРВОМ батче, до единого шага. У zero-init
+            // головы он обязан быть ровно ln(C); если нет, дело в данных или в
+            // проводке, и дальше идти незачем.
+            firstLoss = {
+                let probe = Array(order.prefix(Swift.min(config.batchSize, n)))
+                let l = objective(probe)
+                eval(l)
+                return l.item(Float.self)
+            }()
+        }
 
         var reports: [RerankEpochReport] = []
         var bestScore = -Double.infinity
@@ -237,8 +299,30 @@ public enum RerankTraining {
         var bestEpoch = 0
         var stepsDone = 0
         var lastLoss: Float = .nan
+        if let saved {
+            try trainer.restore(fromCheckpoint: savedArrays)
+            guard trainer.completedSteps == saved.stepsDone else {
+                throw RerankResumeError.corrupt("шагов в тензорах \(trainer.completedSteps), в состоянии \(saved.stepsDone)")
+            }
+            // Порядок данных — прокруткой: тот же сид, те же батчи.
+            for _ in 0 ..< saved.stepsDone { _ = nextBatch() }
+            stepsDone = saved.stepsDone
+            reports = saved.reports
+            bestEpoch = saved.bestEpoch
+            bestScore = saved.bestScore ?? -Double.infinity
+            lastLoss = saved.lastLoss
+            if saved.bestScore != nil {
+                bestParams = try head.parameterNames.map { name -> MLXArray in
+                    guard let p = savedArrays["best/" + name] else {
+                        throw RerankResumeError.corrupt("нет best/\(name)")
+                    }
+                    return p
+                }
+            }
+        }
+        var cancelled = false
 
-        for epoch in 1 ... config.epochs {
+        for epoch in stride(from: reports.count + 1, through: config.epochs, by: 1) {
             let epochEnd = Swift.min(epoch * stepsPerEpoch, totalSteps)
             let r = trainer.run(isCancelled: { stepsDone >= epochEnd },
                                 onStep: { s in
@@ -266,7 +350,29 @@ public enum RerankTraining {
             let report = RerankEpochReport(epoch: epoch, loss: lastLoss,
                                            metrics: metrics)
             reports.append(report)
+            if let checkpoint {
+                let st = RerankResumeState(key: resumeKey, reports: reports, stepsDone: stepsDone,
+                                           bestScore: bestParams == nil ? nil : bestScore,
+                                           bestEpoch: bestEpoch, before: before,
+                                           firstLoss: firstLoss, lastLoss: lastLoss)
+                var arrays = trainer.checkpointArrays()
+                if let bestParams {
+                    for (name, p) in zip(head.parameterNames, bestParams) {
+                        arrays["best/" + name] = p
+                    }
+                }
+                try Self.writeAtomically(arrays, state: st, to: checkpoint)
+            }
             onEpoch?(report)
+            if epoch < config.epochs, isCancelled?() == true { cancelled = true; break }
+        }
+
+        if cancelled {
+            return RerankTrainResult(
+                before: before, after: nil, epochs: reports,
+                bestEpoch: bestEpoch, steps: stepsDone,
+                firstLoss: firstLoss, expectedFirstLoss: log(Float(C)),
+                contract: want, completed: false)
         }
 
         if config.keepBest, let best = bestParams {
@@ -285,5 +391,36 @@ public enum RerankTraining {
             bestEpoch: bestEpoch, steps: stepsDone,
             firstLoss: firstLoss, expectedFirstLoss: log(Float(C)),
             contract: want)
+    }
+
+    /// Ключ обучения для чекпоинта: всё, от чего зависят числа, — числа
+    /// конфигурации (без частоты логов), формы кэшей и их контракт, срез
+    /// слоёв, состав и формы параметров головы.
+    static func resumeKey(config c: RerankTrainConfig, head: RerankerHead, trainCache: StateCache,
+                          evalCache: StateCache?, contract: [String: String], trainSlots: [Int]) -> String {
+        var parts = ["rerank-resume-v1", "\(c.lr)", "\(c.weightDecay)", "\(c.gradClip)", "\(c.batchSize)",
+                     "\(c.epochs)", "\(c.warmupFrac)", c.schedule.rawValue, "\(c.loss)", "\(c.temperature)",
+                     "\(c.keepBest)", "\(c.seed)",
+                     "train \(trainCache.nSamples)x\(trainCache.nCandidates) \(trainCache.shape)",
+                     "eval \(evalCache.map { "\($0.nSamples)x\($0.nCandidates) \($0.shape)" } ?? "none")",
+                     "slots \(trainSlots)"]
+        parts += contract.keys.sorted().map { "\($0)=\(contract[$0]!)" }
+        for (name, p) in zip(head.parameterNames, head.parameters) {
+            parts.append("\(name) \(p.shape) \(p.dtype)")
+        }
+        return parts.joined(separator: "|")
+    }
+
+    static func writeAtomically(_ arrays: [String: MLXArray], state: RerankResumeState, to url: URL) throws {
+        let json = String(data: try JSONEncoder().encode(state), encoding: .utf8) ?? ""
+        let tmp = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp.safetensors")
+        eval(Array(arrays.values))
+        try MLX.save(arrays: arrays, metadata: ["state": json], url: tmp)
+        if FileManager.default.fileExists(atPath: url.path) {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        } else {
+            try FileManager.default.moveItem(at: tmp, to: url)
+        }
     }
 }

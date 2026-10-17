@@ -193,6 +193,14 @@ public final class Trainer<Batch> {
     /// Сохранить параметры, моменты Adam и счётчики. Без моментов возобновление
     /// даёт всплеск лосса на первых шагах: Adam стартует с нулевой истории.
     public func saveCheckpoint(to url: URL) throws {
+        let d = checkpointArrays()
+        try MLX.save(arrays: d, url: url)
+    }
+
+    /// Тензоры чекпоинта (`param/`, `m/`, `v/`, `_meta/step`) — то же, что
+    /// пишет `saveCheckpoint`, для тех, кто кладёт рядом свои тензоры и
+    /// метаданные в один файл (`RerankTraining.train(checkpoint:)`).
+    public func checkpointArrays() -> [String: MLXArray] {
         var d: [String: MLXArray] = [:]
         let names = trainable.parameterNames
         for (i, p) in params.enumerated() {
@@ -203,13 +211,18 @@ public final class Trainer<Batch> {
         }
         d["_meta/step"] = MLXArray([Int32(startStep), Int32(t)])
         eval(Array(d.values))
-        try MLX.save(arrays: d, url: url)
+        return d
     }
 
     /// Восстановить параметры, моменты и счётчики. Порядок берётся из
     /// parameterNames — тот же, что при сохранении.
     public func loadCheckpoint(from url: URL) throws {
-        let d = try loadArrays(url: url)
+        try restore(fromCheckpoint: try loadArrays(url: url))
+    }
+
+    /// Восстановить из тензоров чекпоинта (`checkpointArrays`); лишние ключи
+    /// не мешают.
+    public func restore(fromCheckpoint d: [String: MLXArray]) throws {
         let names = trainable.parameterNames
         var ps: [MLXArray] = [], ms: [MLXArray] = [], vs: [MLXArray] = []
         for (i, name) in names.enumerated() {

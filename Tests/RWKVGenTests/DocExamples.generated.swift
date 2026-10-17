@@ -1081,6 +1081,33 @@ func doc_reranker_4() throws {
         return X070Backbone(weights: weights, cfg: cfg)
     }
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    let model = try Reranker(base: base, cfg: RerankerConfig(layerIdx: [5]))
+    let trainCache = try StateCache.load(URL(fileURLWithPath: "runs/cache_train"))
+    let evalCache = try StateCache.load(URL(fileURLWithPath: "runs/cache_eval"))
+    let result = try RerankTraining.train(
+        model, trainCache: trainCache, evalCache: evalCache,
+        config: RerankTrainConfig(epochs: 8),
+        checkpoint: URL(fileURLWithPath: "runs/rerank.ckpt.safetensors"))
+    print(result.completed, result.epochs.count)
+}
+
+func doc_reranker_5() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        // Geometry is derived from weight shapes. There is simply no
+        // configuration here that could be specified incorrectly.
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
     let cache = try StateCache.load(URL(fileURLWithPath: "runs/cache_eval"))
 
     // From a checkpoint: the contract is read FROM THE FILE and checked
@@ -1091,7 +1118,7 @@ func doc_reranker_4() throws {
     print(contract["max_doc_tokens"] ?? "?", metrics.summary)
 }
 
-func doc_reranker_5() throws {
+func doc_reranker_6() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -1132,7 +1159,7 @@ func doc_reranker_5() throws {
     print(sweep.summary)
 }
 
-func doc_reranker_6() throws {
+func doc_reranker_7() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -1155,7 +1182,7 @@ func doc_reranker_6() throws {
     print(both.sources ?? [])   // [5, 11]
 }
 
-func doc_reranker_7() throws {
+func doc_reranker_8() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -1195,7 +1222,7 @@ func doc_reranker_7() throws {
     }
 }
 
-func doc_reranker_8() throws {
+func doc_reranker_9() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)

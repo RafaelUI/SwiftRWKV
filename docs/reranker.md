@@ -284,6 +284,35 @@ try model.saveHead(to: URL(fileURLWithPath: "runs/head.safetensors"),
 print(result.after?.summary ?? "no evaluation was run")
 ```
 
+### Resuming
+
+`RerankTraining.train(checkpoint:)` writes one file after every epoch: the
+trainer's parameters, Adam moments and step counter, the best epoch's weights,
+and — in its metadata — the epoch reports and the starting numbers. One file,
+written to a temporary name and swapped in, so a crash cannot leave pieces from
+different epochs. Calling `train` again with the same checkpoint continues
+after the last completed epoch; a finished checkpoint returns its result
+without a step. The data order is not stored: it is fixed by the seed, and the
+continuation replays exactly as many batches as were already taken — so a run
+interrupted and resumed with a fresh model gives **bit-identical** weights,
+epoch reports and metrics to one that was never interrupted (a test holds
+this, with and without `keepBest`). A checkpoint of a different training — other
+configuration numbers, caches, contract, layer slice or head — is refused.
+`isCancelled` is checked after each epoch's checkpoint; a cancelled run
+returns `completed == false`.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+let model = try Reranker(base: base, cfg: RerankerConfig(layerIdx: [5]))
+let trainCache = try StateCache.load(URL(fileURLWithPath: "runs/cache_train"))
+let evalCache = try StateCache.load(URL(fileURLWithPath: "runs/cache_eval"))
+let result = try RerankTraining.train(
+    model, trainCache: trainCache, evalCache: evalCache,
+    config: RerankTrainConfig(epochs: 8),
+    checkpoint: URL(fileURLWithPath: "runs/rerank.ckpt.safetensors"))
+print(result.completed, result.epochs.count)
+```
+
 ### Evaluating without training
 
 Comparing two saved heads, re-scoring an old one on a new held-out set,
@@ -577,11 +606,6 @@ way.
 
 ## Not done
 
-- **Resuming training.** `Trainer` supports checkpoints with Adam moments;
-  `RerankTraining` does not expose them. Deliberately deferred: training takes
-  seconds, the mechanism is needed for a corpus that does not exist yet, and
-  building it now would mean building for an imagined load. It becomes
-  necessary once a cache stops fitting into a single session.
 - **The backbone is not recorded in the cache contract.** Caches from
   **different** models are indistinguishable by shape and by contract;
   merging catches this numerically via overlapping layers, but training on a

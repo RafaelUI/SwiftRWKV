@@ -231,4 +231,133 @@ final class RerankTrainingTests: XCTestCase {
         XCTAssertEqual(r.steps, 4 * (50 / 10))
         XCTAssertEqual(r.epochs.count, 4)
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  Возобновление (`checkpoint:`, `isCancelled:`)
+    //
+    //  Эталон — обучение без обрыва: возобновлённое обязано дать ПОБИТНО те
+    //  же веса, отчёты эпох, лучшую эпоху и метрики. Модель продолжения —
+    //  новая (как после настоящего обрыва процесса).
+    // ─────────────────────────────────────────────────────────────────
+
+    func resumeCaches(_ model: Reranker) throws -> (StateCache, StateCache) {
+        (try makeLearnableCache(nSamples: 64, nCand: 4, nHead: model.base.cfg.nHead),
+         try makeLearnableCache(nSamples: 32, nCand: 4, nHead: model.base.cfg.nHead, seed: 2))
+    }
+
+    func resumeConfig(keepBest: Bool = true, lr: Float = 1e-3) -> RerankTrainConfig {
+        RerankTrainConfig(lr: lr, batchSize: 8, epochs: 4, keepBest: keepBest, seed: 3, logEvery: 0)
+    }
+
+    func headBits(_ m: Reranker) -> [MLXArray] {
+        let ps = m.head.parameters.map { $0.asType(.float32) }
+        eval(ps)
+        return ps
+    }
+
+    func sameBits(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { x, y in
+            x.shape == y.shape && MLX.abs(x - y).max().item(Float.self) == 0
+        }
+    }
+
+    func tmpCheckpoint() -> URL {
+        URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rerank_resume_\(UUID().uuidString).safetensors")
+    }
+
+    /// Чекпоинт чисел не меняет: то же обучение с ним и без него — побитно.
+    func testCheckpointDoesNotChangeNumbers() throws {
+        let url = tmpCheckpoint()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (a, _) = try makeModel()
+        let (train, ev) = try resumeCaches(a)
+        let ra = try RerankTraining.train(a, trainCache: train, evalCache: ev, config: resumeConfig())
+        let (b, _) = try makeModel()
+        let rb = try RerankTraining.train(b, trainCache: train, evalCache: ev, config: resumeConfig(),
+                                          checkpoint: url)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertTrue(sameBits(headBits(a), headBits(b)))
+        XCTAssertEqual(ra.epochs, rb.epochs)
+        XCTAssertEqual(ra.after, rb.after)
+        XCTAssertTrue(rb.completed)
+    }
+
+    /// Обрыв после эпохи 1 и после эпохи 3, каждый раз продолжение новой
+    /// моделью, — побитно то же, что без обрыва; с лучшей эпохой и без неё.
+    func testResumeAfterCancelIsBitIdentical() throws {
+        for keepBest in [true, false] {
+            let (ref, _) = try makeModel()
+            let (train, ev) = try resumeCaches(ref)
+            let r0 = try RerankTraining.train(ref, trainCache: train, evalCache: ev,
+                                              config: resumeConfig(keepBest: keepBest))
+            let url = tmpCheckpoint()
+            defer { try? FileManager.default.removeItem(at: url) }
+            var seen = 0
+            for stopAt in [1, 3] {
+                let (m, _) = try makeModel()
+                let r = try RerankTraining.train(m, trainCache: train, evalCache: ev,
+                                                 config: resumeConfig(keepBest: keepBest), checkpoint: url,
+                                                 isCancelled: { seen >= stopAt },
+                                                 onEpoch: { _ in seen += 1 })
+                XCTAssertFalse(r.completed)
+                XCTAssertEqual(r.epochs.count, stopAt, "отмена не после эпохи \(stopAt)")
+                XCTAssertNil(r.after)
+                XCTAssertEqual(Array(r0.epochs.prefix(stopAt)), r.epochs)
+            }
+            let (m, _) = try makeModel(seed: 9)        // и голова с другим стартом: веса берутся из чекпоинта
+            var resumedEpochs: [Int] = []
+            let r = try RerankTraining.train(m, trainCache: train, evalCache: ev,
+                                             config: resumeConfig(keepBest: keepBest), checkpoint: url,
+                                             onEpoch: { resumedEpochs.append($0.epoch) })
+            XCTAssertEqual(resumedEpochs, [4], "продолжение прогнало не только недостающую эпоху")
+            XCTAssertTrue(r.completed)
+            XCTAssertTrue(sameBits(headBits(ref), headBits(m)), "keepBest \(keepBest): веса не те")
+            XCTAssertEqual(r.epochs, r0.epochs)
+            XCTAssertEqual(r.after, r0.after)
+            XCTAssertEqual(r.before, r0.before)
+            XCTAssertEqual(r.bestEpoch, r0.bestEpoch)
+            XCTAssertEqual(r.steps, r0.steps)
+            XCTAssertEqual(r.firstLoss, r0.firstLoss)
+        }
+    }
+
+    /// Чекпоинт другого обучения не продолжается.
+    func testResumeOfOtherRunIsRefused() throws {
+        let url = tmpCheckpoint()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (m, _) = try makeModel()
+        let (train, ev) = try resumeCaches(m)
+        _ = try RerankTraining.train(m, trainCache: train, evalCache: ev, config: resumeConfig(),
+                                     checkpoint: url, isCancelled: { true })
+        let (m2, _) = try makeModel()
+        XCTAssertThrowsError(try RerankTraining.train(m2, trainCache: train, evalCache: ev,
+                                                      config: resumeConfig(lr: 2e-3), checkpoint: url))
+        XCTAssertThrowsError(try RerankTraining.train(m2, trainCache: train, evalCache: nil,
+                                                      config: resumeConfig(), checkpoint: url))
+        // Своя конфигурация — продолжается.
+        XCTAssertNoThrow(try RerankTraining.train(m2, trainCache: train, evalCache: ev,
+                                                  config: resumeConfig(), checkpoint: url))
+    }
+
+    /// Законченное обучение с тем же чекпоинтом не делает ни шага и даёт то же.
+    func testFinishedCheckpointReturnsSameResult() throws {
+        let url = tmpCheckpoint()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let (a, _) = try makeModel()
+        let (train, ev) = try resumeCaches(a)
+        let ra = try RerankTraining.train(a, trainCache: train, evalCache: ev, config: resumeConfig(),
+                                          checkpoint: url)
+        let (b, _) = try makeModel(seed: 5)
+        var epochs = 0
+        let rb = try RerankTraining.train(b, trainCache: train, evalCache: ev, config: resumeConfig(),
+                                          checkpoint: url, onEpoch: { _ in epochs += 1 })
+        XCTAssertEqual(epochs, 0)
+        XCTAssertEqual(ra.steps, rb.steps)
+        XCTAssertEqual(ra.bestEpoch, rb.bestEpoch)
+        XCTAssertEqual(ra.before, rb.before)
+        XCTAssertTrue(sameBits(headBits(a), headBits(b)))
+        XCTAssertEqual(ra.epochs, rb.epochs)
+        XCTAssertEqual(ra.after, rb.after)
+    }
 }

@@ -19,7 +19,7 @@ import MLX
 //  Это же число — пол для сравнения: 0.222 при восьми кандидатах.
 // ───────────────────────────────────────────────────────────────────────
 
-public struct RankingMetrics: Sendable, Equatable {
+public struct RankingMetrics: Sendable, Equatable, Codable {
     public var mrr: Double
     public var recallAt1: Double
     public var recallAt3: Double

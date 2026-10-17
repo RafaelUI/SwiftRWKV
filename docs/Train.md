@@ -533,9 +533,6 @@ legitimate training input.
   two-stage "state in place of the instruction" measurement) and writes a
   report; a multi-stage curriculum is library-only and leaves no incremental
   report, so a run killed halfway leaves no trace.
-- **Reranker training does not expose resumption.** `Trainer` supports it;
-  `RerankTraining` does not surface it. Deliberately deferred while training
-  takes seconds.
 - **`X070PartialFinetune` is not on the shared trainer.**
 - **The backbone is fingerprinted only in state files** (`StateFile`). Adapter
   and head checkpoints still are not: a head trained on one backbone and loaded
