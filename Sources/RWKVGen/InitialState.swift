@@ -92,6 +92,11 @@ public extension X070Backbone {
         }
     }
 
+    /// Отпечаток подключённого состояния (`StateFile.stateFingerprint`):
+    /// `none` без состояния или при нулевом, иначе `sha256:…`. Входит в
+    /// контракты кэшей реранкера.
+    var initialStateFingerprint: String { StateFile.stateFingerprint(initialState) }
+
     /// Состояние для ПОШАГОВОГО декода с самого начала: подключённое либо
     /// нули. (`prefill` стартует с подключённого сам — он идёт параллельным
     /// проходом; это нужно тому, кто декодирует `step` с пустого места.)
@@ -379,6 +384,50 @@ public enum StateFile {
             feed(name, row, lattice: row.dtype == .float16 ? .float16 : .bfloat16)
         }
         return h.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    // ── Отпечаток самого состояния ──────────────────────────────────────
+    //
+    // Нужен контрактам кэшей, которые хранят результат счёта, а не текст:
+    // индекс префиксов реранкера, кэш состояний пар. Свёрнутый префикс —
+    // функция ровно (база, подключённое состояние, текст); кэш, снятый с одним
+    // состоянием, при другом даёт правдоподобные и неверные числа.
+
+    /// Ключ отпечатка подключённого состояния в контрактах кэшей.
+    public static let contractKey = "initial_state"
+    /// Значение «состояния нет». Им же читается ОТСУТСТВИЕ ключа в файле,
+    /// записанном до появления ключа: такой кэш считается снятым без
+    /// состояния. Кэш, снятый с состоянием до этой правки, от него не
+    /// отличить — признанная слепая зона, её закрывает пересборка.
+    public static let noInitialState = "none"
+
+    /// Отпечаток начального состояния: `none` либо `sha256:<hex>`.
+    ///
+    /// sha256 по заголовку `rwkv-initial-state-v1` и трём тензорам в порядке
+    /// wkv, tmix_shift, cmix_shift; у каждого — имя, нулевой байт, форма через
+    /// запятую, перевод строки и значения в fp32 (little-endian, по строкам).
+    /// Через fp32, а не через тип хранения: подключённое состояние хранится в
+    /// fp32 всегда. Тот же отпечаток бит в бит — в
+    /// rwkv_metal/model/initial_state.py (`state_fingerprint`).
+    ///
+    /// nil и НУЛЕВОЕ состояние — одно и то же значение `none`: подключённые
+    /// нули счёта не меняют (выход побитно тот же), и кэш, снятый без
+    /// состояния, для них верен.
+    public static func stateFingerprint(_ state: RWKVBatchState?) -> String {
+        guard let s = state else { return noInitialState }
+        let parts = [("wkv", s.wkv), ("tmix_shift", s.tmixShift), ("cmix_shift", s.cmixShift)]
+            .map { ($0.0, $0.1.asType(.float32).reshaped([-1]), $0.1.shape) }
+        eval(parts.map { $0.1 })
+        let values = parts.map { $0.1.asArray(Float.self) }
+        if values.allSatisfy({ $0.allSatisfy { $0 == 0 } }) { return noInitialState }
+        var h = SHA256()
+        h.update(data: Data("rwkv-initial-state-v1\n".utf8))
+        for ((name, _, shape), v) in zip(parts, values) {
+            h.update(data: Data(name.utf8) + Data([0])
+                     + Data((shape.map(String.init).joined(separator: ",") + "\n").utf8))
+            v.withUnsafeBytes { h.update(bufferPointer: $0) }
+        }
+        return "sha256:" + h.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// Записать состояние отдельным файлом. `base` — модель, на которой оно

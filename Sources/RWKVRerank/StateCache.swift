@@ -260,8 +260,10 @@ public final class StateCache {
             throw StateCacheError.shapeMismatch(
                 "разная форма состояния: \(shape) и \(other.shape)")
         }
-        for (k, v) in index.contract {
-            if let w = other.index.contract[k], w != v {
+        let mineC = Self.withStateKey(index.contract)
+        let theirsC = Self.withStateKey(other.index.contract)
+        for (k, v) in mineC {
+            if let w = theirsC[k], w != v {
                 throw StateCacheError.shapeMismatch(
                     "\(k): один кэш собран с '\(v)', другой с '\(w)'")
             }
@@ -287,6 +289,8 @@ public final class StateCache {
             }
         }
 
+        // Сверка — по нормированным контрактам, а в результат идут СЫРЫЕ:
+        // слияние двух старых кэшей без ключа ключа не выдумывает.
         var newContract = index.contract
         for (k, v) in other.index.contract where newContract[k] == nil {
             newContract[k] = v
@@ -358,17 +362,31 @@ public final class StateCache {
         return out
     }
 
+    /// Контракт с отпечатком состояния: ключа нет — `none`.
+    static func withStateKey(_ c: [String: String]) -> [String: String] {
+        var c = c
+        if c[StateFile.contractKey] == nil { c[StateFile.contractKey] = StateFile.noInitialState }
+        return c
+    }
+
     /// Совместим ли кэш с этой головой и этим контрактом подачи текста.
     ///
     /// Проверять обязательно, и не из педантизма: кэш, собранный для другого
     /// набора слоёв или другого шаблона, имеет ПРАВДОПОДОБНУЮ форму и
     /// обучение на нём пойдёт как ни в чём не бывало — просто научит не тому.
     /// Единственное, чего проверка не увидит, — подменённый чекпоинт базы.
+    ///
+    /// Отпечаток подключённого начального состояния (`initial_state`)
+    /// сверяется, если он есть в ожидаемом контракте; в кэше без ключа
+    /// (собранном до его появления) он читается как `none` — кэш без
+    /// состояния. Кэш, снятый с одним состоянием, при другом даёт
+    /// правдоподобные и неверные числа.
     public func checkCompatible(head: RerankerHead,
                                 contract: [String: String]) throws {
         _ = try slots(for: head)
+        let stored = Self.withStateKey(index.contract)
         for (key, want) in contract {
-            if let have = index.contract[key], have != want {
+            if let have = stored[key], have != want {
                 throw StateCacheError.shapeMismatch(
                     "\(key): кэш собран с '\(have)', сейчас '\(want)'")
             }

@@ -66,7 +66,16 @@ public struct RerankServingConfig: Sendable {
     /// Обрезка запроса и терминатор сюда не входят: они в хвосте, префикс от
     /// них не зависит, и требовать их совпадения значило бы запрещать
     /// законное — переиндексировать корпус ради смены длины запроса.
-    public static let prefixKeys = ["template", "instruct", "max_doc_tokens"]
+    ///
+    /// `initial_state` — отпечаток подключённого к базе начального состояния
+    /// (`StateFile.stateFingerprint`). Свёртка префикса стартует с него, так
+    /// что индекс — функция и его тоже. Это свойство МОДЕЛИ, а не подачи
+    /// текста: в `contract` конфигурации его нет, его добавляет
+    /// `RerankerInference.prefixContract`. Отсутствие ключа в индексе —
+    /// `none` (индекс, записанный до появления ключа, считается снятым без
+    /// состояния).
+    public static let prefixKeys = ["template", "instruct", "max_doc_tokens",
+                                    StateFile.contractKey]
 
     public var prefixContract: [String: String] {
         contract.filter { Self.prefixKeys.contains($0.key) }
@@ -138,7 +147,8 @@ public struct DocIndex {
 
     public let state: RWKVBatchState     // [L, nDocs, ...]
     public let docs: [String]
-    /// `template`, `instruct`, `max_doc_tokens` — то, от чего зависит префикс.
+    /// `template`, `instruct`, `max_doc_tokens`, `initial_state` — то, от чего
+    /// зависит префикс.
     public let contract: [String: String]
 
     public init(state: RWKVBatchState, docs: [String],
@@ -153,12 +163,19 @@ public struct DocIndex {
     public var count: Int { docs.count }
     public var nbytes: Int { state.nbytes }
 
-    /// Совместим ли индекс с этой конфигурацией выдачи.
-    public func check(_ cfg: RerankServingConfig) throws {
-        let now = cfg.prefixContract
+    /// Совместим ли индекс с контрактом префикса выдачи
+    /// (`RerankerInference.prefixContract`: конфигурация плюс отпечаток
+    /// подключённого состояния).
+    ///
+    /// Отпечаток состояния сверяется ВСЕГДА: его отсутствие с любой стороны —
+    /// `none`. Прочие ключи, которых нет в индексе, не сверяются, как и прежде.
+    public func check(_ now: [String: String]) throws {
+        let stateKey = StateFile.contractKey
         for key in RerankServingConfig.prefixKeys {
-            guard let have = contract[key] else { continue }
-            let want = now[key] ?? ""
+            let stored = key == stateKey
+                ? (contract[key] ?? StateFile.noInitialState) : contract[key]
+            guard let have = stored else { continue }
+            let want = now[key] ?? (key == stateKey ? StateFile.noInitialState : "")
             guard have == want else {
                 throw RerankServeError.contractMismatch(key: key, index: have,
                                                         now: want)
@@ -248,6 +265,16 @@ public final class RerankerInference {
     /// Контракт, который стоит класть в `saveHead(extra:)`.
     public var servingMetadata: [String: String] { config.contract }
 
+    /// Контракт префикса, с которым строится и сверяется индекс: ключи
+    /// `RerankServingConfig.prefixKeys` конфигурации (с инструкцией вызова,
+    /// если она задана) и отпечаток состояния, подключённого к базе СЕЙЧАС.
+    public func prefixContract(instruct: String? = nil) -> [String: String] {
+        var c = config.prefixContract
+        if let instruct { c["instruct"] = instruct }
+        c[StateFile.contractKey] = model.base.initialStateFingerprint
+        return c
+    }
+
     // ── Прямой путь ────────────────────────────────────────────────────
 
     /// Скоры `[docs.count]`. Больше — релевантнее.
@@ -327,9 +354,8 @@ public final class RerankerInference {
         }
         let state = parts.count == 1 ? parts[0]
                                      : RWKVBatchState.concatenated(parts)
-        var contract = config.prefixContract
-        contract["instruct"] = ins
-        return DocIndex(state: state, docs: docs, contract: contract)
+        return DocIndex(state: state, docs: docs,
+                        contract: prefixContract(instruct: ins))
     }
 
     /// То же, но состояния уходят на диск ПО ХОДУ, а не копятся в памяти.
@@ -381,9 +407,7 @@ public final class RerankerInference {
             progress?(end, docs.count)
         }
 
-        var contract = config.prefixContract
-        contract["instruct"] = ins
-        var md = contract
+        var md = prefixContract(instruct: ins)
         md["format"] = DocIndex.format
         md["n_docs"] = String(docs.count)
         md["docs"] = String(data: try JSONEncoder().encode(docs),
@@ -401,9 +425,7 @@ public final class RerankerInference {
     public func scoreIndexed(query: String, index: DocIndex,
                              docIds: [Int]? = nil,
                              instruct: String? = nil) throws -> [Float] {
-        var cfg = config
-        if let instruct { cfg.instruct = instruct }
-        try index.check(cfg)
+        try index.check(prefixContract(instruct: instruct))
 
         let ids = docIds ?? Array(0 ..< index.count)
         for i in ids where i < 0 || i >= index.count {
@@ -449,9 +471,7 @@ public final class RerankerInference {
                                   docIds: [Int]? = nil,
                                   instruct: String? = nil) throws -> [[Float]] {
         guard !queries.isEmpty else { return [] }
-        var cfg = config
-        if let instruct { cfg.instruct = instruct }
-        try index.check(cfg)
+        try index.check(prefixContract(instruct: instruct))
 
         let ids = docIds ?? Array(0 ..< index.count)
         for i in ids where i < 0 || i >= index.count {

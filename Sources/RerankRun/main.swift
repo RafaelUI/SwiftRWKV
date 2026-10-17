@@ -475,6 +475,11 @@ let encCfg = RerankEncodeConfig(maxDocTokens: args.maxDocTokens,
                                 maxQueryTokens: args.maxQueryTokens,
                                 docBatch: args.docBatch,
                                 queryBatch: args.queryBatch)
+// Ожидаемый контракт кэша: подача текста плюс отпечаток подключённого к базе
+// начального состояния (`none` без него) — кэш, снятый с другим состоянием,
+// не переиспользуется и не обучает голову.
+let cacheContract = encCfg.contract.merging(
+    [StateFile.contractKey: backbone.initialStateFingerprint]) { a, _ in a }
 
 func buildCache(_ samples: [RerankSample], tag: String) throws -> StateCache {
     let base = args.cachePath.map {
@@ -490,7 +495,7 @@ func buildCache(_ samples: [RerankSample], tag: String) throws -> StateCache {
        existing.nSamples == samples.count,
        existing.nCandidates == args.candidates,
        let have = existing.sources, Set(have).isSuperset(of: neededLayers),
-       (try? existing.checkCompatible(head: model.head, contract: encCfg.contract)) != nil {
+       (try? existing.checkCompatible(head: model.head, contract: cacheContract)) != nil {
         print("  \(tag): кэш найден готовым (\(existing.nPairs) пар, "
               + String(format: "%.2f", Double(existing.byteCount) / 1e9) + " ГБ)")
         return existing
@@ -551,7 +556,7 @@ if headConfigs.count > 1 || seedList.count > 1 {
     let sweep = try RerankSweep.run(
         base: backbone, configs: headConfigs,
         trainCache: trainCache, evalCache: evalCache, config: scfg,
-        seeds: seedList, contract: encCfg.contract,
+        seeds: seedList, contract: cacheContract,
         onPoint: { p in
             pointDicts.append([
                 "layers": p.layers, "n_probe": p.nProbe,
@@ -613,7 +618,7 @@ let result = try RerankTraining.train(
     // Разница в том, кто кому подчиняется: прогонщик знает, каким текстом
     // он хотел кормить модель, и при переиспользовании чужого кэша обязан
     // об этом узнать, а не молча принять чужие обрезки.
-    contract: encCfg.contract,
+    contract: cacheContract,
     onEpoch: { r in
         var d: [String: Any] = ["epoch": r.epoch, "loss": Double(r.loss)]
         if let m = r.metrics {

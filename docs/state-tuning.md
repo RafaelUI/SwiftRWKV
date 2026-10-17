@@ -106,6 +106,11 @@ base.initialState = nil                                     // detach
   is plain continuation with no code of its own (`foldPrompt`).
 - `startState()` gives the same start to step-by-step decoding.
 - An attached zero state changes nothing, bit for bit.
+- Caches that store computed states — the reranker's serving index and pair
+  cache — record the attached state's fingerprint (`initial_state`:
+  `none`, or `sha256:…` from `StateFile.stateFingerprint`; a zero state is
+  `none`) and refuse to be used under another state. See
+  [reranker.md](reranker.md#the-text-feeding-contract).
 
 ## The file and the base fingerprint
 
@@ -234,10 +239,6 @@ compressed base fits at 1 × 512, where its top layers do not.
 
 ## Not done
 
-- **The reranker's serving caches do not know about the attached state.** The
-  prefix cache and the serving index check a contract of keys that does not
-  include the state, so a cache built with one state would be accepted with
-  another. Planned separately.
 - A state attached to queries only (the way an instruction is used) needs the
   attached state switched per text; it was not measured.
 - Instructions that differ per query (several tasks, long instructions) — where

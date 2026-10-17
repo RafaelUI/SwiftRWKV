@@ -156,7 +156,27 @@ artefacts:
 | `RerankTrainResult.contract` | the contract the head **actually** trained on |
 | head checkpoint | saved with the contract taken from the training result |
 | `RerankerInference.fromCheckpoint` | serving configuration is read **from** the checkpoint |
-| `DocIndex` | the index remembers instruction, template and document truncation |
+| `DocIndex` | the index remembers instruction, template, document truncation and the attached initial state |
+
+**The attached initial state is part of the contract too.** A state attached
+to the base (`base.initialState`, see [state-tuning.md](state-tuning.md)) is
+where every prefix fold starts, so an index or a pair cache is a function of
+it as much as of the text. Both record `initial_state`: `none` when no state
+is attached (or the attached one is all zeros, which computes bit-identically),
+otherwise `sha256:…` of the state's three tensors in fp32
+(`StateFile.stateFingerprint`; the same bytes as rwkv-metal's
+`state_fingerprint`). The value is a property of the **model**, not of the
+serving configuration: `RerankerInference.prefixContract()` adds it to the
+configuration's prefix keys, and `scoreIndexed` rejects an index built under
+another state — or built without one while a state is attached now.
+`RerankEncoder.encodePairs` writes it into the pair cache; training refuses a
+held-out cache built under another state, `rerank-run` does not reuse such a
+cache, and a head checkpoint carries the value of the cache it trained on.
+
+A file written before the key existed reads as `none` — built without a state.
+That is right for every such file except one built with a state attached
+between the arrival of states and this check; nothing in the file tells the two
+apart, so rebuild an index or cache that was made with a state.
 
 One rule: **never assemble a serving configuration by hand when a checkpoint
 exists.** Defaults are the most likely source of silent quality loss here,

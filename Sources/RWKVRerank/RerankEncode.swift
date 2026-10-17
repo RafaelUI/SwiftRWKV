@@ -360,6 +360,10 @@ public enum RerankEncoder {
         var contract = config.contract
         let instructs = Set(samples.map { $0.instruct })
         if instructs.count == 1 { contract["instruct"] = instructs.first! }
+        // Подключённое начальное состояние: префикс и хвост пары стартуют с
+        // него (`model.encode` без явного состояния), так что кэш — функция и
+        // его. Ключ пишется всегда, `none` — без состояния.
+        contract[StateFile.contractKey] = model.base.initialStateFingerprint
 
         return try writer.finish(pairIndex: pairIndex,
                                  labels: samples.map { $0.label },

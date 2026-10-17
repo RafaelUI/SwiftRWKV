@@ -117,9 +117,15 @@ public enum RerankTraining {
                                           headDType: headDType)
         // Из метаданных берутся только ключи контракта подачи текста:
         // остальное там — форма головы, и её уже сверил `fromHead`.
-        let want = md.filter {
+        // Отпечаток начального состояния — тоже: голова училась на
+        // состояниях, снятых с ним. Нет ключа (голова записана до его
+        // появления) — `none`, как у кэшей.
+        var want = md.filter {
             ["template", "max_doc_tokens", "max_query_tokens",
-             "terminator", "instruct"].contains($0.key)
+             "terminator", "instruct", StateFile.contractKey].contains($0.key)
+        }
+        if want[StateFile.contractKey] == nil {
+            want[StateFile.contractKey] = StateFile.noInitialState
         }
         return (try evaluate(model, cache: cache, contract: want,
                              batchSize: batchSize), want)
