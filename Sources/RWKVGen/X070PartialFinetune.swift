@@ -248,7 +248,11 @@ public enum X070PartialFinetune {
                 for i in params.indices {
                     m[i] = b1 * m[i] + (1 - b1) * grads[i]
                     v[i] = b2 * v[i] + (1 - b2) * (grads[i] * grads[i])
-                    params[i] = params[i] - lr * (m[i] / c1) / (sqrt(v[i] / c2) + aeps)
+                    // Порядок операций — как в общем Trainer: lr · (m̂ / (√v̂ + ε)).
+                    // Прежний (lr · m̂) / (√v̂ + ε) расходился с ним в последнем
+                    // бите у трети элементов на каждом шаге.
+                    let mhat = m[i] / c1, vhat = v[i] / c2
+                    params[i] = params[i] - lr * (mhat / (sqrt(vhat) + aeps))
                 }
                 eval(params + m + v)
 
