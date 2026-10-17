@@ -30,6 +30,27 @@ public enum Pooling: String, Sendable {
     case mean
 }
 
+/// Чем текст служит в задаче: запрос (якорь) или то, среди чего ищут
+/// (документ, кандидат, метка класса).
+public enum TextRole: String, Sendable {
+    case query
+    case document
+}
+
+/// К каким текстам применяется начальное состояние, подключённое к базе
+/// (`backbone.initialState`, см. RWKVGen/InitialState.swift).
+///
+/// Состояние, обученное ВМЕСТО строки инструкции, по смыслу относится туда же,
+/// куда инструкция, — к запросам: документы её никогда не несли. При
+/// `.queriesOnly` документы кодируются так, будто состояния нет (побитно), и
+/// обучение видит состояние только через запросы.
+public enum InitialStateScope: String, Sendable {
+    /// Ко всем текстам — прежнее поведение (умолчание).
+    case allTexts = "all"
+    /// Только к запросам; документы — без состояния. Роль текста обязательна.
+    case queriesOnly = "queries"
+}
+
 /// Косинусная матрица между наборами L2-нормированных векторов: [N,D]×[M,D] → [N,M].
 public func cosineSimilarity(_ a: MLXArray, _ b: MLXArray? = nil) -> MLXArray {
     matmul(a, (b ?? a).transposed())
@@ -115,19 +136,38 @@ public final class EmbeddingModel {
     public let backbone: X070Backbone
     public let head: EmbeddingHead
     public let pooling: Pooling
+    /// К каким текстам применяется подключённое состояние. Входит в контракт
+    /// (`initial_state_scope`): вектор документа с состоянием и без — разные
+    /// векторы.
+    public var stateScope: InitialStateScope
 
     public init(backbone: X070Backbone, head: EmbeddingHead? = nil,
-                pooling: Pooling = .last) {
+                pooling: Pooling = .last, stateScope: InitialStateScope = .allTexts) {
         self.backbone = backbone
         self.head = head ?? EmbeddingHead(dim: backbone.cfg.nEmbd)
         self.pooling = pooling
+        self.stateScope = stateScope
+    }
+
+    /// Построить проход текста этой роли: документ при `.queriesOnly` — без
+    /// подключённого состояния. Граф строится ВНУТРИ `body`.
+    ///
+    /// Роль nil при `.queriesOnly` — ошибка вызывающего: догадка «это запрос»
+    /// молча испортила бы векторы документов, «это документ» — запросов.
+    public func building<T>(_ role: TextRole?, _ body: () throws -> T) rethrows -> T {
+        guard stateScope == .queriesOnly else { return try body() }
+        guard let role else {
+            preconditionFailure("stateScope = .queriesOnly: укажи роль текста (запрос или документ)")
+        }
+        return role == .document ? try backbone.withoutInitialState(body) : try body()
     }
 
     /// idx [B,T], poolIdx [B] — позиция, с которой снимать вектор (для .last)
     /// либо длина строки (для .mean). Возвращает [B,D], L2-нормировано.
+    /// `role` — см. `stateScope`; при `.allTexts` ни на что не влияет.
     public func embed(_ idx: MLXArray, poolIndex: MLXArray,
-                      headParameters: [MLXArray]? = nil) -> MLXArray {
-        let h = backbone.body(idx)                       // [B,T,D]
+                      headParameters: [MLXArray]? = nil, role: TextRole? = nil) -> MLXArray {
+        let h = building(role) { backbone.body(idx) }    // [B,T,D]
         let pooled = pool(h, poolIndex: poolIndex)
         return l2Normalize(head.apply(pooled, parameters: headParameters ?? head.parameters))
     }
@@ -142,8 +182,8 @@ public final class EmbeddingModel {
     }
 
     /// Пулинг без головы — сырой вектор базы.
-    public func pooledOnly(_ idx: MLXArray, poolIndex: MLXArray) -> MLXArray {
-        l2Normalize(pool(backbone.body(idx), poolIndex: poolIndex))
+    public func pooledOnly(_ idx: MLXArray, poolIndex: MLXArray, role: TextRole? = nil) -> MLXArray {
+        l2Normalize(pool(building(role) { backbone.body(idx) }, poolIndex: poolIndex))
     }
 
     func pool(_ h: MLXArray, poolIndex: MLXArray) -> MLXArray {
@@ -199,10 +239,11 @@ public struct Embedder {
                 contract: EmbeddingContract? = nil) {
         self.model = model
         self.tokenizer = tokenizer
-        // Пулинг берётся у МОДЕЛИ: она источник истины, а контракт — то, что
-        // записывается рядом с ней.
+        // Пулинг и область состояния берутся у МОДЕЛИ: она источник истины, а
+        // контракт — то, что записывается рядом с ней.
         var c = contract ?? EmbeddingContract()
         c.pooling = model.pooling
+        c.stateScope = model.stateScope
         self.contract = c
     }
 
@@ -232,14 +273,15 @@ public struct Embedder {
         return ids
     }
 
-    /// Вектор одного текста [D].
-    public func embed(_ text: String) -> MLXArray {
+    /// Вектор одного текста [D]. `role` обязательна при
+    /// `model.stateScope == .queriesOnly` (см. `InitialStateScope`).
+    public func embed(_ text: String, role: TextRole? = nil) -> MLXArray {
         let ids = encode(text)
         let idx = MLXArray(ids.map { Int32($0) }, [1, ids.count])
         let poolIdx = MLXArray([Int32(model.pooling == .last ? ids.count - 1 : ids.count)])
         // выдача — без градиента: и у модели с навешенными адаптерами длина
         // текста не обязана быть кратной шагу дифференцируемого ядра
-        return model.backbone.withoutGradientPath { model.embed(idx, poolIndex: poolIdx)[0] }
+        return model.backbone.withoutGradientPath { model.embed(idx, poolIndex: poolIdx, role: role)[0] }
     }
 
     /// Векторы списка текстов [N,D].
@@ -249,8 +291,8 @@ public struct Embedder {
     /// Батчевый путь возможен (см. buildMask/lastRealIndex в RWKVGen), но
     /// требует аккуратной маски, и для инференса выигрыш редко стоит риска
     /// тихо испортить вектор короткой строки.
-    public func embed(_ texts: [String]) -> MLXArray {
-        let vecs = texts.map { embed($0).reshaped([1, -1]) }
+    public func embed(_ texts: [String], role: TextRole? = nil) -> MLXArray {
+        let vecs = texts.map { embed($0, role: role).reshaped([1, -1]) }
         let out = concatenated(vecs, axis: 0)
         eval(out)
         return out

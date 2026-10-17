@@ -83,6 +83,12 @@ public enum EmbeddingMetrics {
     /// sts и классификация — 1 за верный ответ, 0 за неверный. По умолчанию nil.
     nonisolated(unsafe) public static var perRowObserver: (([Double]) -> Void)? = nil
 
+    /// Матрица похожести оценки retrieval / классификации [запросов, кандидатов]
+    /// — только для тестов: ранги и точность к малым сдвигам векторов глухи, а
+    /// то, какими векторами кандидатов (с состоянием или без) считалась
+    /// оценка, видно лишь по самой матрице.
+    nonisolated(unsafe) static var similarityObserver: ((MLXArray) -> Void)? = nil
+
     /// Векторы плоского списка текстов, микробатчами.
     ///
     /// Выравнивание T здесь не нужно: оценка идёт БЕЗ градиента, а
@@ -100,11 +106,15 @@ public enum EmbeddingMetrics {
     /// ~0.14 ГБ на 1024 токена сверх модели (0.1B), и 16 текстов по 1024 токена
     /// одним батчем стоили больше шага обучения. Строки в теле независимы,
     /// разбиение на батчи вектора не меняет. 0 — без ограничения по токенам.
+    ///
+    /// `role` — роль ВСЕХ текстов списка (`EmbeddingModel.stateScope`): при
+    /// `.queriesOnly` документы идут без подключённого состояния.
     public static func embedAll(model: EmbeddingModel, tokenizer: WorldTokenizer,
                                 texts: [String], batchSize: Int = 16,
                                 terminator: Int = 0,
                                 maxTokens: Int? = 512,
-                                batchTokens: Int = EmbeddingMetrics.evaluationBatchTokens) -> MLXArray {
+                                batchTokens: Int = EmbeddingMetrics.evaluationBatchTokens,
+                                role: TextRole? = nil) -> MLXArray {
         let rows = texts.map { encodeRow(tokenizer: tokenizer, text: $0, terminator: terminator, maxTokens: maxTokens) }
         let frozen = SequentialBody.Plan(names: [], nLayer: model.backbone.cfg.nLayer)
         var parts: [MLXArray] = []
@@ -123,7 +133,7 @@ public enum EmbeddingMetrics {
             // `model.embed`, но одним ленивым графом всё тело держало ~1 ГБ
             // активаций уже на 2048 токенах батча (0.1B), по блокам — треть.
             let v = model.backbone.withoutGradientPath { () -> MLXArray in
-                let top = SequentialBody.forward(model.backbone, ids: idx, plan: frozen).top
+                let top = model.building(role) { SequentialBody.forward(model.backbone, ids: idx, plan: frozen).top }
                 return model.embedFromTop(top, poolIndex: pool)
             }
             eval(v)                       // иначе ленивый граф удержит активации
@@ -157,11 +167,12 @@ public enum EmbeddingMetrics {
         let negatives = rows.map { String($0.negative.prefix(maxChars)) }
 
         let a = embedAll(model: model, tokenizer: tokenizer, texts: anchors,
-                         terminator: terminator, maxTokens: maxTokens)
+                         terminator: terminator, maxTokens: maxTokens, role: .query)
         let c = embedAll(model: model, tokenizer: tokenizer, texts: positives + negatives,
-                         terminator: terminator, maxTokens: maxTokens)
+                         terminator: terminator, maxTokens: maxTokens, role: .document)
 
         let sims = matmul(a.asType(.float32), c.asType(.float32).transposed())
+        similarityObserver?(sims)
         eval(sims)
         return rankingMetrics(similarities: sims,
                               correctIndex: Array(0 ..< rows.count), ks: ks)
@@ -223,15 +234,17 @@ public enum EmbeddingMetrics {
                                    terminator: Int = 0,
                                    maxTokens: Int? = 512) -> PairwiseMetrics {
         precondition(!rows.isEmpty, "оценка на пустой выборке бессмысленна")
+        // Стороны пары равноправны: роль «запрос» у всех трёх (при
+        // `.queriesOnly` состояние у всех — как при `.allTexts`).
         let a = embedAll(model: model, tokenizer: tokenizer,
                          texts: rows.map { String($0.anchor.prefix(maxChars)) },
-                         terminator: terminator, maxTokens: maxTokens).asType(.float32)
+                         terminator: terminator, maxTokens: maxTokens, role: .query).asType(.float32)
         let p = embedAll(model: model, tokenizer: tokenizer,
                          texts: rows.map { String($0.positive.prefix(maxChars)) },
-                         terminator: terminator, maxTokens: maxTokens).asType(.float32)
+                         terminator: terminator, maxTokens: maxTokens, role: .query).asType(.float32)
         let n = embedAll(model: model, tokenizer: tokenizer,
                          texts: rows.map { String($0.negative.prefix(maxChars)) },
-                         terminator: terminator, maxTokens: maxTokens).asType(.float32)
+                         terminator: terminator, maxTokens: maxTokens, role: .query).asType(.float32)
 
         let simPos = (a * p).sum(axis: -1)
         let simNeg = (a * n).sum(axis: -1)
@@ -287,7 +300,7 @@ public enum EmbeddingMetrics {
         }
 
         let a = embedAll(model: model, tokenizer: tokenizer, texts: anchors,
-                         terminator: terminator, maxTokens: maxTokens).asType(.float32)
+                         terminator: terminator, maxTokens: maxTokens, role: .query).asType(.float32)
 
         // Уникальные метки по всей выборке — один прогон на каждую.
         var labelIndex: [String: Int] = [:]
@@ -299,10 +312,11 @@ public enum EmbeddingMetrics {
             }
         }
         let labelVecs = embedAll(model: model, tokenizer: tokenizer, texts: labelTexts,
-                                 terminator: terminator, maxTokens: maxTokens)
+                                 terminator: terminator, maxTokens: maxTokens, role: .document)
             .asType(.float32)
 
         let sims = matmul(a, labelVecs.transposed())      // [N, уникальных меток]
+        similarityObserver?(sims)
         eval(sims)
         let flat = sims.asArray(Float.self)
         let width = labelTexts.count

@@ -90,6 +90,7 @@ vector is normalised in every case, so no shape error occurs anywhere:
 | `pooling` | `.last` takes the vector at the final real token, `.mean` averages over real tokens. Different geometry entirely, not a detail at the edges |
 | `terminator` | a token appended before pooling; `0` is reserved in the World vocabulary and carries no meaning of its own |
 | `maxTokens` | input truncation. A long text truncated and not truncated are different vectors |
+| `stateScope` | which texts an attached initial state applies to: `.allTexts`, or `.queriesOnly` — documents are then embedded exactly as with no state. Only matters when a state is attached (`backbone.initialState`) |
 
 These travel with the head in its checkpoint:
 
@@ -108,7 +109,9 @@ print(embedder.contract.pooling, embedder.maxTokens as Any)
 ```
 
 Loading a head trained with `.last` into a model configured for `.mean` is
-refused. Without that check it would load fine and quietly produce plausible
+refused, and so is loading a head trained with one `stateScope` into a model
+configured with the other (`initial_state_scope` in the checkpoint; a checkpoint
+without it means `.allTexts`). Without that check it would load fine and quietly produce plausible
 numbers from different geometry.
 
 `maxTokens` defaults to **512 everywhere** — serving, metrics and training
@@ -387,6 +390,39 @@ measurement the state is attached to the model, so it applies to every text —
 documents included, which never had the instruction. Attaching it to queries
 only, the way the instruction was used, needs the attached state switched per
 text and was not measured.
+
+#### Attaching the state to queries only
+
+`EmbeddingModel.stateScope = .queriesOnly` applies the attached state to
+queries and embeds documents as if no state were attached — bit for bit the
+same vectors (`X070Backbone.withoutInitialState` builds their passes). Every
+place that embeds then needs the role of the text: `embed(_:role:)`,
+`Embedder.embed(_:role:)`, `EmbeddingMetrics.embedAll(role:)`. Without a role
+it stops rather than guess. Training and evaluation pass the roles
+themselves: in retrieval the anchor is a query and the positives and negatives
+are documents; in classification the label texts are documents; in sts both
+sides are queries. Block-by-block backward recomputes each piece under its
+batch's role, so the gradient matches autograd on the same batches (checked
+for the sequential path, row chunks and GradCache), and a state learns only
+from the queries. `embed-run --state-scope queries` sets it.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+guard let tok = WorldTokenizer(
+        vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+    fatalError("cannot read vocabulary")
+}
+let (state, _) = try StateFile.load(
+    URL(fileURLWithPath: "runs/query.state.safetensors"), base: base)
+base.initialState = state
+// The head's checkpoint records the scope it was trained with.
+let embedder = try Embedder.fromCheckpoint(
+    backbone: base, tokenizer: tok,
+    head: URL(fileURLWithPath: "runs/embedding_head.safetensors"))
+let docs = embedder.embed(["Bees make honey from nectar."], role: .document)
+let query = embedder.embed("how is honey made", role: .query)
+print(cosineSimilarity(query.reshaped([1, -1]), docs).shape)
+```
 
 ### Training top layers over a quantized base
 

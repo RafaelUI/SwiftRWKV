@@ -51,6 +51,7 @@ struct Args {
     var thenState = 0
     var thenStateLR: Float = 3e-4
     var thenHead = false
+    var stateScope = "all"         // all | queries: к каким текстам применяется подключённое состояние
     var out: String? = nil
     var limit: Int? = nil          // читать не больше стольких строк JSONL (иначе файл целиком в память)
     var sampleSeed: UInt64? = nil  // с --limit: равномерная выборка по всему файлу (резервуар), а не первые строки
@@ -109,6 +110,7 @@ func parse() -> Args {
         case "--then-state": a.thenState = Int(v()) ?? 0
         case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
         case "--then-head": a.thenHead = true
+        case "--state-scope": a.stateScope = v()
         case "--sample-seed": a.sampleSeed = UInt64(v())
         case "--dtype": a.dtype = v()                          // плотная база: bf16 | fp16 | fp32        // контроль: на второй стадии вместо состояния — голова
         default:
@@ -234,8 +236,12 @@ default:
 }
 // сид задаёт и порядок данных, и начальные веса головы (fc1): при сиде 0 —
 // прежнее умолчание головы, счёт тот же
+guard let stateScope = InitialStateScope(rawValue: args.stateScope) else {
+    print("--state-scope: all | queries"); exit(2)
+}
 var model = EmbeddingModel(backbone: base,
-                           head: EmbeddingHead(dim: base.cfg.nEmbd, seed: args.seed))
+                           head: EmbeddingHead(dim: base.cfg.nEmbd, seed: args.seed),
+                           stateScope: stateScope)
 // готовые состояние и голова (перенос на другую базу, оценка без обучения)
 if let path = args.headIn { model = try model.loadHead(from: URL(fileURLWithPath: expand(path))) }
 if let path = args.stateIn {
@@ -441,7 +447,7 @@ if let mode {
     }
 } else {
     if args.cacheGB > 0 { MLX.Memory.cacheLimit = Int(args.cacheGB * 1e9) }
-    _ = EmbeddingMetrics.embedAll(model: model, tokenizer: tok, texts: ["прогрев"])   // первое касание весов — не в замер
+    _ = EmbeddingMetrics.embedAll(model: model, tokenizer: tok, texts: ["прогрев"], role: .query)   // первое касание весов — не в замер
     GPU.resetPeakMemory()
     _ = watch.take()
     t = Date()
@@ -465,6 +471,7 @@ if case .state = mode, let state = base.initialState {
 }
 if let path = args.headOut { try model.saveHead(to: URL(fileURLWithPath: expand(path))) }
 report["seed"] = Int(args.seed); report["per_row"] = perRow
+report["state_scope"] = stateScope.rawValue
 report["dtype"] = quantised ? "rwkvq" : args.dtype
 if let out = args.out {
     try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])

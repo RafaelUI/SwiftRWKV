@@ -397,7 +397,9 @@ final class BackboneBlockContext: RWKVBlockContext {
 
     var castWKVOutput: Bool { backbone.castWKVOutputToComputeDType }
 
-    var initialState: InitialLayerState? { backbone.initialLayers?[layer] }
+    var initialState: InitialLayerState? {
+        backbone.initialStateSuspended ? nil : backbone.initialLayers?[layer]
+    }
 
     var frozenKernels: FrozenPassKernels {
         backbone.rwkvqBaseDType != nil ? backbone.frozenPassKernels : []

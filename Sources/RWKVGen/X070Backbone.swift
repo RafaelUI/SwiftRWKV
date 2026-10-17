@@ -191,6 +191,9 @@ public final class X070Backbone {
     /// обученное (state-tuning), свёрнутый промпт или одно поверх другого.
     /// nil ⇒ последовательность стартует с нуля, счёт прежний.
     var initialLayers: [InitialLayerState]? = nil { didSet { stepVersion &+= 1 } }
+    /// Подключённое состояние ВЫКЛЮЧЕНО (`withoutInitialState`): блоки
+    /// стартуют так, как без него. Само состояние остаётся подключённым.
+    var initialStateSuspended = false { didSet { stepVersion &+= 1 } }
 
     /// Подмена весов на обучаемые (fp32) во время valueAndGrad для full-weight
     /// partial-finetune верхних слоёв. nil ⇒ читаются frozen-веса (инференс не меняется).

@@ -33,18 +33,24 @@ public struct EmbeddingContract: Sendable, Equatable {
     /// 512, выдача не обрезала вовсе, и измеренное качество описывало не то,
     /// что делает выдача. Расхождение было замерено, а не предположено.
     public var maxTokens: Int?
+    /// К каким текстам применяется подключённое начальное состояние. Документ
+    /// с состоянием и без него — разные векторы. Нет ключа в чекпоинте —
+    /// `.allTexts` (прежнее поведение).
+    public var stateScope: InitialStateScope
 
     public init(pooling: Pooling = .last, terminator: Int? = 0,
-                maxTokens: Int? = 512) {
+                maxTokens: Int? = 512, stateScope: InitialStateScope = .allTexts) {
         self.pooling = pooling
         self.terminator = terminator
         self.maxTokens = maxTokens
+        self.stateScope = stateScope
     }
 
     public var metadata: [String: String] {
         ["pooling": pooling.rawValue,
          "terminator": terminator.map(String.init) ?? "none",
-         "max_tokens": maxTokens.map(String.init) ?? "none"]
+         "max_tokens": maxTokens.map(String.init) ?? "none",
+         "initial_state_scope": stateScope.rawValue]
     }
 
     /// Собрать из метаданных чекпоинта.
@@ -58,6 +64,7 @@ public struct EmbeddingContract: Sendable, Equatable {
         if let v = md["pooling"], let p = Pooling(rawValue: v) { pooling = p }
         if let v = md["terminator"] { terminator = v == "none" ? nil : Int(v) }
         if let v = md["max_tokens"] { maxTokens = v == "none" ? nil : Int(v) }
+        if let v = md["initial_state_scope"], let s = InitialStateScope(rawValue: v) { stateScope = s }
     }
 }
 
@@ -98,7 +105,7 @@ extension EmbeddingModel {
     ///   молча, и единственное место, где это ловится, — загрузка.
     public func saveHead(to url: URL, contract: EmbeddingContract? = nil,
                          extra: [String: String]? = nil) throws {
-        let c = contract ?? EmbeddingContract(pooling: pooling)
+        let c = contract ?? EmbeddingContract(pooling: pooling, stateScope: stateScope)
         var md = c.metadata
         md["format"] = Self.checkpointFormat
         md["dim"] = String(head.dim)
@@ -150,6 +157,14 @@ extension EmbeddingModel {
                     key: "pooling", file: want.pooling.rawValue,
                     now: pooling.rawValue)
             }
+            // Область состояния — тоже часть модели: голова, обученная с
+            // состоянием только на запросах, на векторах документов с ним
+            // даёт другую геометрию.
+            if want.stateScope != stateScope {
+                throw EmbeddingCheckpointError.contractMismatch(
+                    key: "initial_state_scope", file: want.stateScope.rawValue,
+                    now: stateScope.rawValue)
+            }
         }
         let names = EmbeddingHead.parameterNames
         let missing = names.filter { weights[$0] == nil }
@@ -177,7 +192,7 @@ extension EmbeddingModel {
         let hidden = md["hidden"].flatMap { Int($0) } ?? dim
         let head = EmbeddingHead(dim: dim, hidden: hidden)
         let model = EmbeddingModel(backbone: backbone, head: head,
-                                   pooling: contract.pooling)
+                                   pooling: contract.pooling, stateScope: contract.stateScope)
         try model.loadHead(from: url)
         return (model, contract)
     }

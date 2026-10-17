@@ -34,11 +34,18 @@ public enum EmbeddingObjective {
         tripletLoss(model, batch, temperature: temperature, symmetric: true)
     }
 
+    /// Роли пачек триплета (якорь, положительный, отрицательный): у retrieval —
+    /// запрос и документы, у sts стороны равноправны — все «запросы».
+    static func tripletRoles(symmetric: Bool) -> [TextRole] {
+        symmetric ? [.query, .query, .query] : [.query, .document, .document]
+    }
+
     static func tripletLoss(_ model: EmbeddingModel, _ batch: TripletBatch,
                             temperature: Float, symmetric: Bool) -> MLXArray {
-        let a = model.embed(batch.anchorIdx, poolIndex: batch.anchorPool)
-        let p = model.embed(batch.positiveIdx, poolIndex: batch.positivePool)
-        let n = model.embed(batch.negativeIdx, poolIndex: batch.negativePool)
+        let roles = tripletRoles(symmetric: symmetric)
+        let a = model.embed(batch.anchorIdx, poolIndex: batch.anchorPool, role: roles[0])
+        let p = model.embed(batch.positiveIdx, poolIndex: batch.positivePool, role: roles[1])
+        let n = model.embed(batch.negativeIdx, poolIndex: batch.negativePool, role: roles[2])
         return tripletPoolLoss(anchor: a, positive: p, negative: n,
                                temperature: temperature, symmetric: symmetric)
     }
@@ -49,12 +56,12 @@ public enum EmbeddingObjective {
     public static func classificationLoss(_ model: EmbeddingModel,
                                           _ batch: ClassificationBatch,
                                           temperature: Float = 0.05) -> MLXArray {
-        let anchor = model.embed(batch.anchorIdx, poolIndex: batch.anchorPool)  // [B,D]
+        let anchor = model.embed(batch.anchorIdx, poolIndex: batch.anchorPool, role: .query)  // [B,D]
         let B = batch.candidateIdx.shape[0]
         let K = batch.candidateIdx.shape[1]
         let T = batch.candidateIdx.shape[2]
         let flat = model.embed(batch.candidateIdx.reshaped([B * K, T]),
-                               poolIndex: batch.candidatePool.reshaped([B * K]))
+                               poolIndex: batch.candidatePool.reshaped([B * K]), role: .document)
         let candidates = flat.reshaped([B, K, -1])                              // [B,K,D]
         return zeroShotClassificationLoss(anchor: anchor, candidates: candidates,
                                           mask: batch.mask,
@@ -100,19 +107,26 @@ public enum EmbeddingObjective {
     /// (лосс, градиенты в порядке `trainable.parameterNames`). `groups` —
     /// пачки, которые модель векторизует порознь (якоря, положительные, …);
     /// `loss` получает их векторы в том же порядке. `chunkTokens` — см. `pieces`.
+    /// `roles` — роль каждой пачки (`EmbeddingModel.stateScope`); и прямой
+    /// проход куска, и пересчёт его блоков в обратном идут под ролью его пачки.
     static func sequentialValueAndGrad(
         model: EmbeddingModel, trainable: TrainableSet, parameters: [MLXArray],
-        groups: [(idx: MLXArray, pool: MLXArray)], chunkTokens: Int = 0, traceStride: Int = 1,
+        groups: [(idx: MLXArray, pool: MLXArray)], roles: [TextRole]? = nil,
+        chunkTokens: Int = 0, traceStride: Int = 1,
         loss: @escaping ([MLXArray]) -> MLXArray
     ) -> (loss: MLXArray, gradients: [MLXArray]) {
+        precondition(roles == nil || roles!.count == groups.count, "ролей \(roles!.count), пачек \(groups.count)")
         sequentialCalls += 1
         let bb = model.backbone
         let plan = SequentialBody.Plan(names: trainable.parameterNames, nLayer: bb.cfg.nLayer)
         let parts = pieces(of: groups, chunkTokens: chunkTokens)
+        func role(_ part: Int) -> TextRole? { roles?[parts[part].group] }
 
         // 1. прямой проход каждого куска без градиента
         trainable.inject(parameters)
-        let traces = parts.map { SequentialBody.forward(bb, ids: $0.idx, plan: plan, stride: traceStride) }
+        let traces = parts.indices.map { c in
+            model.building(role(c)) { SequentialBody.forward(bb, ids: parts[c].idx, plan: plan, stride: traceStride) }
+        }
 
         // 2. всё, что над телом: ln_out, пулинг, голова, лосс — по выходам
         //    последнего блока и по параметрам «над телом» (голова, ln_out)
@@ -138,8 +152,10 @@ public enum EmbeddingObjective {
 
         // 3. блоки сверху вниз, кусок за куском
         for (k, trace) in traces.enumerated() {
-            SequentialBody.backward(bb, trace: trace, dTop: g[k], parameters: parameters, plan: plan,
-                                    inject: { trainable.inject($0) }, grads: &grads)
+            model.building(role(k)) {
+                SequentialBody.backward(bb, trace: trace, dTop: g[k], parameters: parameters, plan: plan,
+                                        inject: { trainable.inject($0) }, grads: &grads)
+            }
         }
         return (value[0], grads.enumerated().map { i, g in
             g ?? MLXArray.zeros(parameters[i].shape, dtype: parameters[i].dtype)
@@ -156,6 +172,7 @@ public enum EmbeddingObjective {
                 model: model, trainable: trainable, parameters: params,
                 groups: [(batch.anchorIdx, batch.anchorPool), (batch.positiveIdx, batch.positivePool),
                          (batch.negativeIdx, batch.negativePool)],
+                roles: tripletRoles(symmetric: symmetric),
                 chunkTokens: chunkTokens, traceStride: traceStride,
                 loss: { v in
                     tripletPoolLoss(anchor: v[0], positive: v[1], negative: v[2],
@@ -176,6 +193,7 @@ public enum EmbeddingObjective {
                 model: model, trainable: trainable, parameters: params,
                 groups: [(batch.anchorIdx, batch.anchorPool),
                          (batch.candidateIdx.reshaped([B * K, T]), batch.candidatePool.reshaped([B * K]))],
+                roles: [.query, .document],
                 chunkTokens: chunkTokens, traceStride: traceStride,
                 loss: { v in
                     zeroShotClassificationLoss(anchor: v[0], candidates: v[1].reshaped([B, K, -1]),
@@ -214,6 +232,7 @@ public enum EmbeddingObjective {
 
         precondition(chunkSize > 0, "chunkSize должен быть положительным")
 
+        let roles = tripletRoles(symmetric: symmetric)
         return { params, batch in
             let B = batch.batchSize
             let starts = chunkStarts(batch: B, chunkSize: chunkSize)
@@ -226,11 +245,11 @@ public enum EmbeddingObjective {
                     let end = Swift.min(start + chunkSize, B)
                     return [
                         model.embed(batch.anchorIdx[start ..< end],
-                                    poolIndex: batch.anchorPool[start ..< end]),
+                                    poolIndex: batch.anchorPool[start ..< end], role: roles[0]),
                         model.embed(batch.positiveIdx[start ..< end],
-                                    poolIndex: batch.positivePool[start ..< end]),
+                                    poolIndex: batch.positivePool[start ..< end], role: roles[1]),
                         model.embed(batch.negativeIdx[start ..< end],
-                                    poolIndex: batch.negativePool[start ..< end]),
+                                    poolIndex: batch.negativePool[start ..< end], role: roles[2]),
                     ]
                 },
                 lossFromEmbeddings: { fields in

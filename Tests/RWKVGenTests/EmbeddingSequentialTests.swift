@@ -162,6 +162,98 @@ final class EmbeddingSequentialTests: XCTestCase {
         }
     }
 
+    // ── Состояние только для запросов (`InitialStateScope.queriesOnly`) ──
+
+    /// Подключить ненулевое состояние, не делая его обучаемым (режимы базы).
+    func attachState(_ model: EmbeddingModel) {
+        MLXRandom.seed(78)
+        let z = model.backbone.zeroInitialState()
+        model.backbone.initialState = RWKVBatchState(
+            wkv: MLXRandom.normal(z.wkv.shape) * 0.05,
+            tmixShift: MLXRandom.normal(z.tmixShift.shape) * 0.5,
+            cmixShift: MLXRandom.normal(z.cmixShift.shape) * 0.5)
+    }
+
+    /// Эталон — автоград на ТОМ ЖЕ составе пачек и кусков: обратный проход по
+    /// блокам, GradCache и куски по строкам обязаны дать тот же градиент, что
+    /// автоград eager-пути, когда документы идут без состояния. Пересчёт блока
+    /// документа в обратном проходе без роли дал бы градиент состояния от
+    /// документа, которого в прямом проходе не было.
+    func testQueriesOnlyGradientsMatchAutograd() {
+        for (what, mode) in [("состояние", BaseTrainingMode.state()),
+                             ("состояние со сдвигами", .state(parts: StateTrainableSet.Part.allCases)),
+                             ("вся база при подключённом состоянии", .full)] {
+            let (model, set, ps) = prepare(mode)
+            if mode == .full { attachState(model) }
+            model.stateScope = .queriesOnly
+            let b = triplets()
+            check("только запросы, \(what)", set, ps,
+                  eager: { EmbeddingObjective.tripletLoss(model, b, temperature: 0.05, symmetric: false) },
+                  sequential: {
+                      EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                            symmetric: false)(ps, b)
+                  })
+            check("только запросы, \(what), куски по 16 токенов", set, ps,
+                  eager: { EmbeddingObjective.tripletLoss(model, b, temperature: 0.05, symmetric: false) },
+                  sequential: {
+                      EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                            symmetric: false, chunkTokens: 16)(ps, b)
+                  })
+            check("только запросы, \(what), GradCache по 2 строки", set, ps,
+                  eager: { EmbeddingObjective.tripletLoss(model, b, temperature: 0.05, symmetric: false) },
+                  sequential: {
+                      EmbeddingObjective.gradCacheProvider(model: model, trainable: set, chunkSize: 2,
+                                                           temperature: 0.05, symmetric: false)(ps, b)
+                  })
+            let c = classification()
+            check("только запросы, классификация, \(what)", set, ps,
+                  eager: { EmbeddingObjective.classificationLoss(model, c, temperature: 0.05) },
+                  sequential: {
+                      EmbeddingObjective.sequentialClassificationProvider(model: model, trainable: set,
+                                                                          temperature: 0.05)(ps, c)
+                  })
+        }
+    }
+
+    /// Независимый эталон смысла: при `.queriesOnly` градиент тот же, что у
+    /// лосса, где положительные и отрицательные посчитаны с ОТКЛЮЧЁННЫМ
+    /// состоянием (подключённые слои сняты на время их прохода — другой
+    /// механизм, не тот, что проверяется), а якорь — с ним. И он не равен
+    /// градиенту при `.allTexts`: иначе роль ничего не меняла бы.
+    func testQueriesOnlyLearnsStateFromQueriesOnly() {
+        let (model, set, ps) = prepare(.state())
+        let b = triplets()
+        let bb = model.backbone
+        let vg = valueAndGrad({ (p: [MLXArray]) -> [MLXArray] in
+            set.inject(p)
+            let a = model.embed(b.anchorIdx, poolIndex: b.anchorPool)
+            let layers = bb.initialLayers
+            bb.initialLayers = nil
+            let pos = model.embed(b.positiveIdx, poolIndex: b.positivePool)
+            let neg = model.embed(b.negativeIdx, poolIndex: b.negativePool)
+            bb.initialLayers = layers
+            return [tripletPoolLoss(anchor: a, positive: pos, negative: neg, temperature: 0.05,
+                                    symmetric: false).asType(.float32)]
+        }, argumentNumbers: Array(ps.indices))
+        let (vRef, gRef) = vg(ps)
+        eval(vRef + gRef)
+        set.inject(ps)
+        model.stateScope = .queriesOnly
+        let r = EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                      symmetric: false)(ps, b)
+        eval([r.loss] + r.gradients)
+        XCTAssertEqual(r.loss.item(Float.self), vRef[0].item(Float.self), accuracy: 1e-5)
+        for (i, name) in set.parameterNames.enumerated() {
+            XCTAssertLessThan(rel(gRef[i], r.gradients[i]), 1e-5, name)
+        }
+        model.stateScope = .allTexts
+        let all = EmbeddingObjective.sequentialProvider(model: model, trainable: set, temperature: 0.05,
+                                                        symmetric: false)(ps, b)
+        eval(all.gradients)
+        XCTAssertGreaterThan(rel(all.gradients[0], r.gradients[0]), 1e-2,
+                             "градиент состояния не зависит от роли документов")
+    }
+
     /// Тело по строкам (`bodyChunkTokens`): пачки режутся на куски строк, каждый
     /// идёт через тело порознь, лосс видит весь батч. Градиент тот же, что у
     /// автограда; кусков ровно столько, сколько следует из длин пачек (16 / 32 /
