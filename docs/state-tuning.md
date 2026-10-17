@@ -213,6 +213,36 @@ over the control (+0.004…+0.007) is at the edge of significance. The state was
 attached to the model, so it applied to the documents too, not only to the
 queries.
 
+**Query-only state (17.10).** The same measurement on `reduction`, re-run with
+the state applied to queries only (`stateScope = .queriesOnly`: documents are
+embedded exactly as with no state, and the state learns only from queries),
+next to a re-run of the all-texts variant and of the control on the same seeds
+(first stage 200 steps, second 200 steps at lr 1e-4, 300 held-out queries, 10 000
+paired bootstrap resamples over queries; the first stage is identical across the
+three arms of a seed):
+
+| state applied to | with instruction | without | after the second stage |
+|---|---|---|---|
+| all texts | 0.757 | 0.748 | 0.756 |
+| queries only | 0.757 | 0.748 | 0.752 |
+| — (control: head) | 0.757 | 0.748 | 0.750 |
+
+| difference | Δ MRR [95 %] |
+|---|---|
+| queries only − all texts | −0.004 [−0.010; +0.002] |
+| queries only − with instruction | −0.004 [−0.014; +0.005] |
+| all texts − with instruction | −0.000 [−0.012; +0.011] |
+| queries only − control | +0.003 [−0.004; +0.010] |
+| all texts − control | +0.007 [−0.000; +0.013] |
+
+The all-texts arm reproduces the earlier numbers exactly. Restricting the state
+to queries — the way the instruction itself was used — does **not** help: it is
+slightly below the all-texts state and indistinguishable from the control. All
+intervals contain zero. A plausible reading is that a state on both sides can
+move documents and queries together and so has more room to fit, while the
+query-only state carries the whole adjustment alone; on single-instruction data
+there is little for either to recover (−0.009 from dropping the instruction).
+
 ### Cost of a step
 
 Embedder, state and head trained; all three texts of a triplet at full length
@@ -239,8 +269,6 @@ compressed base fits at 1 × 512, where its top layers do not.
 
 ## Not done
 
-- A state attached to queries only (the way an instruction is used) needs the
-  attached state switched per text; it was not measured.
 - Instructions that differ per query (several tasks, long instructions) — where
   a state could gain more than on the single-instruction data above — were not
   measured.

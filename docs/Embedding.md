@@ -434,9 +434,15 @@ costs little in the first place (−0.007…−0.009), and the state's edge over
 control (+0.004…+0.007) is at the edge of significance. State lr 1e-4; 1e-3
 made things worse (0.704 against 0.745 without the instruction). In this
 measurement the state is attached to the model, so it applies to every text —
-documents included, which never had the instruction. Attaching it to queries
-only, the way the instruction was used, needs the attached state switched per
-text and was not measured.
+documents included, which never had the instruction.
+
+Applied to queries only (below), the same measurement on `reduction` gives
+0.752 against 0.756 for the all-texts state and 0.750 for the control: queries
+only − all texts −0.004 [−0.010; +0.002], queries only − control +0.003
+[−0.004; +0.010] (three seeds, paired bootstrap over 300 queries; the all-texts
+arm reproduces the table above exactly). On this data restricting the state to
+queries does not help; details in
+[state-tuning.md](state-tuning.md#in-place-of-the-instruction).
 
 #### Attaching the state to queries only
 
