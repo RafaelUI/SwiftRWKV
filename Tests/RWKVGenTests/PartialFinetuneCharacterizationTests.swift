@@ -1,6 +1,7 @@
 import XCTest
 import MLX
 import MLXRandom
+import MLXNN
 @testable import RWKVGen
 @testable import RWKVKernel
 
@@ -274,5 +275,98 @@ final class PartialFinetuneCharacterizationTests: XCTestCase {
         XCTAssertGreaterThan(MLX.abs(a.params["head.weight"]! - c.params["head.weight"]!).max().item(Float.self), 0,
                              "сид не влияет на начальные веса головы")
         XCTAssertNotEqual(la, lc, "сид не влияет на порядок примеров или голову")
+    }
+
+    // ── Эталон цикла обучения (перенос на общий Trainer, 17.10) ─────
+
+    /// Прежний собственный цикл X070PartialFinetune — дословно (после
+    /// выравнивания порядка операций в шаге Adam с Trainer): эпохи, по
+    /// эпохе перестановка от SplitMix64(seed), батчи с неполным последним,
+    /// Adam β₂ = 0.999 без отсечения и затухания, постоянный шаг.
+    func referenceTrain(backbone: X070Backbone, trainCache tc: X070BoundaryCache, cfg: X070Config,
+                        numClasses: Int, freeze: Int, epochs: Int, batchSize: Int, lr: Float,
+                        seed: UInt64) -> (params: [String: MLXArray], losses: [Float]) {
+        let dim = cfg.nEmbd
+        let trainLayerSet = Set(freeze ..< cfg.nLayer)
+        var keys = backbone.w.keys.filter { k in (freeze ..< cfg.nLayer).contains { k.hasPrefix("blocks.\($0).") } }
+        keys.append("ln_out.weight"); keys.append("ln_out.bias"); keys.sort()
+        let nBB = keys.count
+        var params: [MLXArray] = keys.map { backbone.w[$0]!.asType(.float32) }
+        params.append(MLXRandom.normal([numClasses, dim], key: MLXRandom.key(seed)) * 0.02)
+        params.append(MLXArray.zeros([numClasses]))
+        eval(params)
+        func logits(_ ps: [MLXArray], _ x: MLXArray, _ vf: MLXArray, _ lens: [Int]) -> MLXArray {
+            var ov: [String: MLXArray] = [:]
+            for j in 0 ..< nBB { ov[keys[j]] = ps[j] }
+            backbone.wOverride = ov; backbone.trainLayers = trainLayerSet
+            let pooled = X070Pooling.pool(backbone.forwardFrom(x, vf, from: freeze), lengths: lens, kind: .mean)
+            return matmul(pooled, ps[nBB].transposed()) + ps[nBB + 1]
+        }
+        var m = params.map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
+        var v = params.map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
+        var t = 0
+        var rng = SplitMix64(seed: seed)
+        var losses: [Float] = []
+        for _ in 0 ..< epochs {
+            var perm = Array(0 ..< tc.count); perm.shuffle(using: &rng)
+            var s0 = 0
+            while s0 < tc.count {
+                let e = min(s0 + batchSize, tc.count), idx = Array(perm[s0 ..< e])
+                backbone.wOverride = nil; backbone.trainLayers = []
+                let x = tc.readX(idx).asType(.float32)
+                let vf = backbone.vFirstFrom(tc.idsBatch(idx)).asType(.float32)
+                eval(x, vf)
+                let y = MLXArray(idx.map { tc.label[$0] }), lens = idx.map { tc.length[$0] }
+                let (vals, grads) = valueAndGrad({ (ps: [MLXArray]) -> [MLXArray] in
+                    [crossEntropy(logits: logits(ps, x, vf, lens), targets: y, reduction: .mean)]
+                }, argumentNumbers: Array(params.indices))(params)
+                t += 1
+                let c1 = 1 - Float(pow(Double(Float(0.9)), Double(t)))
+                let c2 = 1 - Float(pow(Double(Float(0.999)), Double(t)))
+                for i in params.indices {
+                    m[i] = Float(0.9) * m[i] + (1 - Float(0.9)) * grads[i]
+                    v[i] = Float(0.999) * v[i] + (1 - Float(0.999)) * (grads[i] * grads[i])
+                    let mhat = m[i] / c1, vhat = v[i] / c2
+                    params[i] = params[i] - lr * (mhat / (sqrt(vhat) + Float(1e-8)))
+                }
+                eval(params + m + v)
+                losses.append(vals[0].item(Float.self))
+                s0 = e
+            }
+        }
+        backbone.wOverride = nil; backbone.trainLayers = []
+        var out: [String: MLXArray] = [:]
+        for j in 0 ..< nBB { out[keys[j]] = params[j] }
+        out["head.weight"] = params[nBB]; out["head.bias"] = params[nBB + 1]
+        return (out, losses)
+    }
+
+    /// Обучение на общем Trainer ПОБИТНО равно прежнему собственному циклу:
+    /// веса, лоссы по шагам; верх из одного и из двух слоёв, неполный батч.
+    func testTrainerPathEqualsReferenceLoop() {
+        for (freeze, n) in [(2, 10), (1, 14)] {
+            let (bb, cfg) = TinyBackbone.make(nLayer: 3, seed: 42)
+            let tc = X070PartialFinetune.buildBoundaryCache(backbone: bb, examples: examples(n, classes: 3),
+                                                            freeze: freeze, name: "train", ctxLen: Self.ctxLen)
+            let vc = X070PartialFinetune.buildBoundaryCache(backbone: bb, examples: examples(4, classes: 3, seed: 99),
+                                                            freeze: freeze, name: "val", ctxLen: Self.ctxLen)
+            var losses: [Float] = [], atEpoch: [Int] = []
+            let got = X070PartialFinetune.train(backbone: bb, trainCache: tc, valCache: vc, cfg: cfg, numClasses: 3,
+                                                freeze: freeze, epochs: 3, batchSize: 4, lr: 1e-3, seed: 11,
+                                                onStep: { _, l, _ in losses.append(l) },
+                                                onEpoch: { _, _ in atEpoch.append(losses.count) })
+            let ref = referenceTrain(backbone: bb, trainCache: tc, cfg: cfg, numClasses: 3, freeze: freeze,
+                                     epochs: 3, batchSize: 4, lr: 1e-3, seed: 11)
+            XCTAssertEqual(losses, ref.losses, "freeze \(freeze): лоссы по шагам")
+            let perEpoch = (n + 3) / 4
+            XCTAssertEqual(losses.count, 3 * perEpoch)
+            XCTAssertEqual(atEpoch, [perEpoch, 2 * perEpoch, 3 * perEpoch], "точность не на границах эпох")
+            XCTAssertEqual(got.params.keys.sorted(), ref.params.keys.sorted())
+            for (k, r) in ref.params {
+                XCTAssertEqual(MLX.abs(got.params[k]! - r).max().item(Float.self), 0, "freeze \(freeze): \(k)")
+            }
+            XCTAssertNil(bb.wOverride, "подмена весов осталась после обучения")
+            XCTAssertTrue(bb.trainLayers.isEmpty)
+        }
     }
 }

@@ -385,7 +385,7 @@ let val = X070PartialFinetune.buildBoundaryCache(
 
 let result = X070PartialFinetune.train(
     backbone: base, trainCache: train, valCache: val, cfg: base.cfg,
-    numClasses: 2, freeze: 8, epochs: 5, batchSize: 8, lr: 1e-4,
+    numClasses: 2, freeze: 8, epochs: 5, batchSize: 8, lr: 1e-4, seed: 0,
     onEpoch: { epoch, acc in print(epoch, acc) })
 print(result.valAcc, result.params.count)
 
@@ -396,9 +396,20 @@ The boundary cache is the same idea as the reranker's state cache: a frozen
 prefix is a fixed function, so compute it once. `ctxLen` must be a multiple of
 16.
 
-This path has its own epoch loop rather than using `Trainer` — shuffling and
-per-epoch accuracy are a different control structure.
-`BackboneWeightsTrainableSet` is ready for a port when one is wanted.
+Training runs on the shared `Trainer` (Adam with β₂ = 0.999, no clipping, no
+weight decay, constant step), one trainer run per epoch with the accuracy in
+between. The model is not modified: trained weights come back in
+`result.params`, as before. `seed:` fixes both the classifier's initial weights
+and the example order, so a seeded run is bit-reproducible; without it the
+order comes from the system generator.
+
+The move to `Trainer` (17.10) went in three steps so that only one of them
+could change numbers: a seed first; then the Adam step rewritten in `Trainer`'s
+order of operations, `lr·(m̂/(√v̂+ε))` instead of `(lr·m̂)/(√v̂+ε)` — the last bit
+differs in about a third of the elements per step, losses agree to 1e-7 and
+accuracies are the same; then the port itself, bit-identical to that loop (a
+test keeps the former loop as a reference and compares weights and per-step
+losses bit for bit).
 
 ---
 
@@ -529,14 +540,6 @@ legitimate training input.
 
 ## Not done
 
-- **`X070PartialFinetune` is not on the shared trainer, and moving it would
-  change its numbers.** Its Adam step is `lr·m̂ / (√v̂ + ε)`, `Trainer`'s is
-  `lr · (m̂ / (√v̂ + ε))`; in fp32 the two differ by one ulp in about a third of
-  the elements on every step (measured on 10⁵ random moments). Its β₂ is 0.999,
-  not `Trainer`'s default, and its batch order and classifier initialisation
-  come from the system RNG, so even its own runs are not bit-reproducible
-  today. Moving it is a choice between accepting a one-ulp-per-step change and
-  giving `Trainer` a second update order.
 - **The backbone is fingerprinted only in state files** (`StateFile`). Adapter
   and head checkpoints still are not: a head trained on one backbone and loaded
   onto another differs in neither shape nor contract.

@@ -75,6 +75,30 @@ public struct X070BoundaryCache {
     }
 }
 
+/// Батч partial finetune: вход границы и vFirst посчитаны заранее, вне
+/// трассировки градиента.
+struct PartialBatch {
+    let x: MLXArray
+    let vFirst: MLXArray
+    let labels: MLXArray
+    let lengths: [Int]
+}
+
+/// Обучаемое множество partial finetune: веса верхних слоёв и голова. Модель
+/// не трогает: веса подставляет сама цель (`logits` — через `wOverride`), а
+/// обученное отдаётся вызывающему в `TrainResult.params`, как и прежде.
+final class PartialTrainableSet: TrainableSet {
+    let parameterNames: [String]
+    private(set) var current: [MLXArray]
+    private var master: [MLXArray]
+    init(names: [String], initial: [MLXArray]) {
+        parameterNames = names; current = initial; master = initial
+    }
+    func initialParameters() -> [MLXArray] { master }
+    func inject(_ ps: [MLXArray]) { current = ps }
+    func commit(_ ps: [MLXArray]) { current = ps; master = ps }
+}
+
 public enum X070PartialFinetune {
 
     public struct TrainResult {
@@ -214,52 +238,52 @@ public enum X070PartialFinetune {
             return Float(correct) / Float(max(total, 1))
         }
 
-        var m = params.map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
-        var v = params.map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
-        let b1: Float = 0.9, b2: Float = 0.999, aeps: Float = 1e-8
-        var t = 0
-
+        // Обучение — общим Trainer (AdamW без затухания и отсечения, постоянный
+        // шаг, β₂ = 0.999 — как прежний собственный цикл, побитно). Эпоха —
+        // прогон тренера до её последнего шага: между эпохами — точность.
+        // Батч собирается ВНЕ трассировки градиента (`nextBatch`): вход границы
+        // с диска и vFirst слоя 0 считаются при снятой подмене весов.
         let N = trainCache.count
         var rng = seed.map { SplitMix64(seed: $0) }
+        let trainable = PartialTrainableSet(names: keys + ["head.weight", "head.bias"], initial: params)
+        let stepsPerEpoch = (N + batchSize - 1) / batchSize
+        var perm: [Int] = []
+        var cursor = 0
+        func nextBatch() -> PartialBatch {
+            if cursor >= perm.count {
+                perm = Array(0 ..< N)
+                if rng != nil { perm.shuffle(using: &rng!) } else { perm.shuffle() }
+                cursor = 0
+            }
+            let e = min(cursor + batchSize, N)
+            let idx = Array(perm[cursor ..< e])
+            cursor = e
+            let (x, vf) = inputs(trainCache, idx)
+            return PartialBatch(x: x, vFirst: vf, labels: MLXArray(idx.map { trainCache.label[$0] }),
+                                lengths: idx.map { trainCache.length[$0] })
+        }
+        let trainer = Trainer<PartialBatch>(
+            trainable: trainable,
+            objective: { b in
+                crossEntropy(logits: logits(trainable.current, b.x, b.vFirst, b.lengths),
+                             targets: b.labels, reduction: .mean)
+            },
+            nextBatch: nextBatch,
+            config: TrainingConfig(lr: lr, lrMin: lr, schedule: .constant, warmupSteps: 0,
+                                   gradClip: 0, weightDecay: 0, beta1: 0.9, beta2: 0.999, adamEps: 1e-8,
+                                   maxSteps: epochs * stepsPerEpoch, gradAccum: 1,
+                                   cacheLimitGB: 0, logEvery: 1))
+
         var step = 0
         for epoch in 0 ..< epochs {
             if isCancelled() { break }
-            var perm = Array(0 ..< N)
-            if rng != nil { perm.shuffle(using: &rng!) } else { perm.shuffle() }
-            var s = 0
-            while s < N {
-                if isCancelled() { break }
-                let e = min(s + batchSize, N)
-                let idx = Array(perm[s ..< e])
-                let y = MLXArray(idx.map { trainCache.label[$0] })
-                let lens = idx.map { trainCache.length[$0] }
-
-                let (x, vf) = inputs(trainCache, idx)
-
-                let vg = valueAndGrad({ (ps: [MLXArray]) -> [MLXArray] in
-                    [crossEntropy(logits: logits(ps, x, vf, lens),
-                                  targets: y, reduction: .mean)]
-                }, argumentNumbers: Array(params.indices))
-                let (vals, grads) = vg(params)
-
-                t += 1
-                let c1 = 1 - Float(pow(Double(b1), Double(t)))
-                let c2 = 1 - Float(pow(Double(b2), Double(t)))
-                for i in params.indices {
-                    m[i] = b1 * m[i] + (1 - b1) * grads[i]
-                    v[i] = b2 * v[i] + (1 - b2) * (grads[i] * grads[i])
-                    // Порядок операций — как в общем Trainer: lr · (m̂ / (√v̂ + ε)).
-                    // Прежний (lr · m̂) / (√v̂ + ε) расходился с ним в последнем
-                    // бите у трети элементов на каждом шаге.
-                    let mhat = m[i] / c1, vhat = v[i] / c2
-                    params[i] = params[i] - lr * (mhat / (sqrt(vhat) + aeps))
-                }
-                eval(params + m + v)
-
-                step += 1
-                onStep(step, vals[0].item(Float.self), residentMemoryMB())
-                s = e
-            }
+            let epochEnd = (epoch + 1) * stepsPerEpoch
+            trainer.run(isCancelled: { isCancelled() || step >= epochEnd },
+                        onStep: { s in
+                step = s.step
+                onStep(s.step, s.loss, s.peakMemoryMB)
+            })
+            params = trainer.currentParameters
             if isCancelled() { break }
             onEpoch(epoch + 1, accuracy(valCache))
         }

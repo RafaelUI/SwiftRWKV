@@ -703,6 +703,3 @@ IOAccelerator and only partly show up in `ps -o rss`. Use
 - **GradCache throughput is not measured.** Peak memory is; the Python
   figures (batch 48: eager 9.68 GB vs 3.20 GB) did not reproduce in Swift and
   are not claimed here.
-- **`X070PartialFinetune` is not on the shared trainer.** Moving it would
-  change its numbers (a different order of operations in the Adam step, one
-  ulp per step) — see [Train.md](Train.md#not-done).

@@ -831,7 +831,7 @@ func doc_Train_8() throws {
 
     let result = X070PartialFinetune.train(
         backbone: base, trainCache: train, valCache: val, cfg: base.cfg,
-        numClasses: 2, freeze: 8, epochs: 5, batchSize: 8, lr: 1e-4,
+        numClasses: 2, freeze: 8, epochs: 5, batchSize: 8, lr: 1e-4, seed: 0,
         onEpoch: { epoch, acc in print(epoch, acc) })
     print(result.valAcc, result.params.count)
 
