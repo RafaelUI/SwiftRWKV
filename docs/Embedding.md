@@ -233,10 +233,57 @@ try model.saveHead(to: URL(fileURLWithPath: "runs/embedding_head.safetensors"))
 Each stage evaluates before and after, so `StageResult.delta` says what the
 stage actually did rather than what it was supposed to do.
 
-Across a curriculum the trainable set is built **once**. It holds an fp32
-master copy of the parameters; rebuilding it per stage would take the master
-from the model again — i.e. discard the precision accumulated by the previous
-stage by rounding back to the weights' bf16 representation.
+Across a curriculum the trainable set is built **once**, and each stage
+starts from what the set reads back from the model. That is exact for the head
+(fp32), for a state (fp32) and for top layers unpacked from a `.rwkvq` (fp32);
+top layers of a bf16 base and LoRA adapters are committed in bf16 at the end of
+a stage, so the next stage starts from the bf16-rounded values, not from the
+fp32 master of the previous one. (An earlier version of this paragraph claimed
+an fp32 master survives between stages; reading the code, it does not for
+those two. Changing it would change the numbers of every multi-stage run, so it
+is recorded, not changed.)
+
+#### Running a curriculum with a report and resumption
+
+`EmbeddingCurriculum.run` runs the same stages in a run directory: after
+**every** stage it writes `curriculum.json` (before / after metrics, final
+loss, steps, time) and `stage<i>.params.safetensors` (the trainable set's
+parameters by name). Run it again with the same plan and it continues with the
+first unfinished stage; a stage interrupted half-way starts over from the
+previous stage's parameters. Each stage has its own data seed and its own
+optimiser (as in `EmbeddingFinetune.run`), so a run killed in the middle and
+resumed with a freshly built model gives **bit-identical** parameters and
+metrics to one that never stopped — a test holds this for the head, top layers
+and a state, and that the runner equals `EmbeddingFinetune.run`. A different
+plan (stages, data, steps, mode, state scope) in the same directory is refused.
+Build the model the same way both times (same base, same unpacked layers, same
+attached state): the runner stores the trainable set, not the base.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+guard let tok = WorldTokenizer(
+        vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+    fatalError("cannot read vocabulary")
+}
+let model = EmbeddingModel(backbone: base)
+let rows = try EmbeddingDataset.loadJSONL(path: "~/data/litretrieval.jsonl", limit: 2000)
+func stage(_ task: EmbeddingTask, steps: Int) -> EmbeddingStage {
+    let r = rows.filter { $0.task == task }
+    return EmbeddingStage(task: task, train: Array(r.dropLast(100)), heldOut: Array(r.suffix(100)),
+                          config: TrainingConfig(lr: 2e-5, maxSteps: steps), batchSize: 8)
+}
+let report = try EmbeddingCurriculum.run(
+    model: model, tokenizer: tok, mode: .topLayers(4),
+    stages: [stage(.retrieval, steps: 600), stage(.sts, steps: 200)],
+    directory: URL(fileURLWithPath: "runs/curriculum"),
+    onStage: { i, r in print(i, r.after?.description ?? "—") })
+print(report.finished, report.stages.map { $0.after ?? .nan })
+```
+
+From the command line: `embed-run --curriculum plan.json --run-dir dir`, where
+`plan.json` is an array of stages whose keys (`data`, `task`, `train`, `eval`,
+`steps`, `lr`, `seed`, `batch`, `max_tokens`, `max_chars`, `sample_seed`,
+`limit`) override the command-line ones.
 
 The tokeniser is checked against the model vocabulary once per stage. Without
 it, an out-of-range embedding lookup does not fail in MLX: the loss becomes
@@ -650,19 +697,12 @@ IOAccelerator and only partly show up in `ps -o rss`. Use
 
 ## Not done
 
-- **No runner target.** The reranker has `rerank-run` end to end; embeddings
-  are library-only. A curriculum has no incremental report either, so a run
-  killed halfway leaves no trace.
-- **Reservoir sampling is not wired in.** `EmbeddingDataset.loadJSONL` reads
-  from the start up to `limit`, so a slice of a 2.6 GB corpus is its
-  beginning, not a sample of it. `RerankDataset.loadJSONL` already does this
-  properly and the code transfers by copying.
 - **The backbone is not recorded in the checkpoint.** A head trained on one
   backbone and loaded onto another differs in neither shape nor contract. A
   weight fingerprint would close this.
 - **GradCache throughput is not measured.** Peak memory is; the Python
   figures (batch 48: eager 9.68 GB vs 3.20 GB) did not reproduce in Swift and
   are not claimed here.
-- **`X070PartialFinetune` is not on the shared trainer.** Its loop is
-  epoch-based with shuffling and per-epoch accuracy — a different control
-  structure. `BackboneWeightsTrainableSet` is ready for it.
+- **`X070PartialFinetune` is not on the shared trainer.** Moving it would
+  change its numbers (a different order of operations in the Adam step, one
+  ulp per step) — see [Train.md](Train.md#not-done).

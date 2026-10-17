@@ -529,11 +529,14 @@ legitimate training input.
 
 ## Not done
 
-- **Embedding curricula have no runner.** `embed-run` runs one stage (and the
-  two-stage "state in place of the instruction" measurement) and writes a
-  report; a multi-stage curriculum is library-only and leaves no incremental
-  report, so a run killed halfway leaves no trace.
-- **`X070PartialFinetune` is not on the shared trainer.**
+- **`X070PartialFinetune` is not on the shared trainer, and moving it would
+  change its numbers.** Its Adam step is `lr·m̂ / (√v̂ + ε)`, `Trainer`'s is
+  `lr · (m̂ / (√v̂ + ε))`; in fp32 the two differ by one ulp in about a third of
+  the elements on every step (measured on 10⁵ random moments). Its β₂ is 0.999,
+  not `Trainer`'s default, and its batch order and classifier initialisation
+  come from the system RNG, so even its own runs are not bit-reproducible
+  today. Moving it is a choice between accepting a one-ulp-per-step change and
+  giving `Trainer` a second update order.
 - **The backbone is fingerprinted only in state files** (`StateFile`). Adapter
   and head checkpoints still are not: a head trained on one backbone and loaded
   onto another differs in neither shape nor contract.

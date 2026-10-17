@@ -26,6 +26,15 @@ import RWKVEmbedding
 //
 //  Для замеров: --limit N (не читать JSONL целиком), --log-every 1 (время
 //  каждого шага), --guard ГБ (выход, если footprint процесса выше порога).
+//
+//  Curriculum: --curriculum plan.json --run-dir папка — стадии подряд над одной
+//  моделью (`EmbeddingCurriculum`): отчёт в папке после каждой стадии, повторный
+//  запуск с тем же планом продолжает с первой незаконченной. plan.json — массив
+//  стадий; ключи стадии (data, task, train, eval, steps, lr, seed, batch,
+//  max_tokens, max_chars, sample_seed, limit) перекрывают ключи командной строки:
+//
+//      [{"data": "ret.jsonl", "task": "retrieval", "steps": 300},
+//       {"data": "sts.jsonl", "task": "sts", "steps": 200, "lr": 1e-5}]
 // ───────────────────────────────────────────────────────────────────────
 
 struct Args {
@@ -51,6 +60,8 @@ struct Args {
     var thenState = 0
     var thenStateLR: Float = 3e-4
     var thenHead = false
+    var curriculum: String? = nil  // план стадий (JSON); с --run-dir
+    var runDir: String? = nil
     var stateScope = "all"         // all | queries: к каким текстам применяется подключённое состояние
     var out: String? = nil
     var limit: Int? = nil          // читать не больше стольких строк JSONL (иначе файл целиком в память)
@@ -111,6 +122,8 @@ func parse() -> Args {
         case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
         case "--then-head": a.thenHead = true
         case "--state-scope": a.stateScope = v()
+        case "--curriculum": a.curriculum = v()
+        case "--run-dir": a.runDir = v()
         case "--sample-seed": a.sampleSeed = UInt64(v())
         case "--dtype": a.dtype = v()                          // плотная база: bf16 | fp16 | fp32        // контроль: на второй стадии вместо состояния — голова
         default:
@@ -160,7 +173,7 @@ func loadBase(_ path: String, dtype: DType = .bfloat16) throws -> (X070Backbone,
 }
 
 let args = parse()
-guard !args.model.isEmpty, !args.vocab.isEmpty, !args.data.isEmpty else {
+guard !args.model.isEmpty, !args.vocab.isEmpty, !args.data.isEmpty || args.curriculum != nil else {
     print("нужны --model, --vocab, --data"); exit(2)
 }
 guard let task = EmbeddingTask(rawValue: args.task) else { print("задача \(args.task)?"); exit(2) }
@@ -203,13 +216,20 @@ print(String(format: "база: %@, L=%d D=%d; загрузка %.1f с; MLX а�
              quantised ? ".rwkvq" : "плотная", base.cfg.nLayer, base.cfg.nEmbd,
              Date().timeIntervalSince(t), Double(GPU.activeMemory) / 1e9, footprintGB() - f0))
 
-let rows = try EmbeddingDataset.loadJSONL(path: expand(args.data), limit: args.limit, tasks: [task],
-                                          sampleSeed: args.sampleSeed)
-guard rows.count >= args.eval + 16 else { print("строк задачи \(task) всего \(rows.count)"); exit(2) }
-// отложенные строки — с конца, обучающие — с начала: не пересекаются
-let heldOut = Array(rows.suffix(args.eval))
-let train = Array(rows.prefix(min(args.train, rows.count - args.eval)))
-print("задача \(task.rawValue): обучение \(train.count), оценка \(heldOut.count)")
+/// Строки задачи: отложенные — с конца, обучающие — с начала (не пересекаются).
+func loadSplit(_ path: String, task: EmbeddingTask, train nTrain: Int, eval nEval: Int,
+               limit: Int?, sampleSeed: UInt64?) throws -> (train: [EmbeddingSample], heldOut: [EmbeddingSample]) {
+    let rows = try EmbeddingDataset.loadJSONL(path: expand(path), limit: limit, tasks: [task],
+                                              sampleSeed: sampleSeed)
+    guard rows.count >= nEval + 16 else { print("строк задачи \(task) всего \(rows.count)"); exit(2) }
+    return (Array(rows.prefix(min(nTrain, rows.count - nEval))), Array(rows.suffix(nEval)))
+}
+let (train, heldOut) = try args.curriculum != nil ? ([EmbeddingSample](), [EmbeddingSample]())
+    : loadSplit(args.data, task: task, train: args.train, eval: args.eval, limit: args.limit,
+                    sampleSeed: args.sampleSeed)
+if args.curriculum == nil {
+    print("задача \(task.rawValue): обучение \(train.count), оценка \(heldOut.count)")
+}
 
 let mode: BaseTrainingMode?
 switch args.mode {
@@ -259,6 +279,75 @@ EmbeddingMetrics.perRowObserver = { perRow = $0; allRows.append($0) }
 if let m = mode, let why = EmbeddingTrainable.unsupportedReason(model: model, mode: m) {
     print(why); exit(2)
 }
+
+/// Настройки счёта из командной строки — общие для всех стадий.
+func applyRunSettings(_ st: inout EmbeddingStage) {
+    st.sequentialBackward = args.sequential
+    st.config.cacheLimitGB = args.cacheGB
+    st.config.logEvery = args.logEvery
+    if let c = args.chunkTokens { st.bodyChunkTokens = c }
+    st.traceStride = args.traceStride
+    st.config.pipelined = args.pipeline
+    st.evaluationCacheLimitGB = args.evalCacheGB
+}
+
+if let planPath = args.curriculum {
+    guard let mode else { print("--curriculum: нужен режим обучения (--mode)"); exit(2) }
+    guard let runDir = args.runDir else { print("--curriculum: нужна --run-dir"); exit(2) }
+    let raw = try Data(contentsOf: URL(fileURLWithPath: expand(planPath)))
+    guard let list = try JSONSerialization.jsonObject(with: raw) as? [[String: Any]], !list.isEmpty else {
+        print("--curriculum: ожидается непустой JSON-массив стадий"); exit(2)
+    }
+    let known: Set<String> = ["data", "task", "train", "eval", "steps", "lr", "seed", "batch",
+                              "max_tokens", "max_chars", "sample_seed", "limit"]
+    var stages: [EmbeddingStage] = []
+    for (i, d) in list.enumerated() {
+        if let bad = d.keys.sorted().first(where: { !known.contains($0) }) {
+            print("стадия \(i): неизвестный ключ \(bad)"); exit(2)
+        }
+        func num(_ k: String) -> Double? { (d[k] as? NSNumber)?.doubleValue }
+        func int(_ k: String) -> Int? { num(k).map { Int($0) } }
+        guard let t = EmbeddingTask(rawValue: d["task"] as? String ?? args.task) else {
+            print("стадия \(i): задача?"); exit(2)
+        }
+        let path = d["data"] as? String ?? args.data
+        guard !path.isEmpty else { print("стадия \(i): нет data"); exit(2) }
+        let steps = int("steps") ?? args.steps
+        let lr = num("lr").map { Float($0) } ?? args.lr
+        let (tr, ho) = try loadSplit(path, task: t, train: int("train") ?? args.train, eval: int("eval") ?? args.eval,
+                                     limit: int("limit") ?? args.limit,
+                                     sampleSeed: num("sample_seed").map { UInt64($0) } ?? args.sampleSeed)
+        var st = EmbeddingStage(
+            task: t, train: tr, heldOut: ho,
+            config: TrainingConfig(lr: lr, lrMin: lr / 20, schedule: .cosine,
+                                   warmupSteps: min(50, steps / 5), maxSteps: steps),
+            batchSize: int("batch") ?? args.batch, gradCacheChunk: args.gradCache,
+            maxTokens: int("max_tokens") ?? args.maxTokens, maxChars: int("max_chars") ?? args.maxChars,
+            seed: num("seed").map { UInt64($0) } ?? args.seed)
+        applyRunSettings(&st)
+        stages.append(st)
+        print("стадия \(i): \(t.rawValue), обучение \(tr.count), оценка \(ho.count), \(steps) шагов, шаг \(lr)")
+    }
+    let dir = URL(fileURLWithPath: expand(runDir))
+    let t0 = Date()
+    let rep = try EmbeddingCurriculum.run(
+        model: model, tokenizer: tok, mode: mode, stages: stages, directory: dir,
+        onResume: { print("продолжение: готово стадий \($0) из \(stages.count) (\(dir.path))") },
+        onStage: { i, r in
+            print(String(format: "стадия %d готова: до %@ | после %@ | %d шагов за %.1f с", i,
+                         r.before?.description ?? "—", r.after?.description ?? "—", r.steps, r.seconds))
+            fflush(stdout)
+        },
+        onStep: { i, s in
+            print(String(format: "  стадия %d, шаг %d: лосс %.4f, %.1f с", i, s.step, s.loss,
+                         Date().timeIntervalSince(t0)))
+            fflush(stdout)
+        })
+    print(rep.finished ? "curriculum закончен, отчёт: \(dir.appendingPathComponent(EmbeddingCurriculum.reportName).path)"
+                       : "curriculum прерван после стадии \(rep.stages.count); повторный запуск продолжит")
+    if rep.finished, let path = args.headOut { try model.saveHead(to: URL(fileURLWithPath: expand(path))) }
+    exit(rep.finished ? 0 : 1)
+}
 var stage = EmbeddingStage(
     task: task, train: train, heldOut: heldOut,
     config: TrainingConfig(lr: args.lr, lrMin: args.lr / 20, schedule: .cosine,
@@ -266,13 +355,7 @@ var stage = EmbeddingStage(
     batchSize: args.batch, gradCacheChunk: args.gradCache,
     maxTokens: args.maxTokens, maxChars: args.maxChars, seed: args.seed)
 
-stage.sequentialBackward = args.sequential
-stage.config.cacheLimitGB = args.cacheGB
-stage.config.logEvery = args.logEvery
-if let c = args.chunkTokens { stage.bodyChunkTokens = c }
-stage.traceStride = args.traceStride
-stage.config.pipelined = args.pipeline
-stage.evaluationCacheLimitGB = args.evalCacheGB
+applyRunSettings(&stage)
 var report: [String: Any] = ["model": args.model, "mode": args.mode, "task": task.rawValue,
                              "train": train.count, "eval": heldOut.count, "steps": args.steps,
                              "batch": args.batch, "max_tokens": args.maxTokens, "quantised": quantised]
