@@ -153,6 +153,7 @@ public enum X070PartialFinetune {
         epochs: Int = 5,
         batchSize: Int = 8,
         lr: Float = 1e-4,
+        seed: UInt64? = nil,
         isCancelled: @escaping () -> Bool = { false },
         onStep: @escaping (_ step: Int, _ loss: Float, _ peakMB: Double) -> Void = { _, _, _ in },
         onEpoch: @escaping (_ epoch: Int, _ valAcc: Float) -> Void = { _, _ in }
@@ -169,7 +170,12 @@ public enum X070PartialFinetune {
         let nBB = keys.count
 
         var params: [MLXArray] = keys.map { backbone.w[$0]!.asType(.float32) }
-        params.append(MLXRandom.normal([numClasses, dim]) * 0.02)   // head.weight
+        // Сид задаёт и начальные веса головы, и порядок примеров: с ним прогон
+        // воспроизводим побитно. Без сида — как было: глобальный MLXRandom и
+        // системный ГСЧ.
+        let headInit = seed.map { MLXRandom.normal([numClasses, dim], key: MLXRandom.key($0)) }
+            ?? MLXRandom.normal([numClasses, dim])
+        params.append(headInit * 0.02)                              // head.weight
         params.append(MLXArray.zeros([numClasses]))                 // head.bias
         eval(params)
 
@@ -214,10 +220,12 @@ public enum X070PartialFinetune {
         var t = 0
 
         let N = trainCache.count
+        var rng = seed.map { SplitMix64(seed: $0) }
         var step = 0
         for epoch in 0 ..< epochs {
             if isCancelled() { break }
-            var perm = Array(0 ..< N); perm.shuffle()
+            var perm = Array(0 ..< N)
+            if rng != nil { perm.shuffle(using: &rng!) } else { perm.shuffle() }
             var s = 0
             while s < N {
                 if isCancelled() { break }
@@ -265,6 +273,7 @@ public enum X070PartialFinetune {
         backbone: X070Backbone, cfg: X070Config, numClasses: Int,
         trainSet: [X070Example], valSet: [X070Example], freeze: Int,
         ctxLen: Int = 128, epochs: Int = 5, batchSize: Int = 8, lr: Float = 1e-4,
+        seed: UInt64? = nil,
         onStep: @escaping (_ step: Int, _ loss: Float, _ peakMB: Double) -> Void = { _, _, _ in },
         onEpoch: @escaping (_ epoch: Int, _ valAcc: Float) -> Void = { _, _ in }
     ) -> TrainResult {
@@ -275,6 +284,6 @@ public enum X070PartialFinetune {
                                     freeze: freeze, name: "val", ctxLen: ctxLen)
         return train(backbone: backbone, trainCache: tc, valCache: vc, cfg: cfg,
                      numClasses: numClasses, freeze: freeze, epochs: epochs,
-                     batchSize: batchSize, lr: lr, onStep: onStep, onEpoch: onEpoch)
+                     batchSize: batchSize, lr: lr, seed: seed, onStep: onStep, onEpoch: onEpoch)
     }
 }

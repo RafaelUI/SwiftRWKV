@@ -235,4 +235,44 @@ final class PartialFinetuneCharacterizationTests: XCTestCase {
             onStep: { s, _, _ in steps = s })
         XCTAssertLessThan(steps, 80, "отмена не сработала: \(steps) шагов")
     }
+
+    // ── Воспроизводимость по сиду ────────────────────────────────────
+
+    /// `globalNoise` — разное состояние глобального MLXRandom перед обучением:
+    /// с сидом результат от него зависеть не обязан (TinyBackbone сеет
+    /// глобальный генератор сам, и без этого голова «от сида» и голова от
+    /// глобального генератора были бы неразличимы).
+    func seededRun(seed: UInt64?, globalNoise: UInt64 = 0, steps: inout [Float]) -> X070PartialFinetune.TrainResult {
+        let (bb, cfg) = TinyBackbone.make(nLayer: 3, seed: 42)
+        MLXRandom.seed(1000 &+ globalNoise)
+        X070PartialFinetune.clearCache()
+        var losses: [Float] = []
+        let r = X070PartialFinetune.run(
+            backbone: bb, cfg: cfg, numClasses: 2,
+            trainSet: examples(10), valSet: examples(4, seed: 99),
+            freeze: 1, ctxLen: Self.ctxLen, epochs: 3, batchSize: 4, lr: 1e-3, seed: seed,
+            onStep: { _, l, _ in losses.append(l) })
+        steps = losses
+        return r
+    }
+
+    /// С сидом два прогона ПОБИТНО одинаковы (веса, лоссы по шагам, точность);
+    /// другой сид — другие веса. Предпосылка побитной сверки переноса на
+    /// общий Trainer. (Неполный последний батч: 10 примеров по 4.)
+    func testSeededRunsAreBitIdentical() {
+        var la: [Float] = [], lb: [Float] = [], lc: [Float] = []
+        let a = seededRun(seed: 7, steps: &la)
+        let b = seededRun(seed: 7, globalNoise: 1, steps: &lb)
+        let c = seededRun(seed: 8, steps: &lc)
+        XCTAssertEqual(la.count, 9, "3 эпохи по 3 шага (4 + 4 + 2)")
+        XCTAssertEqual(la, lb, "лоссы двух прогонов с одним сидом разошлись")
+        XCTAssertEqual(a.valAcc, b.valAcc)
+        XCTAssertEqual(a.params.keys.sorted(), b.params.keys.sorted())
+        for k in a.params.keys {
+            XCTAssertEqual(MLX.abs(a.params[k]! - b.params[k]!).max().item(Float.self), 0, k)
+        }
+        XCTAssertGreaterThan(MLX.abs(a.params["head.weight"]! - c.params["head.weight"]!).max().item(Float.self), 0,
+                             "сид не влияет на начальные веса головы")
+        XCTAssertNotEqual(la, lc, "сид не влияет на порядок примеров или голову")
+    }
 }
