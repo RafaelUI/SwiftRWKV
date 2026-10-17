@@ -403,29 +403,45 @@ try EmbeddingFinetune.run(model: model, tokenizer: tok, mode: .topLayers(4), sta
 ```
 
 The unpacked projections are the same dequantized numbers the compressed base
-computed with (the embedding moves by 1.7e-4). Training speed in tokens per
-second and peak physical footprint of the process — retrieval stage, top N
-layers and the head trained, three texts of 512 tokens per triplet, tokens
-counted over the whole step including the frozen bottom (M4 16 GB, defaults,
-`embed-run --mode top:N --eval 0`; bold is above 3 GB):
+computed with (the embedding moves by 1.7e-4).
 
-| model | layers | batch 1 | batch 2 | batch 4 |
-|---|---|---|---|---|
-| 0.1B bf16 | 2 | 3072 tok/s, 1.05 GB | 3657 tok/s, 1.24 GB | 3840 tok/s, 1.74 GB |
-| 0.1B bf16 | 4 | 2259 tok/s, 1.32 GB | 2719 tok/s, 1.48 GB | 2831 tok/s, 2.01 GB |
-| 0.1B bf16 | 6 | 1766 tok/s, 1.64 GB | 2148 tok/s, 1.74 GB | 2259 tok/s, 2.28 GB |
-| 0.1B REDUCTION | 2 | 3268 tok/s, 0.98 GB | 3889 tok/s, 1.21 GB | 4267 tok/s, 1.68 GB |
-| 0.1B REDUCTION | 4 | 2363 tok/s, 1.26 GB | 2844 tok/s, 1.46 GB | 3027 tok/s, 1.96 GB |
-| 0.1B REDUCTION | 6 | 1807 tok/s, 1.59 GB | 2210 tok/s, 1.73 GB | 2336 tok/s, 2.25 GB |
-| 0.4B bf16* | 2 | 1313 tok/s, 1.91 GB | 1477 tok/s, 2.13 GB | 1466 tok/s, 2.70 GB |
-| 0.4B bf16* | 4 | 1067 tok/s, 2.32 GB | 1209 tok/s, 2.56 GB | 1212 tok/s, **3.16** GB |
-| 0.4B bf16* | 6 | 909 tok/s, 2.86 GB | 1031 tok/s, 3.00 GB | 1027 tok/s, **3.62** GB |
-| 0.4B REDUCTION | 2 | 1463 tok/s, 1.60 GB | 1707 tok/s, 1.88 GB | 1736 tok/s, 2.41 GB |
-| 0.4B REDUCTION | 4 | 1164 tok/s, 2.07 GB | 1347 tok/s, 2.30 GB | 1368 tok/s, 2.90 GB |
-| 0.4B REDUCTION | 6 | 966 tok/s, 2.61 GB | 1113 tok/s, 2.77 GB | 1129 tok/s, **3.39** GB |
+**Quality.** Against the same dense checkpoint in fp16 — the type a `.rwkvq`
+base computes in — top-layer training over a compressed bottom loses nothing
+once training has converged (retrieval, MRR over 300 queries, three to five
+seeds, paired bootstrap):
 
-\* measured on the dequantized REDUCTION saved as bf16; a rerun on the original
-dense checkpoint gave the same numbers within 2%.
+- top 4 and 6 layers: differences −0.007…+0.007, intervals around zero, on
+  LitRetrieval and on RuLitSearch (hard negatives mined by Harrier);
+- top 2 layers: differences appear only while training is short (0.1B,
+  200 steps: −0.015; 0.4B, 300 steps: +0.03…+0.04) and vanish or flip sign at
+  three times the steps (0.1B, 600: +0.013 / +0.010; 0.4B, 900: +0.003 /
+  +0.004);
+- `compression` and `reduction` do not differ in any cell.
+
+Mind the type when comparing: a dense base loaded in bf16 (the default for a
+dense checkpoint) is a different arm — on 0.4B with two layers it scored 0.015
+below the same base in fp16. The full tables are in rwkv-quant
+`docs/ARTICLE-1.md`, section 15.
+
+**Speed and memory.** Tokens per second and peak physical footprint of the
+process — retrieval, top N layers and the head trained, three texts of 512
+tokens per triplet, tokens counted over the whole step including the frozen
+bottom; the four arms interleaved as separate processes with pauses, a control
+run after each model (M4 16 GB, defaults, `embed-run --mode top:N --eval 0`;
+bold is above 3 GB). Dense bf16 and dense fp16 run at the same speed within 2%
+and are shown once:
+
+| model | layers | batch | dense | `reduction` | `compression` |
+|---|---|---|---|---|---|
+| 0.1B | 2 | 1 / 2 / 4 | 3339 / 3572 / 3792 tok/s, 1.08 / 1.23 / 1.74 GB | 3657 / 3938 / 4237, 1.03 / 1.20 / 1.67 | 3657 / 3938 / 4237, 1.02 / 1.21 / 1.68 |
+| 0.1B | 4 | 1 / 2 / 4 | 2477 / 2671 / 2818, 1.32 / 1.47 / 2.01 | 2603 / 2792 / 2982, 1.27 / 1.43 / 1.96 | 2603 / 2792 / 2997, 1.28 / 1.45 / 1.97 |
+| 0.1B | 6 | 1 / 2 / 4 | 1725 / 2104 / 2234, 1.63 / 1.74 / 2.28 | 1765 / 2163 / 2318, 1.59 / 1.70 / 2.25 | 1765 / 2178 / 2318, 1.60 / 1.72 / 2.26 |
+| 0.4B | 2 | 1 / 2 / 4 | 1409 / 1484 / 1452, 1.91 / 2.13 / 2.70 | 1462 / 1725 / 1721, 1.60 / 1.86 / 2.41 | 1476 / 1765 / 1725, 1.55 / 1.81 / 2.36 |
+| 0.4B | 4 | 1 / 2 / 4 | 1089 / 1209 / 1197, 2.33 / 2.56 / **3.16** | 1154 / 1341 / 1356, 2.06 / 2.30 / 2.90 | 1154 / 1341 / 1356, 2.02 / 2.26 / 2.86 |
+| 0.4B | 6 | 1 / 2 / 4 | 925 / 1027 / 1017, 2.84 / 3.00 / **3.62** | 960 / 1125 / 1119, 2.62 / 2.77 / **3.38** | 960 / 1109 / 1121, 2.60 / 2.73 / **3.35** |
+
+A compressed bottom trains 3–12% (0.1B) and 4–19% (0.4B) faster than a dense
+one and takes 0.03–0.07 GB (0.1B) and 0.22–0.36 GB (0.4B) less.
 
 With `config.pipelined = true` the same grid runs 2…15% faster for
 0.2…0.6 GB more.
