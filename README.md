@@ -37,9 +37,13 @@ print(out.text)
   O(1) memory per token; prefill uses the parallel pass and is measured 94×
   faster than folding the prompt token by token.
 - **Reranking** — a cross-encoder head over backbone state, with a state cache,
-  listwise training and an indexed serving path.
+  listwise training (resumable after an interruption, bit-identically) and an
+  indexed serving path; caches record the attached initial state and refuse
+  another one.
 - **Embeddings** — pooling, a trainable head, contrastive losses, GradCache,
-  curriculum stages and retrieval metrics.
+  retrieval metrics, and a curriculum runner that writes a report after every
+  stage and resumes after a crash; an attached state can apply to every text or
+  to queries only.
 - **Quantised `.rwkvq` base** — the format from
   [rwkv-quant](https://github.com/RafaelUI/rwkv-quant), opened directly with
   `X070Backbone.load(fromRwkvq:)` — no dense checkpoint needed — with fused
@@ -52,7 +56,7 @@ print(out.text)
 - **Top-layer training** — full-weight training of the top N layers for smaller
   models (≤400M), where adapters carry too few parameters; also over a `.rwkvq`
   base. The classic path (`X070PartialFinetune`) caches the frozen lower stack
-  on disk.
+  on disk and trains on the shared trainer, reproducibly with a seed.
 - **State-tuning** — the base frozen, only the initial state of the recurrence
   trained (0.1B: 0.59 M numbers), kept in its own file with a fingerprint of the
   base; a trained state and a folded prompt are one pluggable object.
@@ -78,7 +82,7 @@ Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/RafaelUI/SwiftRWKV", from: "0.2.4"),
+    .package(url: "https://github.com/RafaelUI/SwiftRWKV", from: "0.3.0"),
 ],
 targets: [
     .target(name: "YourApp", dependencies: [
@@ -93,8 +97,11 @@ targets: [
 
 Or in Xcode: **File → Add Package Dependencies…** → paste the repo URL.
 
-The latest tag is `0.2.4`. State-tuning, top-layer training over `.rwkvq` and
-the memory levers above are on `main` and not tagged yet.
+The latest tag is `0.3.0`. Changes since `0.2.4` that need attention when
+upgrading: `DocIndex.check` takes a contract (use
+`RerankerInference.prefixContract()`), and an embedding model with
+`stateScope = .queriesOnly` needs the role of each text (`role: .query` /
+`.document`); everything else is additive.
 
 ## Project layout
 
@@ -138,7 +145,7 @@ Sources/
 ├── RWKVRerank/                  # cross-encoder reranker: head over state, state
 │                                # cache, listwise training, indexed serving
 ├── RerankRun/                   # executable rerank-run: data → cache → training → report
-├── EmbedRun/                    # executable embed-run: one embedding stage, evaluation, A/B instruments
+├── EmbedRun/                    # executable embed-run: an embedding stage or a resumable curriculum, evaluation, A/B instruments
 └── DecodeBench/                 # executable decode-bench: decode and training-step benchmarks
 ```
 
@@ -178,7 +185,7 @@ is missing and what was tried and rejected is in
 
 Experimental, but validated end to end on real models rather than on toys —
 RWKV-7 World 0.1B, g1d 0.1B / 0.4B dense and as `.rwkvq`, and 1.5B / 2.9B for
-inference. 566 tests, plus mutation suites that deliberately break the code and
+inference. 595 tests, plus mutation suites that deliberately break the code and
 require the tests to notice — the interesting failures in this problem are
 silent, so "the tests pass" is not by itself evidence.
 
