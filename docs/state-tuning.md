@@ -243,6 +243,56 @@ move documents and queries together and so has more room to fit, while the
 query-only state carries the whole adjustment alone; on single-instruction data
 there is little for either to recover (−0.009 from dropping the instruction).
 
+#### Many and long instructions (18.10)
+
+LitRetrieval has one short instruction for every query, so there was little to
+replace. The same two-stage measurement on two sets where instructions matter
+more (0.1B `reduction`, top 4 layers, 200 + 200 steps, state lr 1e-4, three
+seeds, three arms sharing the first stage of each seed, 300 held-out queries,
+evaluation with duplicate candidates merged — `--dedupe-pool`, since documents
+repeat in both):
+
+- **Tool_Use** — tool selection built from
+  [UltraData-SFT-Agent-2609](https://huggingface.co/datasets/openbmb/UltraData-SFT-Agent-2609):
+  query = the agent's system policy + the last user turn, positive = the
+  description of the tool the agent called next, negative = another tool from
+  the same list. 6000 rows from seven sources, 203 distinct instructions,
+  ~1065 instruction tokens per query (up to ~2.2 thousand; `--max-tokens 2816`).
+- **MAIR** — [MAIR](https://github.com/sunnweiwei/Mair) (126 instructed
+  retrieval tasks; 10 031 queries, 805 distinct instructions, median 141
+  characters); positive = the top-graded relevant document, negative = a random
+  other document of the same task.
+
+| set | with instruction | without | + state, all texts | + state, queries only | + head (control) |
+|---|---|---|---|---|---|
+| Tool_Use | 0.648 | 0.394 | 0.552 | 0.570 | 0.557 |
+| MAIR | 0.772 | 0.746 | 0.758 | 0.751 | 0.749 |
+
+| difference (Δ MRR [95 %]) | Tool_Use | MAIR |
+|---|---|---|
+| without − with instruction | −0.253 [−0.288; −0.219] | −0.025 [−0.040; −0.011] |
+| queries only − all texts | +0.018 [+0.003; +0.034] | −0.006 [−0.012; −0.000] |
+| state, all texts − control | −0.006 [−0.026; +0.015] | +0.009 [+0.002; +0.016] |
+| state, queries only − control | +0.013 [−0.006; +0.032] | +0.003 [−0.003; +0.008] |
+| best arm − with instruction | −0.077 [−0.105; −0.050] | −0.014 [−0.028; −0.001] |
+
+Where the instruction carries real information — long agent policies that tell
+which domain and which tools a request belongs to — dropping it costs a quarter
+of MRR. A second stage on instruction-free queries wins back about 60 % of that,
+but a head trained the same way wins back as much: what recovers is the
+embedder adapting to the shorter queries, not something only a state can do. A
+single state is one object for every query, so it cannot know which of 203
+instructions a query had; no arm reaches the quality with the instruction. On
+MAIR the instruction is worth less (−0.025) and the picture is the same, with
+the all-texts state slightly above the control. Which side the state applies
+to flips between the sets (queries only better on Tool_Use, worse on MAIR), so
+neither is a default to recommend.
+
+The direction this points to is a state **per instruction** — trained, or simply
+the instruction folded into a state (`foldPrompt`) and attached to queries only,
+which gives the instruction's effect without its tokens in every query. Not
+measured yet.
+
 ### Cost of a step
 
 Embedder, state and head trained; all three texts of a triplet at full length
@@ -269,7 +319,8 @@ compressed base fits at 1 × 512, where its top layers do not.
 
 ## Not done
 
-- Instructions that differ per query (several tasks, long instructions) — where
-  a state could gain more than on the single-instruction data above — were not
-  measured.
+- A state **per instruction** (trained, or the instruction folded into a state
+  and attached to queries only) — the next step after the many-instruction
+  measurement above — is not implemented: an attached state is one per model,
+  and an embedding batch cannot mix states.
 - Neuro (the iOS app) does not use states yet; the file format and API are ready.

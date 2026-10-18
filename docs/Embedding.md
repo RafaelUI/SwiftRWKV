@@ -444,6 +444,13 @@ arm reproduces the table above exactly). On this data restricting the state to
 queries does not help; details in
 [state-tuning.md](state-tuning.md#in-place-of-the-instruction).
 
+On data where instructions matter more — tool selection with ~1 thousand-token
+agent policies, and the 126 instructed tasks of MAIR — dropping the instruction
+costs −0.253 and −0.025 MRR. A trained state wins back part of it (Tool_Use:
+0.394 → 0.552…0.570), but a head trained on the same rows wins back as much
+(0.557), and no arm reaches the quality with the instruction: one state cannot
+stand for many different instructions. Same section of state-tuning.md.
+
 #### Attaching the state to queries only
 
 `EmbeddingModel.stateScope = .queriesOnly` applies the attached state to
