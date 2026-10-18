@@ -91,6 +91,10 @@ public struct EmbeddingStage {
     /// же потолок почти ничего не стоит. Цена снятия — кэш входит в footprint
     /// процесса. После оценки ставится потолок обучения.
     public var evaluationCacheLimitGB: Double? = nil
+    /// Retrieval: сливать одинаковые тексты кандидатов оценки
+    /// (`EmbeddingMetrics.evaluateRetrieval(dedupeCandidates:)`). Для данных,
+    /// где документы повторяются; по умолчанию — прежний пул 2N.
+    public var dedupeEvaluationPool = false
 
     public init(task: EmbeddingTask,
                 train: [EmbeddingSample],
@@ -357,7 +361,7 @@ public enum EmbeddingFinetune {
             return .ranking(EmbeddingMetrics.evaluateRetrieval(
                 model: model, tokenizer: tokenizer, rows: stage.heldOut,
                 maxChars: stage.maxChars, terminator: terminator,
-                maxTokens: stage.maxTokens))
+                maxTokens: stage.maxTokens, dedupeCandidates: stage.dedupeEvaluationPool))
         case .sts:
             return .pairwise(EmbeddingMetrics.evaluateSTS(
                 model: model, tokenizer: tokenizer, rows: stage.heldOut,

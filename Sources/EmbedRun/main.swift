@@ -60,6 +60,7 @@ struct Args {
     var thenState = 0
     var thenStateLR: Float = 3e-4
     var thenHead = false
+    var dedupePool = false         // retrieval: сливать одинаковые тексты кандидатов оценки
     var curriculum: String? = nil  // план стадий (JSON); с --run-dir
     var runDir: String? = nil
     var stateScope = "all"         // all | queries: к каким текстам применяется подключённое состояние
@@ -122,6 +123,7 @@ func parse() -> Args {
         case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
         case "--then-head": a.thenHead = true
         case "--state-scope": a.stateScope = v()
+        case "--dedupe-pool": a.dedupePool = true
         case "--curriculum": a.curriculum = v()
         case "--run-dir": a.runDir = v()
         case "--sample-seed": a.sampleSeed = UInt64(v())
@@ -289,6 +291,7 @@ func applyRunSettings(_ st: inout EmbeddingStage) {
     st.traceStride = args.traceStride
     st.config.pipelined = args.pipeline
     st.evaluationCacheLimitGB = args.evalCacheGB
+    st.dedupeEvaluationPool = args.dedupePool
 }
 
 if let planPath = args.curriculum {
@@ -498,6 +501,7 @@ if let mode {
         if let c = args.chunkTokens { stage2.bodyChunkTokens = c }
         stage2.traceStride = args.traceStride
         stage2.evaluationCacheLimitGB = args.evalCacheGB
+        stage2.dedupeEvaluationPool = args.dedupePool
         base.trainLayers = []
         // Контроль (--then-head): те же шаги на тех же строках без инструкции,
         // но обучается голова, а состояния нет, — чтобы прибавку состояния не

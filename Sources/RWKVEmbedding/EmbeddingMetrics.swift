@@ -155,27 +155,49 @@ public enum EmbeddingMetrics {
     /// числа зависят от её размера: чем больше N, тем труднее задача. Сравнивать
     /// прогоны между собой можно только при одинаковом N — это и есть причина,
     /// по которой `count` возвращается наружу, а не остаётся отладочным.
+    ///
+    /// - dedupeCandidates: одинаковые тексты кандидатов (после обрезки)
+    ///   сливаются в одного. Нужно там, где документы повторяются — один
+    ///   инструмент верен для многих запросов, документ позитивен у одного
+    ///   запроса и негативен у другого: копии одного текста в разных пачках
+    ///   оценки получают векторы, отличные в последних битах, и копия верного
+    ///   документа может встать выше него самого. Ранг тогда — среди
+    ///   РАЗЛИЧНЫХ документов. Умолчание false — прежний пул 2N (с ним сняты
+    ///   все прежние серии).
     public static func evaluateRetrieval(model: EmbeddingModel, tokenizer: WorldTokenizer,
                                          rows: [EmbeddingSample],
                                          maxChars: Int = 800,
                                          ks: [Int] = [1, 5, 10],
                                          terminator: Int = 0,
-                                         maxTokens: Int? = 512) -> RankingMetrics {
+                                         maxTokens: Int? = 512,
+                                         dedupeCandidates: Bool = false) -> RankingMetrics {
         precondition(!rows.isEmpty, "оценка на пустой выборке бессмысленна")
         let anchors = rows.map { String($0.anchor.prefix(maxChars)) }
         let positives = rows.map { String($0.positive.prefix(maxChars)) }
         let negatives = rows.map { String($0.negative.prefix(maxChars)) }
 
+        var candidates = positives + negatives
+        var correct = Array(0 ..< rows.count)
+        if dedupeCandidates {
+            var index: [String: Int] = [:]
+            var unique: [String] = []
+            for t in candidates where index[t] == nil {
+                index[t] = unique.count
+                unique.append(t)
+            }
+            correct = positives.map { index[$0]! }
+            candidates = unique
+        }
+
         let a = embedAll(model: model, tokenizer: tokenizer, texts: anchors,
                          terminator: terminator, maxTokens: maxTokens, role: .query)
-        let c = embedAll(model: model, tokenizer: tokenizer, texts: positives + negatives,
+        let c = embedAll(model: model, tokenizer: tokenizer, texts: candidates,
                          terminator: terminator, maxTokens: maxTokens, role: .document)
 
         let sims = matmul(a.asType(.float32), c.asType(.float32).transposed())
         similarityObserver?(sims)
         eval(sims)
-        return rankingMetrics(similarities: sims,
-                              correctIndex: Array(0 ..< rows.count), ks: ks)
+        return rankingMetrics(similarities: sims, correctIndex: correct, ks: ks)
     }
 
     /// Метрики по готовой матрице похожести [N, C] и индексу верного

@@ -90,7 +90,8 @@ public enum EmbeddingCurriculum {
                 + "\(c.gradClip)|\(c.weightDecay)|\(c.beta1)|\(c.beta2)|\(c.adamEps)|\(c.gradAccum)|"
                 + "\(st.batchSize)|\(st.gradCacheChunk)|\(st.sequentialBackward)|\(st.bodyChunkTokens)|"
                 + "\(st.traceStride)|\(st.temperature)|\(st.maxTokens.map(String.init) ?? "none")|"
-                + "\(st.maxChars)|\(st.seed)|\(st.evaluateOnFullPool)")
+                + "\(st.maxChars)|\(st.seed)|\(st.evaluateOnFullPool)"
+                + (st.dedupeEvaluationPool ? "|dedupe" : ""))
             for (name, rows) in [("train", st.train), ("held", st.heldOut)] {
                 put("\(name):\(rows.count)")
                 for r in rows { put(r.task.rawValue); put(r.anchor); put(r.positive); put(r.negative) }
