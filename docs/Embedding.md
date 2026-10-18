@@ -579,6 +579,15 @@ let c = EmbeddingMetrics.evaluateClassification(
 print(c.accuracy, c.candidatesPerRow, c.predictions.count)
 ```
 
+Retrieval ranks each query's positive among **all** positives and negatives
+of the held-out rows (2N candidates). Where documents repeat — one tool is the
+answer to many queries, a document is one query's positive and another's
+negative — pass `dedupeCandidates: true` (`EmbeddingStage.dedupeEvaluationPool`,
+`embed-run --dedupe-pool`): identical texts are merged and the rank is taken
+among distinct documents. Without it, copies of the same text embedded in
+different evaluation batches differ in the last bits, and a copy of the correct
+document can rank above the document itself. The default keeps the 2N pool.
+
 Classification is scored against the **full pool of 25 labels** by default.
 The seven candidates named in a row's instruction are that row's own, so
 accuracy over them also measures how easy that particular seven happened to
