@@ -61,6 +61,9 @@ struct Args {
     var thenStateLR: Float = 3e-4
     var thenHead = false
     var dedupePool = false         // retrieval: сливать одинаковые тексты кандидатов оценки
+    var foldInstructions = false   // retrieval: инструкции запросов оценки свёрнуты в состояние
+    var compareFolded = false      // после первой стадии (или вместо обучения): в строке против свёрнутой
+    var compareRounds = 3          // кругов сравнения; первый — прогрев, во время не входит
     var curriculum: String? = nil  // план стадий (JSON); с --run-dir
     var runDir: String? = nil
     var stateScope = "all"         // all | queries: к каким текстам применяется подключённое состояние
@@ -124,6 +127,9 @@ func parse() -> Args {
         case "--then-head": a.thenHead = true
         case "--state-scope": a.stateScope = v()
         case "--dedupe-pool": a.dedupePool = true
+        case "--fold-instructions": a.foldInstructions = true
+        case "--compare-folded": a.compareFolded = true
+        case "--compare-rounds": a.compareRounds = max(2, Int(v()) ?? a.compareRounds)
         case "--curriculum": a.curriculum = v()
         case "--run-dir": a.runDir = v()
         case "--sample-seed": a.sampleSeed = UInt64(v())
@@ -292,6 +298,7 @@ func applyRunSettings(_ st: inout EmbeddingStage) {
     st.config.pipelined = args.pipeline
     st.evaluationCacheLimitGB = args.evalCacheGB
     st.dedupeEvaluationPool = args.dedupePool
+    st.foldInstructions = args.foldInstructions
 }
 
 if let planPath = args.curriculum {
@@ -411,6 +418,89 @@ if args.forwardAB > 0 {
     }
     exit(0)
 }
+/// СВЁРНУТЫЕ ИНСТРУКЦИИ ПРОТИВ ИНСТРУКЦИИ В СТРОКЕ (--compare-folded): та же
+/// оценка retrieval на тех же весах двумя путями, плечи вперемежку
+/// (`--compare-rounds` кругов, порядок плеч меняется от круга к кругу; первый
+/// круг — прогрев, во время не входит). Числа обязаны совпасть до порядка
+/// сложения на стыке, кроме строк, которые в строке обрезала `--max-tokens`
+/// (свёртка режет только хвост, запрос не теряется) — они считаются отдельно.
+/// Поштучные ранги обоих плеч — в отчёт (для парного бутстрэпа по сидам).
+func compareFolded(_ st: EmbeddingStage) {
+    guard st.task == .retrieval else { print("--compare-folded: только retrieval"); exit(2) }
+    guard model.pooling == .last else { print("--compare-folded: нужен пулинг .last"); exit(2) }
+    let anchors = st.heldOut.map { String($0.anchor.prefix(st.maxChars)) }
+    let room = (st.maxTokens ?? Int.max) - 1            // токенов строки без терминатора
+    var withInstr = 0, inlineCut = 0, tailCut = 0, inlineTok = 0, tailTok = 0
+    var cutRows: [Int] = [], prefixTok: [String: Int] = [:]
+    for (i, a) in anchors.enumerated() {
+        let n = tok.encode(a).count
+        inlineTok += min(n, room)
+        if n > room { inlineCut += 1; cutRows.append(i) }
+        if let (p, q) = InstructionCache.split(a) {
+            withInstr += 1
+            let k = tok.encode(q).count
+            tailTok += min(k, room)
+            if k > room { tailCut += 1 }
+            if prefixTok[p] == nil { prefixTok[p] = tok.encode(p).count }
+        } else {
+            tailTok += min(n, room)
+        }
+    }
+    let foldTok = prefixTok.values.reduce(0, +)
+    print("СВЁРТКА: инструкция у \(withInstr) из \(anchors.count) запросов, различных \(prefixTok.count) "
+          + "(\(foldTok) токенов на свёртку); токенов запросов в строке \(inlineTok), хвостов \(tailTok); "
+          + "обрезано --max-tokens: в строке \(inlineCut), хвостов \(tailCut)")
+    let savedObserver = EmbeddingMetrics.perRowObserver
+    defer { EmbeddingMetrics.perRowObserver = savedObserver; EmbeddingMetrics.instructionCacheObserver = nil }
+    var folds = (count: 0, tokens: 0)
+    EmbeddingMetrics.instructionCacheObserver = { folds = ($0.foldedCount, $0.foldedTokens) }
+    let names = ["в строке", "свёрнутая"]
+    var ranks: [[Double]] = [[], []], metrics: [RankingMetrics?] = [nil, nil]
+    var times: [[Double]] = [[], []], peaks: [[Double]] = [[], []]
+    for round in 0 ..< args.compareRounds {
+        for arm in (round % 2 == 0 ? [0, 1] : [1, 0]) {
+            var row: [Double] = []
+            EmbeddingMetrics.perRowObserver = { row = $0 }
+            GPU.resetPeakMemory()
+            let t0 = Date()
+            let r = EmbeddingMetrics.evaluateRetrieval(
+                model: model, tokenizer: tok, rows: st.heldOut, maxChars: st.maxChars,
+                maxTokens: st.maxTokens, dedupeCandidates: st.dedupeEvaluationPool, foldInstructions: arm == 1)
+            let dt = Date().timeIntervalSince(t0)
+            if round > 0 { times[arm].append(dt); peaks[arm].append(Double(GPU.peakMemory) / 1e9) }
+            if let prev = metrics[arm], prev != r || ranks[arm] != row {
+                print("ВНИМАНИЕ: плечо «\(names[arm])» не повторилось от круга к кругу")
+            }
+            metrics[arm] = r; ranks[arm] = row
+            print(String(format: "  круг %d, %@: %.1f с | %@", round, names[arm] as NSString, dt, r.description))
+            fflush(stdout)
+        }
+    }
+    func med(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
+    let cut = Set(cutRows)
+    let differ = (0 ..< ranks[0].count).filter { ranks[0][$0] != ranks[1][$0] }
+    let differUncut = differ.filter { !cut.contains($0) }
+    func mrr(_ r: [Double], _ idx: [Int]) -> Double { idx.isEmpty ? .nan : idx.map { 1 / r[$0] }.reduce(0, +) / Double(idx.count) }
+    let uncut = (0 ..< ranks[0].count).filter { !cut.contains($0) }
+    print(String(format: "СВЁРТКА, итог: MRR в строке %.4f, свёрнутая %.4f (разность %+.4f); ранги разошлись у %d строк "
+                 + "(из них не обрезанных в строке %d); на необрезанных MRR %.4f / %.4f; на обрезанных %.4f / %.4f",
+                 metrics[0]!.mrr, metrics[1]!.mrr, metrics[1]!.mrr - metrics[0]!.mrr, differ.count, differUncut.count,
+                 mrr(ranks[0], uncut), mrr(ranks[1], uncut), mrr(ranks[0], cutRows), mrr(ranks[1], cutRows)))
+    print(String(format: "СВЁРТКА, время оценки (медиана %d кругов): в строке %.2f с, свёрнутая %.2f с (%.2fx); "
+                 + "пик MLX %.2f / %.2f ГБ; свёрнуто %d инструкций, %d токенов",
+                 times[0].count, med(times[0]), med(times[1]), med(times[0]) / med(times[1]),
+                 med(peaks[0]), med(peaks[1]), folds.count, folds.tokens))
+    report["cmp_inline"] = metrics[0]!.mrr; report["cmp_folded"] = metrics[1]!.mrr
+    report["per_row_cmp_inline"] = ranks[0]; report["per_row_cmp_folded"] = ranks[1]
+    report["cmp_inline_seconds"] = times[0]; report["cmp_folded_seconds"] = times[1]
+    report["cmp_inline_peak_gb"] = peaks[0]; report["cmp_folded_peak_gb"] = peaks[1]
+    report["cmp_rows_with_instruction"] = withInstr; report["cmp_distinct_instructions"] = prefixTok.count
+    report["cmp_fold_tokens"] = foldTok; report["cmp_inline_tokens"] = inlineTok; report["cmp_tail_tokens"] = tailTok
+    report["cmp_inline_cut"] = inlineCut; report["cmp_tail_cut"] = tailCut; report["cmp_cut_rows"] = cutRows
+    report["cmp_rows_differ"] = differ.count; report["cmp_rows_differ_uncut"] = differUncut.count
+    report["cmp_cache_limit_gb"] = Double(MLX.Memory.cacheLimit) / 1e9
+}
+
 if args.probe {
     // Отметка: активная память MLX после фазы и пик MLX ЗА фазу (сбрасывается).
     // Разность пика и активной памяти до фазы — её временное потребление.
@@ -471,6 +561,7 @@ if let mode {
     report["after"] = r.after?.headline ?? Double.nan
     report["final_loss"] = Double(r.finalLoss); report["train_seconds"] = r.seconds
     report["train_peak_gb"] = Double(GPU.peakMemory) / 1e9
+    if args.compareFolded { compareFolded(stage) }
 
     if args.thenState > 0 {
         // ВТОРАЯ СТАДИЯ: начальное состояние ВМЕСТО строки инструкции поверх
@@ -545,6 +636,7 @@ if let mode {
                  Double(GPU.peakMemory) / 1e9, watch.take()))
     report["before"] = before.headline; report["eval_seconds"] = evalSeconds
     report["eval_peak_gb"] = Double(GPU.peakMemory) / 1e9
+    if args.compareFolded { compareFolded(stage) }
 }
 report["footprint_gb"] = footprintGB() - f0
 if case .state = mode, let state = base.initialState {
