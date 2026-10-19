@@ -89,6 +89,10 @@ public enum EmbeddingMetrics {
     /// оценка, видно лишь по самой матрице.
     nonisolated(unsafe) static var similarityObserver: ((MLXArray) -> Void)? = nil
 
+    /// Кэш свёрнутых инструкций последней оценки с `foldInstructions` — для
+    /// отчёта о цене (сколько инструкций свёрнуто, сколько их токенов).
+    nonisolated(unsafe) public static var instructionCacheObserver: ((InstructionCache) -> Void)? = nil
+
     /// Векторы плоского списка текстов, микробатчами.
     ///
     /// Выравнивание T здесь не нужно: оценка идёт БЕЗ градиента, а
@@ -164,13 +168,19 @@ public enum EmbeddingMetrics {
     ///   документа может встать выше него самого. Ранг тогда — среди
     ///   РАЗЛИЧНЫХ документов. Умолчание false — прежний пул 2N (с ним сняты
     ///   все прежние серии).
+    /// - foldInstructions: инструкции запросов («Instruct: X\nQuery: q»)
+    ///   сворачиваются в состояние один раз на инструкцию (`InstructionCache`),
+    ///   запрос платит только за хвост. Тот же счёт, что с инструкцией в
+    ///   строке, кроме обрезки: `maxTokens` действует на хвост. Только пулинг
+    ///   `.last`. Документы — как без свёртки.
     public static func evaluateRetrieval(model: EmbeddingModel, tokenizer: WorldTokenizer,
                                          rows: [EmbeddingSample],
                                          maxChars: Int = 800,
                                          ks: [Int] = [1, 5, 10],
                                          terminator: Int = 0,
                                          maxTokens: Int? = 512,
-                                         dedupeCandidates: Bool = false) -> RankingMetrics {
+                                         dedupeCandidates: Bool = false,
+                                         foldInstructions: Bool = false) -> RankingMetrics {
         precondition(!rows.isEmpty, "оценка на пустой выборке бессмысленна")
         let anchors = rows.map { String($0.anchor.prefix(maxChars)) }
         let positives = rows.map { String($0.positive.prefix(maxChars)) }
@@ -189,8 +199,16 @@ public enum EmbeddingMetrics {
             candidates = unique
         }
 
-        let a = embedAll(model: model, tokenizer: tokenizer, texts: anchors,
+        let a: MLXArray
+        if foldInstructions {
+            precondition(model.pooling == .last, InstructionCacheError.meanPooling.description)
+            let cache = InstructionCache(model: model, tokenizer: tokenizer)
+            a = try! cache.embedQueries(anchors, terminator: terminator, maxTokens: maxTokens)
+            instructionCacheObserver?(cache)
+        } else {
+            a = embedAll(model: model, tokenizer: tokenizer, texts: anchors,
                          terminator: terminator, maxTokens: maxTokens, role: .query)
+        }
         let c = embedAll(model: model, tokenizer: tokenizer, texts: candidates,
                          terminator: terminator, maxTokens: maxTokens, role: .document)
 

@@ -107,6 +107,22 @@ public extension X070Backbone {
         return try body()
     }
 
+    /// Проходы внутри `body` стартуют с `state` (батч 1; nil — без
+    /// состояния). После — подключено ровно прежнее: те же массивы, а не
+    /// копия через `initialState` (обучаемое множество состояния работает с
+    /// ними напрямую), в том числе при ошибке. Граф, построенный внутри и
+    /// вычисленный позже, держит `state` сам. Внутри `withoutInitialState`
+    /// не действует: там состояние приостановлено.
+    ///
+    /// Нужно там, где состояние своё у группы текстов: свёрнутая инструкция
+    /// эмбеддера (`InstructionCache`) подключается на время своей группы.
+    func withInitialState<T>(_ state: RWKVBatchState?, _ body: () throws -> T) rethrows -> T {
+        let saved = initialLayers
+        defer { initialLayers = saved }
+        initialState = state
+        return try body()
+    }
+
     /// Отпечаток подключённого состояния (`StateFile.stateFingerprint`):
     /// `none` без состояния или при нулевом, иначе `sha256:…`. Входит в
     /// контракты кэшей реранкера.

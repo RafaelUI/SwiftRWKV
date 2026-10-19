@@ -95,6 +95,10 @@ public struct EmbeddingStage {
     /// (`EmbeddingMetrics.evaluateRetrieval(dedupeCandidates:)`). Для данных,
     /// где документы повторяются; по умолчанию — прежний пул 2N.
     public var dedupeEvaluationPool = false
+    /// Retrieval: инструкции запросов оценки свёрнуты в состояние
+    /// (`EmbeddingMetrics.evaluateRetrieval(foldInstructions:)`): та же
+    /// оценка без токенов инструкции в каждом запросе. Только пулинг `.last`.
+    public var foldInstructions = false
 
     public init(task: EmbeddingTask,
                 train: [EmbeddingSample],
@@ -361,7 +365,8 @@ public enum EmbeddingFinetune {
             return .ranking(EmbeddingMetrics.evaluateRetrieval(
                 model: model, tokenizer: tokenizer, rows: stage.heldOut,
                 maxChars: stage.maxChars, terminator: terminator,
-                maxTokens: stage.maxTokens, dedupeCandidates: stage.dedupeEvaluationPool))
+                maxTokens: stage.maxTokens, dedupeCandidates: stage.dedupeEvaluationPool,
+                foldInstructions: stage.foldInstructions))
         case .sts:
             return .pairwise(EmbeddingMetrics.evaluateSTS(
                 model: model, tokenizer: tokenizer, rows: stage.heldOut,
