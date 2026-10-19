@@ -290,8 +290,12 @@ neither is a default to recommend.
 
 The direction this points to is a state **per instruction** — trained, or simply
 the instruction folded into a state (`foldPrompt`) and attached to queries only,
-which gives the instruction's effect without its tokens in every query. Not
-measured yet.
+which gives the instruction's effect without its tokens in every query. The
+folded form is done (19.10, `InstructionCache`, see
+[Embedding.md](Embedding.md#folding-the-instruction-into-a-state)): on Tool_Use
+it gives the same MRR as the instruction inline (−3.5·10⁻⁷, three seeds) with
+9.5 times fewer query tokens and a 6 times faster evaluation. It is a cache, not
+a gain in quality; a trained state per instruction is the open step.
 
 ### Cost of a step
 
@@ -319,8 +323,10 @@ compressed base fits at 1 × 512, where its top layers do not.
 
 ## Not done
 
-- A state **per instruction** (trained, or the instruction folded into a state
-  and attached to queries only) — the next step after the many-instruction
-  measurement above — is not implemented: an attached state is one per model,
-  and an embedding batch cannot mix states.
+- A **trained** state per instruction — the next step after the
+  many-instruction measurement above — is not implemented. The untrained form,
+  the instruction folded into a state, is (`InstructionCache`, evaluation by
+  groups of one instruction); training one state per instruction needs batches
+  of one instruction or a state of shape [B, …] in the block, since an
+  attached state is one per model.
 - Neuro (the iOS app) does not use states yet; the file format and API are ready.

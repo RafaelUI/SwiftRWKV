@@ -449,7 +449,9 @@ agent policies, and the 126 instructed tasks of MAIR — dropping the instructio
 costs −0.253 and −0.025 MRR. A trained state wins back part of it (Tool_Use:
 0.394 → 0.552…0.570), but a head trained on the same rows wins back as much
 (0.557), and no arm reaches the quality with the instruction: one state cannot
-stand for many different instructions. Same section of state-tuning.md.
+stand for many different instructions. Same section of state-tuning.md. A state
+per instruction — the instruction folded once — keeps the quality with the
+instruction and drops its tokens from every query (below).
 
 #### Attaching the state to queries only
 
@@ -483,6 +485,86 @@ let docs = embedder.embed(["Bees make honey from nectar."], role: .document)
 let query = embedder.embed("how is honey made", role: .query)
 print(cosineSimilarity(query.reshaped([1, -1]), docs).shape)
 ```
+
+### Folding the instruction into a state
+
+A query with an instruction is `Instruct: X\nQuery: q`. RWKV reads it left to
+right, and all the instruction gives the query is the state after the
+instruction's tokens. `InstructionCache` folds each distinct instruction into a
+state once (`foldPrompt`) and embeds the queries of that instruction starting
+from it, so a query pays only for its own tokens. With agent policies of about a
+thousand tokens that is most of what a query costs.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+guard let tok = WorldTokenizer(
+        vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+    fatalError("cannot read vocabulary")
+}
+let model = EmbeddingModel(backbone: base)
+let cache = InstructionCache(model: model, tokenizer: tok)
+let instruct = "Instruct: Pick the tool that serves the user's request.\n"
+let queries = try cache.embedQueries([
+    instruct + "Query: cancel my order",
+    instruct + "Query: where is my parcel",
+    "a query without an instruction",
+])
+print(queries.shape, cache.foldedCount, cache.foldedTokens)   // [3, D] 1 …
+```
+
+- **Where it is cut.** The prefix is `Instruct: X\n`, the tail `Query: q`.
+  Cut there, the two pieces tokenize exactly as the whole line (checked on
+  1,500 rows of the Tool_Use set below and 1,500 of MAIR); cut after `Query: `,
+  World's greedy vocabulary glues the space to the next word and nearly every
+  row tokenizes differently. Rows without an instruction of this form are
+  embedded as they are; the order of the rows is kept.
+- **The same numbers**, up to summation order at the seam — with one
+  exception: `maxTokens` now cuts the tail, not the whole line, so a long
+  instruction can no longer push the query out of the window.
+- **Pooling `.last` only** (`.mean` throws): a mean over the tail is not the
+  mean over the line.
+- **The attached state is the start.** With a trained state attached the order
+  is trained state → instruction → query, as it is inline. The cache notices a
+  different attached state by its fingerprint and folds again; after the
+  weights change (training), make a new cache. The attached state is restored
+  after each call — the same arrays, not a copy
+  (`X070Backbone.withInitialState`).
+- **Folding goes in pieces** of `foldChunkTokens` (512) chained through the
+  state: one pass over a 3,000-token instruction builds the graph of every
+  layer at once and raised the evaluation peak from 0.69 to 1.27 GB (60
+  queries, untrained head); in pieces the peak stays at the inline level
+  (table below).
+
+Evaluation: `evaluateRetrieval(foldInstructions: true)`,
+`EmbeddingStage.foldInstructions`, `embed-run --fold-instructions`;
+`embed-run --compare-folded` evaluates both ways on the same weights,
+interleaved, and writes both rankings to the report.
+
+Measured on Tool_Use (the tool-selection set in
+[state-tuning.md](state-tuning.md#many-and-long-instructions-1810)): 0.1B
+`reduction`, top 4 layers trained 200 steps with the instruction inline, then
+both evaluations on the same weights, three seeds, 300 held-out queries with
+23 distinct instructions, `--max-tokens 2816`, duplicate candidates merged;
+release build, M4, arms interleaved, the first round a warm-up:
+
+| seed | MRR inline | MRR folded | rows ranked differently | evaluation inline | folded | peak MLX inline / folded |
+|---|---|---|---|---|---|---|
+| 0 | 0.6439 | 0.6439 | 0 | 78.9 s | 13.1 s | 0.72 / 0.74 GB |
+| 1 | 0.6470 | 0.6470 | 2 (rank 30→31, 86→87) | 80.6 s | 13.2 s | 0.72 / 0.74 GB |
+| 2 | 0.6522 | 0.6522 | 1 (rank 34→33) | 84.2 s | 13.7 s | 0.72 / 0.74 GB |
+
+Folded − inline: −3.5·10⁻⁷ [−3.7·10⁻⁶; +2.8·10⁻⁶] MRR (paired bootstrap over
+queries, three seeds); the three moved rows are last-bit ties deep in the
+ranking. Query tokens: 1,112 per query inline against 48 per query plus 20,563
+folded once — 9.5 times fewer — and the evaluation, which also embeds the
+documents, runs 6.0–6.1 times faster. No row was cut by `--max-tokens` here.
+The inline arm reproduces, row for row, the "with instruction" evaluation of
+the earlier measurement on the same seeds. Process footprint 2.10–2.12 GB
+(training dominates), swap unchanged over each run.
+
+Not for training with trainable layers: the folded state depends on the weights,
+which change every step. With a frozen base (only the head trains) it would
+hold for the whole run; that is not implemented.
 
 ### Training top layers over a quantized base
 

@@ -285,6 +285,38 @@ func doc_Embedding_8() throws {
         fatalError("cannot read vocabulary")
     }
     let model = EmbeddingModel(backbone: base)
+    let cache = InstructionCache(model: model, tokenizer: tok)
+    let instruct = "Instruct: Pick the tool that serves the user's request.\n"
+    let queries = try cache.embedQueries([
+        instruct + "Query: cancel my order",
+        instruct + "Query: where is my parcel",
+        "a query without an instruction",
+    ])
+    print(queries.shape, cache.foldedCount, cache.foldedTokens)   // [3, D] 1 …
+}
+
+func doc_Embedding_9() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        // Geometry is derived from weight shapes. There is simply no
+        // configuration here that could be specified incorrectly.
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    guard let tok = WorldTokenizer(
+            vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+        fatalError("cannot read vocabulary")
+    }
+    let model = EmbeddingModel(backbone: base)
     let rows = try EmbeddingDataset.loadJSONL(path: "~/data/litretrieval.jsonl",
                                               limit: 500)
 
@@ -304,7 +336,7 @@ func doc_Embedding_8() throws {
     print(c.accuracy, c.candidatesPerRow, c.predictions.count)
 }
 
-func doc_Embedding_9() throws {
+func doc_Embedding_10() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
