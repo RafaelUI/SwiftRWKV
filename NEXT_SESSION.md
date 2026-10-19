@@ -17,6 +17,100 @@
 
 ---
 
+## 19.10 — снимок состояния генерации (готов, не закоммичен); кэш свёрнутых инструкций (начат)
+
+Сессия остановлена по переполнению контекста. Ничего не запушено сверх 18.10.
+
+### Не запушено (пуш — только по слову Алексея)
+- SwiftRWKV: `bc4ec0c` (docs: много и длинных инструкций), `e77dc67` (NEXT_SESSION 18.10)
+  и коммит с этим разделом.
+- rwkv-quant: `739aeb4` (статья: много/длинные инструкции), ahead 1.
+
+### 1. Снимок состояния генерации — сделан, гейты зелёные, НЕ закоммичен
+Задача Алексея: «снимок» = состояние генерации — сохранить `RWKVState` посреди
+разговора в файл и продолжить позже, не прогоняя историю заново.
+- `Sources/RWKVGen/X070Generation.swift`: doc-комментарий к `RWKVState` (это
+  значение: `let saved = state` — уже снимок в памяти) и
+  `RWKVState.asBatchState() -> RWKVBatchState` (B=1).
+- `Sources/RWKVGen/InitialState.swift`: `StateFile.Kind.snapshot`, `dtypeNames`,
+  `StateFile.saveSnapshot(_:base:to:note:)` (kind "snapshot", тензоры fp32,
+  метаданные `shift_dtype`) и `StateFile.loadSnapshot(_:base:allowOtherBase:)`
+  (проверки контракта/базы через `load`, сдвиги восстанавливаются в
+  `shift_dtype`, иначе в dtype `ln0.weight`). Пояснение: после префилла сдвиги
+  fp32 даже на bf16-модели — поэтому dtype пишется в файл, а не берётся из модели.
+- `Tests/RWKVGenTests/StateSnapshotTests.swift` — 6 тестов (значение в памяти;
+  файл туда-обратно → продолжение побитно; восстановление bf16/fp16 сдвигов;
+  `generate` с семплингом продолжается теми же токенами, pipelined true/false;
+  отказы: чужая база / allowOtherBase / другая архитектура; снимок как
+  подключённое начальное состояние ≈ пошаговому < 1e-4). Все проходят.
+- `Scripts/mutations_snapshot.sh` — 7 мутаций, все пойманы.
+- `docs/Inference.md` — раздел «### Snapshots: saving a conversation and
+  resuming it» перед «### What sampling costs»; `DocExamples.generated.swift`
+  перегенерирован, check_docs: 44 блока OK.
+- Полный прогон `com.swr.full7` (лог `~/Develop/swr_bench_keep/w1014/bg_full7.log`,
+  вывод `~/Develop/swr_bench_keep/w1018/full7_out.txt`) на 13:50 шёл: 407 passed,
+  0 failed. **Дальше:** дождаться `EXIT 0` в логе, проверить
+  `grep -E "failed|error" full7_out.txt` и итоговую строку «Executed N tests»,
+  `launchctl bootout gui/$(id -u)/com.swr.full7`, затем ОДИН коммит снимка:
+  `git add Sources/RWKVGen/X070Generation.swift Sources/RWKVGen/InitialState.swift
+  Tests/RWKVGenTests/StateSnapshotTests.swift Scripts/mutations_snapshot.sh
+  docs/Inference.md Tests/RWKVGenTests/DocExamples.generated.swift`
+  (НЕ брать `InstructionCache.swift` — он ещё не собран). Внимание: full7
+  собран ДО появления `InstructionCache.swift`, так что на прогон он не влиял.
+  Обновить «Итог» вверху записки (было 598 тестов; станет 604).
+
+### 2. Кэш свёрнутых инструкций — начат
+Задача («берёмся»): состояние на каждую инструкцию. Первый шаг — без обучения:
+свернуть инструкцию в состояние `foldPrompt` один раз и подключать его только к
+запросам этой инструкции; оценка группами по инструкции; замер «свёрнутая
+против инструкции в строке» на Tool_Use (MRR — должен совпасть; время оценки и
+сэкономленные токены — выигрыш). Второй шаг (потом) — обученное состояние на
+инструкцию.
+
+Найдено и проверено:
+- Где резать: префикс «Instruct: X\n» | хвост «Query: q» — токенизация кусков
+  совпадает со сплошной в 100 % из 1500 строк Tool_Use и 1500 MAIR. Разрез
+  «Query: » | «q» расходится почти всегда (World склеивает пробел со словом);
+  «Query:» | « q» тоже 0 расхождений, но выбран разрез по «\n».
+- `encodeRow(tokenizer:text:terminator:maxTokens:)` — EmbeddingDataset.swift:201;
+  `foldPrompt(_ ids:[Int], from:)` — InitialState.swift:126 (без `from` стартует
+  с подключённого состояния).
+
+Написан, но НЕ собран и не проверен: `Sources/RWKVEmbedding/InstructionCache.swift`
+(`InstructionCache`: `split`, `state(forPrefix:)` с мемоизацией и сбросом по
+отпечатку подключённого состояния, `embedQueries` — группировка по префиксу,
+подключение свёрнутого состояния на время группы с восстановлением прежнего,
+строки без инструкции — как есть, порядок сохраняется, `.mean` → ошибка).
+Перед сборкой сверить имена, которые я предположил: `backbone.initialStateFingerprint`
+(возможно, это `StateFile.stateFingerprint(...)` или иное), `StateFile.noInitialState`,
+`EmbeddingMetrics.evaluationBatchTokens`, сигнатуру `EmbeddingMetrics.embedAll(...role:)`,
+тип `backbone.initialState` (RWKVBatchState?) и что `foldPrompt` возвращает его же.
+
+Осталось:
+1. Собрать, поправить имена.
+2. Тесты (fp32 TinyBackbone): свёрнутая ≈ в строке (< ~1e-5) при одинаковой
+   токенизации; порядок строк при смешанных инструкциях и строках без инструкции;
+   подключённое состояние модели после вызова — прежнее (в т.ч. при ошибке);
+   `.mean` отказ; пересвёртка при смене подключённого состояния; свёртка
+   стартует с подключённого («обученное → инструкция → запрос»); счётчики
+   `foldedCount/foldedTokens`.
+3. `EmbeddingStage.foldInstructions`, `evaluateRetrieval(foldInstructions:)`,
+   флаг embed-run `--compare-folded` (после стадии 1 — inline и folded, время,
+   построчные результаты в отчёте).
+4. Мутации `Scripts/mutations_instruction_cache.sh` (разрез не по «\n»; без
+   восстановления состояния; без сброса по отпечатку; перепутанный порядок;
+   свёртка с нуля вместо подключённого; хвост с инструкцией).
+5. Замер на Tool_Use (`~/Develop/swr_bench_keep/w1018/tool/tool_all.jsonl`):
+   MRR inline против folded на тех же весах (должны совпасть; расхождение —
+   только обрезка `maxTokens`, она теперь действует на хвост — посчитать, сколько
+   строк inline обрезалось), время оценки, токены. MAIR — по желанию.
+6. Документ: docs/Embedding.md (раздел о свёрнутых инструкциях; оговорка — кэш
+   для ОБУЧЕНИЯ с обучаемыми верхними слоями невозможен: свёртка зависит от
+   весов), state-tuning.md «Not done», статья, этот файл.
+7. Итог Алексею с мнением; пушей не делать.
+
+---
+
 ## 18.10 — инструкций много и они длинные: Tool_Use и MAIR
 
 Данные и скрипты — `~/Develop/swr_bench_keep/w1018` (сырые данные не хранятся):
