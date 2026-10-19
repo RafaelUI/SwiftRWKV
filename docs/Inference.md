@@ -252,6 +252,49 @@ exact equality. Without this, continuing generation from the returned state
 would silently drop one token — an error that surfaces a hundred steps later
 as text that is merely a bit wrong.
 
+### Snapshots: saving a conversation and resuming it
+
+RWKV carries the whole context in a fixed-size state, so a conversation can be
+put away and resumed without feeding its history again. `RWKVState` is a value
+— MLX arrays are immutable and `prefill` / `step` replace them rather than
+modify them — so `let saved = state` already is a snapshot: generating further
+from `state` does not touch it, and continuing from `saved` is bit-identical to
+continuing from that point. To keep it across launches:
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+guard let tok = WorldTokenizer(
+        vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+    fatalError("cannot read vocabulary")
+}
+let url = URL(fileURLWithPath: "chat.state.safetensors")
+
+var state = base.startState()
+_ = base.generate(prompt: tok.encode("User: hi\n\nAssistant:"),
+                  config: GenerationConfig(maxTokens: 64, stopStrings: ["\n\n"]),
+                  tokenizer: tok, state: &state)
+try StateFile.saveSnapshot(state, base: base, to: url, note: "chat 42")
+
+// later, possibly in another process
+var resumed = try StateFile.loadSnapshot(url, base: base).state
+let next = base.generate(prompt: tok.encode("\n\nUser: and then?\n\nAssistant:"),
+                         config: GenerationConfig(maxTokens: 64, stopStrings: ["\n\n"]),
+                         tokenizer: tok, state: &resumed)
+print(next.text)
+```
+
+The file is a state file (`StateFile`, kind `snapshot`): the recurrent state in
+fp32 plus the model's contract and base fingerprint, so a snapshot taken on one
+model is refused on another (`allowOtherBase: true` to load it anyway). The
+token-shift parts are kept in the type the model computed them in and restored
+to it, so the round trip is bit-exact; a test resumes a sampled, pipelined
+`generate` from a file and requires the same tokens as the uninterrupted
+session, for fp32, bf16 and fp16 models. The same file opens with `load` as a
+batch-1 state and can be attached as an initial state (`base.initialState`) —
+a snapshot of a prompt and a folded prompt are one object. What is not in the
+file: sampler settings and the penalty history, which `generate` starts afresh
+on every call anyway.
+
 ### What sampling costs
 
 Measured on 0.1B, **debug build**, 64 tokens each, after warm-up (see the note

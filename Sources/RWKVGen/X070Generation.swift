@@ -18,6 +18,13 @@ import RWKVKernel
 // ───────────────────────────────────────────────────────────────────────
 
 /// Рекуррентное состояние модели (B=1).
+///
+/// **Снимок.** Это значение: массивы MLX неизменяемы, а `prefill` и `step`
+/// заменяют их новыми, а не правят. Поэтому `let saved = state` — уже снимок:
+/// дальнейшая генерация в `state` его не трогает, и продолжение с `saved`
+/// побитно то же, что было бы с исходного места. На диск и обратно —
+/// `StateFile.saveSnapshot` / `loadSnapshot` (с отпечатком базы, как у
+/// файла начального состояния).
 public struct RWKVState {
     public var wkv: [MLXArray]        // [nLayer] × [H, D, D]  fp32
     public var tmixPrev: [MLXArray]   // [nLayer] × [1, D]
@@ -55,6 +62,17 @@ public struct RWKVState {
         tmixPrev = (0 ..< L).map { batch.layerTmixShift($0)[row] }    // [1,D]
         cmixPrev = (0 ..< L).map { batch.layerCmixShift($0)[row] }    // [1,D]
         vFirst = nil
+    }
+
+    /// То же состояние батчем из одной строки (`RWKVBatchState`: стопка
+    /// `[L,1,…]`) — обратное к `init(_:row:)`. Нужно, чтобы снимок генерации
+    /// записать файлом состояния (`StateFile.saveSnapshot`) или подключить к
+    /// модели как начальное (`backbone.initialState`). `vFirst` не переносится:
+    /// он живёт внутри одного шага (см. `init(_:row:)`).
+    public func asBatchState() -> RWKVBatchState {
+        RWKVBatchState.stacked(wkv: wkv.map { $0.expandedDimensions(axis: 0) },
+                               tmix: tmixPrev.map { $0.expandedDimensions(axis: 0) },
+                               cmix: cmixPrev.map { $0.expandedDimensions(axis: 0) })
     }
 
     /// Состояние из готовых массивов (для собранного шага).

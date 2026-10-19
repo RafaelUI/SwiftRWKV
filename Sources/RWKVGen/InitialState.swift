@@ -314,6 +314,8 @@ public enum StateFile {
 
     public enum Kind: String, Sendable {
         case tuned, prompt, tunedPrompt = "tuned+prompt"
+        /// Снимок состояния генерации (`saveSnapshot`).
+        case snapshot
     }
 
     /// Метаданные файла.
@@ -466,6 +468,61 @@ public enum StateFile {
         eval(Array(arrays.values))
         try MLX.save(arrays: arrays, metadata: md, url: url)
         return info
+    }
+
+    // ── Снимок состояния генерации ──────────────────────────────────────
+    //
+    // Тот же файл, что у начального состояния (формат, контракт, отпечаток
+    // базы), kind = snapshot. Отличие одно: сдвиги генерации хранятся в типе
+    // потока модели (bf16 / fp16 / fp32), а файл всегда fp32 — поэтому тип
+    // записывается (`shift_dtype`) и при чтении восстанавливается. fp32
+    // держит bf16 и fp16 точно, круг туда-обратно побитный. Файл читается и
+    // `load` как обычное состояние батча 1 — его можно подключить к модели
+    // как начальное (`backbone.initialState`).
+
+    static let dtypeNames: [DType: String] = [.float32: "float32", .bfloat16: "bfloat16", .float16: "float16"]
+
+    /// Записать снимок состояния генерации (после `prefill` / `step` /
+    /// `generate`). `base` — модель, которая его посчитала.
+    @discardableResult
+    public static func saveSnapshot(_ state: RWKVState, base bb: X070Backbone, to url: URL,
+                                    note: String = "") throws -> Info {
+        let shiftType = state.tmixPrev.first?.dtype ?? .float32
+        guard let name = dtypeNames[shiftType] else {
+            throw Failure.otherArchitecture("тип сдвигов \(shiftType) не поддерживается")
+        }
+        let batch = state.asBatchState()
+        if let why = mismatch(batch, bb.cfg) { throw Failure.otherArchitecture(why) }
+        let info = Info(kind: Kind.snapshot.rawValue, trained: [], note: note,
+                        baseFingerprint: baseFingerprint(bb), nLayer: bb.cfg.nLayer,
+                        nEmbd: bb.cfg.nEmbd, nHead: bb.cfg.nHead, headSize: bb.cfg.headSize)
+        let md = ["format": format, "version": version, "kind": info.kind, "trained": "",
+                  "base_fingerprint": info.baseFingerprint, "note": note, "shift_dtype": name,
+                  "n_layer": String(info.nLayer), "n_embd": String(info.nEmbd),
+                  "n_head": String(info.nHead), "head_size": String(info.headSize)]
+        let arrays = ["wkv": batch.wkv.asType(.float32),
+                      "tmix_shift": batch.tmixShift.asType(.float32),
+                      "cmix_shift": batch.cmixShift.asType(.float32)]
+        eval(Array(arrays.values))
+        try MLX.save(arrays: arrays, metadata: md, url: url)
+        return info
+    }
+
+    /// Прочитать снимок и вернуть состояние генерации, с которого продолжает
+    /// `step` / `generate`. Проверки — как у `load`. Тип сдвигов — записанный
+    /// в файле; у файла без него (обычный файл состояния) — тип потока модели.
+    public static func loadSnapshot(_ url: URL, base bb: X070Backbone,
+                                    allowOtherBase: Bool = false) throws -> (state: RWKVState, info: Info) {
+        let (batch, info) = try load(url, base: bb, allowOtherBase: allowOtherBase)
+        let md = try loadArraysAndMetadata(url: url).1
+        let shiftType = md["shift_dtype"].flatMap { n in dtypeNames.first { $0.value == n }?.key }
+            ?? bb.weight("ln0.weight").dtype
+        var s = RWKVState(batch, row: 0)
+        s.wkv = s.wkv.map { $0.asType(.float32) }
+        s.tmixPrev = s.tmixPrev.map { $0.asType(shiftType) }
+        s.cmixPrev = s.cmixPrev.map { $0.asType(shiftType) }
+        s.eval()
+        return (s, info)
     }
 
     /// Прочитать файл состояния. С `base` проверяются контракт (несовпадение —
