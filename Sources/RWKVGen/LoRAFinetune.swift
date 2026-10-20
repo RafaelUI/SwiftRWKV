@@ -127,9 +127,28 @@ public enum LoRAFinetune {
         chunk > 0 ? Swift.max(1, chunk / Swift.max(1, batch)) : length
     }
 
+    // ── Маска лосса ──
+    // Цель < 0 — токен не входит в лосс (вопрос при обучении ответу, добивка
+    // батча). Лосс — среднее по ВОШЕДШИМ токенам. Без отрицательных целей —
+    // прежний путь, побитно тот же (ветвь выбирается по самим целям).
+
+    /// Есть ли в целях исключённые токены (< 0).
+    static func ignoresTargets(_ y: MLXArray) -> Bool { y.min().item(Int32.self) < 0 }
+
+    /// Сколько токенов входит в лосс.
+    static func lossTokens(_ y: MLXArray) -> Int { (y .>= 0).asType(.int32).sum().item(Int.self) }
+
+    /// Сумма кросс-энтропии по токенам с целью >= 0.
+    static func maskedCrossEntropySum(logits: MLXArray, targets: MLXArray) -> MLXArray {
+        let keep = (targets .>= 0).asType(.float32)
+        let ce = crossEntropy(logits: logits, targets: MLX.maximum(targets, MLXArray(Int32(0))), reduction: .none)
+        return (ce.asType(.float32) * keep).sum()
+    }
+
     static func languageModelLoss(_ bb: X070Backbone, _ batch: LoRABatch, chunk chunkBudget: Int = 0) -> MLXArray {
         let T0 = batch.x.shape[1]
         let chunk = lossPieceTokens(chunk: chunkBudget, batch: batch.x.shape[0], length: T0)
+        let masked = ignoresTargets(batch.y)
         if chunk > 0, T0 > chunk, bb.headIsConstant {
             let h = bb.body(batch.x)                        // [B,T,D]
             let B = h.shape[0], V = bb.cfg.vocab
@@ -140,16 +159,23 @@ public enum LoRAFinetune {
                 let targets = batch.y[0..., from ..< to].reshaped([-1]).asType(.int32)
                 let piece = checkpointed { (ins: [MLXArray]) -> [MLXArray] in
                     let lg = bb.projectForBlock(ins[0], "head.weight", lora: nil)
-                    return [crossEntropy(logits: lg.reshaped([-1, V]), targets: targets,
-                                         reduction: .sum).asType(.float32)]
+                    return [masked
+                        ? maskedCrossEntropySum(logits: lg.reshaped([-1, V]), targets: targets)
+                        : crossEntropy(logits: lg.reshaped([-1, V]), targets: targets,
+                                       reduction: .sum).asType(.float32)]
                 }
                 total = total + piece([h[0..., from ..< to]])[0]
                 from = to
             }
-            return total / Float(B * T0)
+            return total / Float(masked ? lossTokens(batch.y) : B * T0)
         }
         let logits = bb(batch.x)                            // [B,T,V]
         let B = logits.shape[0], T = logits.shape[1], V = logits.shape[2]
+        if masked {
+            return maskedCrossEntropySum(logits: logits.reshaped([B * T, V]),
+                                         targets: batch.y.reshaped([B * T]).asType(.int32))
+                / Float(lossTokens(batch.y))
+        }
         return crossEntropy(logits: logits.reshaped([B * T, V]),
                             targets: batch.y.reshaped([B * T]).asType(.int32),
                             reduction: .mean)
