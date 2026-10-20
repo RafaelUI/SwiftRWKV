@@ -63,7 +63,8 @@ struct Args {
     var dedupePool = false         // retrieval: сливать одинаковые тексты кандидатов оценки
     var foldInstructions = false   // retrieval: инструкции запросов оценки свёрнуты в состояние
     var compareFolded = false      // после первой стадии (или вместо обучения): в строке против свёрнутой
-    var compareRounds = 3          // кругов сравнения; первый — прогрев, во время не входит
+    var compareRounds = 3          // кругов сравнения; первый — прогрев, во время не входит; 1 — только качество
+    var compareMaxTokens: Int? = nil // предел токенов строки в сравнении (иначе — стадии)
     var curriculum: String? = nil  // план стадий (JSON); с --run-dir
     var runDir: String? = nil
     var stateScope = "all"         // all | queries: к каким текстам применяется подключённое состояние
@@ -129,7 +130,8 @@ func parse() -> Args {
         case "--dedupe-pool": a.dedupePool = true
         case "--fold-instructions": a.foldInstructions = true
         case "--compare-folded": a.compareFolded = true
-        case "--compare-rounds": a.compareRounds = max(2, Int(v()) ?? a.compareRounds)
+        case "--compare-rounds": a.compareRounds = max(1, Int(v()) ?? a.compareRounds)
+        case "--compare-max-tokens": a.compareMaxTokens = Int(v())
         case "--curriculum": a.curriculum = v()
         case "--run-dir": a.runDir = v()
         case "--sample-seed": a.sampleSeed = UInt64(v())
@@ -429,7 +431,9 @@ func compareFolded(_ st: EmbeddingStage) {
     guard st.task == .retrieval else { print("--compare-folded: только retrieval"); exit(2) }
     guard model.pooling == .last else { print("--compare-folded: нужен пулинг .last"); exit(2) }
     let anchors = st.heldOut.map { String($0.anchor.prefix(st.maxChars)) }
-    let room = (st.maxTokens ?? Int.max) - 1            // токенов строки без терминатора
+    // --compare-max-tokens: обрезка в сравнении своя (веса обучены при --max-tokens)
+    let maxTokens = args.compareMaxTokens ?? st.maxTokens
+    let room = (maxTokens ?? Int.max) - 1               // токенов строки без терминатора
     var withInstr = 0, inlineCut = 0, tailCut = 0, inlineTok = 0, tailTok = 0
     var cutRows: [Int] = [], prefixTok: [String: Int] = [:]
     for (i, a) in anchors.enumerated() {
@@ -465,7 +469,7 @@ func compareFolded(_ st: EmbeddingStage) {
             let t0 = Date()
             let r = EmbeddingMetrics.evaluateRetrieval(
                 model: model, tokenizer: tok, rows: st.heldOut, maxChars: st.maxChars,
-                maxTokens: st.maxTokens, dedupeCandidates: st.dedupeEvaluationPool, foldInstructions: arm == 1)
+                maxTokens: maxTokens, dedupeCandidates: st.dedupeEvaluationPool, foldInstructions: arm == 1)
             let dt = Date().timeIntervalSince(t0)
             if round > 0 { times[arm].append(dt); peaks[arm].append(Double(GPU.peakMemory) / 1e9) }
             if let prev = metrics[arm], prev != r || ranks[arm] != row {
@@ -486,10 +490,15 @@ func compareFolded(_ st: EmbeddingStage) {
                  + "(из них не обрезанных в строке %d); на необрезанных MRR %.4f / %.4f; на обрезанных %.4f / %.4f",
                  metrics[0]!.mrr, metrics[1]!.mrr, metrics[1]!.mrr - metrics[0]!.mrr, differ.count, differUncut.count,
                  mrr(ranks[0], uncut), mrr(ranks[1], uncut), mrr(ranks[0], cutRows), mrr(ranks[1], cutRows)))
-    print(String(format: "СВЁРТКА, время оценки (медиана %d кругов): в строке %.2f с, свёрнутая %.2f с (%.2fx); "
-                 + "пик MLX %.2f / %.2f ГБ; свёрнуто %d инструкций, %d токенов",
-                 times[0].count, med(times[0]), med(times[1]), med(times[0]) / med(times[1]),
-                 med(peaks[0]), med(peaks[1]), folds.count, folds.tokens))
+    if times[0].isEmpty {
+        print("СВЁРТКА: время не мерилось (--compare-rounds 1 — только качество); "
+              + "свёрнуто \(folds.count) инструкций, \(folds.tokens) токенов")
+    } else {
+        print(String(format: "СВЁРТКА, время оценки (медиана %d кругов): в строке %.2f с, свёрнутая %.2f с (%.2fx); "
+                     + "пик MLX %.2f / %.2f ГБ; свёрнуто %d инструкций, %d токенов",
+                     times[0].count, med(times[0]), med(times[1]), med(times[0]) / med(times[1]),
+                     med(peaks[0]), med(peaks[1]), folds.count, folds.tokens))
+    }
     report["cmp_inline"] = metrics[0]!.mrr; report["cmp_folded"] = metrics[1]!.mrr
     report["per_row_cmp_inline"] = ranks[0]; report["per_row_cmp_folded"] = ranks[1]
     report["cmp_inline_seconds"] = times[0]; report["cmp_folded_seconds"] = times[1]
@@ -498,6 +507,7 @@ func compareFolded(_ st: EmbeddingStage) {
     report["cmp_fold_tokens"] = foldTok; report["cmp_inline_tokens"] = inlineTok; report["cmp_tail_tokens"] = tailTok
     report["cmp_inline_cut"] = inlineCut; report["cmp_tail_cut"] = tailCut; report["cmp_cut_rows"] = cutRows
     report["cmp_rows_differ"] = differ.count; report["cmp_rows_differ_uncut"] = differUncut.count
+    report["cmp_max_tokens"] = maxTokens ?? 0
     report["cmp_cache_limit_gb"] = Double(MLX.Memory.cacheLimit) / 1e9
 }
 
@@ -623,6 +633,7 @@ if let mode {
         report["state_final_loss"] = Double(r2.finalLoss)
         report["second_stage"] = args.thenHead ? "head" : "state"
     }
+
 } else {
     if args.cacheGB > 0 { MLX.Memory.cacheLimit = Int(args.cacheGB * 1e9) }
     _ = EmbeddingMetrics.embedAll(model: model, tokenizer: tok, texts: ["прогрев"], role: .query)   // первое касание весов — не в замер
