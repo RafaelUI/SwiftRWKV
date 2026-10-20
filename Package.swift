@@ -50,6 +50,9 @@ let package = Package(
         // Прогон эмбеддера: оценка и одна стадия дообучения на плотной базе
         // либо на базе из .rwkvq.
         .executable(name: "embed-run", targets: ["EmbedRun"]),
+        // Ответы чат-модели на список вопросов: системная инструкция в
+        // строке, свёрнутая в состояние, или обученное состояние вместо неё.
+        .executable(name: "gen-run", targets: ["GenRun"]),
     ],
     dependencies: [
         .package(
@@ -140,6 +143,10 @@ let package = Package(
             name: "EmbedRun",
             dependencies: ["RWKVEmbedding", "RWKVGen",
                            .product(name: "MLX", package: "mlx-swift")]
+        ),
+        .executableTarget(
+            name: "GenRun",
+            dependencies: ["RWKVGen", .product(name: "MLX", package: "mlx-swift")]
         ),
         .executableTarget(
             name: "DecodeBench",
