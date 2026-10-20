@@ -316,6 +316,53 @@ func doc_Embedding_9() throws {
             vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
         fatalError("cannot read vocabulary")
     }
+    // The bank is for queries only: documents never see it.
+    let model = EmbeddingModel(backbone: base, stateScope: .queriesOnly)
+    let instructions = ["Instruct: Pick the airline tool for the request.\n",
+                        "Instruct: Pick the banking tool for the request.\n"]
+    // Start from the folded instructions: exactly the quality with them inline.
+    let folded = InstructionCache(model: model, tokenizer: tok).bank(instructions)
+    let rows = [
+        EmbeddingSample(anchor: "Query: change my flight", positive: "change_flight: …",
+                        negative: "get_balance: …", task: .retrieval, state: 0),
+        EmbeddingSample(anchor: "Query: what is on my card", positive: "get_balance: …",
+                        negative: "change_flight: …", task: .retrieval, state: 1),
+    ]
+    let bank = StateBankTrainableSet(base, initial: folded)
+    let stage = EmbeddingStage(task: .retrieval, train: rows, heldOut: rows,
+                               config: TrainingConfig(lr: 1e-4, maxSteps: 200),
+                               batchSize: 4)
+    let result = try EmbeddingFinetune.runStage(model: model, tokenizer: tok,
+                                                trainable: bank, stage: stage)
+    print(result.before as Any, result.after as Any)
+    // Serving: a query with the row of its instruction.
+    let query = EmbeddingMetrics.embedAll(model: model, tokenizer: tok,
+                                          texts: ["Query: cancel my trip"],
+                                          role: .query, states: [0])
+    print(query.shape)
+}
+
+func doc_Embedding_10() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        // Geometry is derived from weight shapes. There is simply no
+        // configuration here that could be specified incorrectly.
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    guard let tok = WorldTokenizer(
+            vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+        fatalError("cannot read vocabulary")
+    }
     let model = EmbeddingModel(backbone: base)
     let rows = try EmbeddingDataset.loadJSONL(path: "~/data/litretrieval.jsonl",
                                               limit: 500)
@@ -336,7 +383,7 @@ func doc_Embedding_9() throws {
     print(c.accuracy, c.candidatesPerRow, c.predictions.count)
 }
 
-func doc_Embedding_10() throws {
+func doc_Embedding_11() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)

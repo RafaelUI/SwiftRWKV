@@ -295,7 +295,12 @@ folded form is done (19.10, `InstructionCache`, see
 [Embedding.md](Embedding.md#folding-the-instruction-into-a-state)): on Tool_Use
 it gives the same MRR as the instruction inline (−3.5·10⁻⁷, three seeds) with
 9.5 times fewer query tokens and a 6 times faster evaluation. It is a cache, not
-a gain in quality; a trained state per instruction is the open step.
+a gain in quality — except where the window is shorter than the instruction
+(at 512 tokens: +0.325). A **trained** state per instruction (20.10, a state
+bank, see [Embedding.md](Embedding.md#a-trained-state-per-instruction-a-state-bank)),
+started from the folded instructions, adds +0.026 [+0.015; +0.037] over the
+instruction inline and +0.017 [+0.006; +0.027] over a head trained the same
+way (three seeds) — the first arm in this series that beats the instruction.
 
 ### Cost of a step
 
@@ -323,10 +328,9 @@ compressed base fits at 1 × 512, where its top layers do not.
 
 ## Not done
 
-- A **trained** state per instruction — the next step after the
-  many-instruction measurement above — is not implemented. The untrained form,
-  the instruction folded into a state, is (`InstructionCache`, evaluation by
-  groups of one instruction); training one state per instruction needs batches
-  of one instruction or a state of shape [B, …] in the block, since an
-  attached state is one per model.
+- A state per instruction is done (folded: `InstructionCache`; trained: a
+  state bank, `StateBankTrainableSet`) for retrieval queries only. Not done: a
+  bank for sts and classification, a bank file format (`StateFile` holds one
+  state), and a stronger control for the trained bank (the same steps on the
+  top layers with the instruction inline).
 - Neuro (the iOS app) does not use states yet; the file format and API are ready.

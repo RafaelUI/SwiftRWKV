@@ -562,9 +562,106 @@ The inline arm reproduces, row for row, the "with instruction" evaluation of
 the earlier measurement on the same seeds. Process footprint 2.10–2.12 GB
 (training dominates), swap unchanged over each run.
 
+Where the window is shorter than the instruction, folding is a gain in quality
+as well. The same weights evaluated with `--max-tokens 512` (an iPhone budget;
+`embed-run --compare-max-tokens 512`): inline, 197 of the 300 queries lose the
+query itself — the instruction fills the window — while folded queries are
+untouched (the folded rankings are, row for row, those at 2816):
+
+| seed | MRR inline, 512 | MRR folded, 512 | inline on the 197 cut queries | folded on them |
+|---|---|---|---|---|
+| 0 | 0.3451 | 0.6439 | 0.2921 | 0.7472 |
+| 1 | 0.2993 | 0.6470 | 0.2054 | 0.7350 |
+| 2 | 0.3250 | 0.6522 | 0.2317 | 0.7300 |
+
+Folded − inline +0.325 [+0.282; +0.366]: +0.494 on the cut queries, 0.0000 on
+the other 103.
+
 Not for training with trainable layers: the folded state depends on the weights,
 which change every step. With a frozen base (only the head trains) it would
 hold for the whole run; that is not implemented.
+
+### A trained state per instruction (a state bank)
+
+Folding reproduces the instruction; training a state of its own for each
+instruction is the step after it. An attached state is one per model, so the
+states live in a **bank**: `X070Backbone.initialStateBank` holds K states, and
+each row of a batch names its own (`EmbeddingSample.state` →
+`TripletBatch.anchorRows` → `withInitialRows`). The block picks the rows of the
+bank itself, so a batch mixes instructions exactly as it did without states —
+the in-batch negatives do not change — and the gradient of a bank row is the sum
+over the batch rows that use it. `StateBankTrainableSet` trains the bank
+(`blocks.N.state0bank.*`); a row no training batch uses gets no gradient and,
+under Adam without weight decay, does not move.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+guard let tok = WorldTokenizer(
+        vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+    fatalError("cannot read vocabulary")
+}
+// The bank is for queries only: documents never see it.
+let model = EmbeddingModel(backbone: base, stateScope: .queriesOnly)
+let instructions = ["Instruct: Pick the airline tool for the request.\n",
+                    "Instruct: Pick the banking tool for the request.\n"]
+// Start from the folded instructions: exactly the quality with them inline.
+let folded = InstructionCache(model: model, tokenizer: tok).bank(instructions)
+let rows = [
+    EmbeddingSample(anchor: "Query: change my flight", positive: "change_flight: …",
+                    negative: "get_balance: …", task: .retrieval, state: 0),
+    EmbeddingSample(anchor: "Query: what is on my card", positive: "get_balance: …",
+                    negative: "change_flight: …", task: .retrieval, state: 1),
+]
+let bank = StateBankTrainableSet(base, initial: folded)
+let stage = EmbeddingStage(task: .retrieval, train: rows, heldOut: rows,
+                           config: TrainingConfig(lr: 1e-4, maxSteps: 200),
+                           batchSize: 4)
+let result = try EmbeddingFinetune.runStage(model: model, tokenizer: tok,
+                                            trainable: bank, stage: stage)
+print(result.before as Any, result.after as Any)
+// Serving: a query with the row of its instruction.
+let query = EmbeddingMetrics.embedAll(model: model, tokenizer: tok,
+                                      texts: ["Query: cancel my trip"],
+                                      role: .query, states: [0])
+print(query.shape)
+```
+
+Rules: the bank is for queries only, under `stateScope = .queriesOnly`, and for
+retrieval only; a bank without rows, rows without a bank, a batch where some rows
+have a state and some do not — all stop rather than guess. Folding with a bank
+attached stops too (which row would it start from?): fold first, attach after.
+Size: a 0.1B state is 2.4 MB in fp32, so a bank of 150 instructions is 350 MB
+before the optimizer's moments. `embed-run --then-bank N` runs this as a second
+stage after the first (instructions inline), `--then-head` being the control.
+
+Measured on Tool_Use: the same first stage (0.1B `reduction`, top 4 layers,
+200 steps with the instruction inline), then 200 steps at lr 1e-4 of either the
+bank (WKV, starting from the folded instructions) or — the control — the head
+with the folded bank fixed; three seeds, the same 300 held-out queries, both
+arms of a seed sharing the first stage:
+
+| | with instruction | folded bank | after the second stage |
+|---|---|---|---|
+| bank trained | 0.6477 | 0.6477 | 0.6737 |
+| head trained (control) | 0.6477 | 0.6477 | 0.6571 |
+
+| difference (Δ MRR [95 %]) | |
+|---|---|
+| folded bank − with instruction | −0.0000 [−0.0000; +0.0000] |
+| trained bank − with instruction | +0.026 [+0.015; +0.037] |
+| control − with instruction | +0.009 [+0.002; +0.017] |
+| trained bank − control | +0.017 [+0.006; +0.027] |
+
+96 instructions in the bank (234 MB); 10 held-out queries have an instruction
+no training row has, and on them the bank stays at the folded state — exactly
+the quality with the instruction (Δ 0). On the other 290 the bank adds +0.027
+over the instruction and +0.018 over the control. The second stage takes
+~175 s against ~78 s for the head (the gradient goes through every layer), and
+the process footprint is 2.72 GB against 2.11 GB (the bank and its Adam
+moments); swap unchanged over every run. The bank carries far more numbers than
+the head (56.6 M), and roughly 20 training queries per instruction; a stronger
+control — the same steps on the top layers with the instruction inline — was
+not run.
 
 ### Training top layers over a quantized base
 
@@ -804,6 +901,9 @@ IOAccelerator and only partly show up in `ps -o rss`. Use
 - **The backbone is not recorded in the checkpoint.** A head trained on one
   backbone and loaded onto another differs in neither shape nor contract. A
   weight fingerprint would close this.
+- **A state bank has no file.** `StateFile` holds one state; a trained bank
+  (`initialStateBank`) lives in memory, and its rows are known only by the order
+  of the instructions it was built from.
 - **GradCache throughput is not measured.** Peak memory is; the Python
   figures (batch 48: eager 9.68 GB vs 3.20 GB) did not reproduce in Swift and
   are not claimed here.
