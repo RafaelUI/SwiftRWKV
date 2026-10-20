@@ -26,10 +26,12 @@ import RWKVGen
 //  Строки t.txt — «вид: вопрос»: id (ответ обязан совпасть с --keep-regex),
 //  skill (ответ упоминает стихи), poem (в ответе не меньше трёх строк), gen
 //  (берётся, если не оборван лимитом токенов), fact («fact: регэксп :: вопрос»
-//  — берётся только ВЕРНЫЙ ответ учителя). Учитель —
-//  та же модель с системной строкой; его ответы фильтруются по виду и
-//  сохраняются в --teacher-cache (повторный запуск берёт их оттуда — у плеч
-//  одни данные). Ученик — та же модель БЕЗ системной строки с обучаемым
+//  — берётся только ВЕРНЫЙ ответ учителя); --reject-regex отбрасывает ответы
+//  (например, пересказ системной строки). Учитель —
+//  та же модель с системной строкой; его ответы фильтруются по виду и все,
+//  с отметкой «взят», сохраняются в --teacher-cache (повторный запуск берёт
+//  их оттуда и догенерирует только новые вопросы — у плеч одни данные; в
+//  обучение идут только вопросы текущего --train-questions). Ученик — та же модель БЕЗ системной строки с обучаемым
 //  начальным состоянием (с нуля или со свёрнутой системной строки); лосс
 //  только по ответу (цели вопроса < 0).
 // ───────────────────────────────────────────────────────────────────────
@@ -41,7 +43,8 @@ struct Args {
     var think = false
     var distill = false, trainQuestions = "", teacherCache = "", stateOut = ""
     var teacherSamples = 4, steps = 300, lr: Float = 3e-4, batch = 4, initMode = "zero"
-    var keepRegex = "neuron|нейрон", parts = "wkv", gradClip: Float = 0, logEvery = 25
+    var keepRegex = "neuron|нейрон", parts = "wkv", gradClip: Float? = nil, logEvery = 25
+    var rejectRegex: String? = nil
 }
 
 func parse() -> Args {
@@ -74,7 +77,8 @@ func parse() -> Args {
         case "--init": a.initMode = v()
         case "--keep-regex": a.keepRegex = v()
         case "--state-parts": a.parts = v()
-        case "--grad-clip": a.gradClip = Float(v()) ?? 0
+        case "--grad-clip": a.gradClip = Float(v())
+        case "--reject-regex": a.rejectRegex = v()
         case "--log-every": a.logEvery = max(1, Int(v()) ?? 25)
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!); exit(2)
@@ -136,52 +140,74 @@ func distill() throws {
     }
     guard ["zero", "fold"].contains(args.initMode) else { print("--init: zero | fold"); exit(2) }
     let cacheURL = URL(fileURLWithPath: expand(args.teacherCache))
-    var data: [[String: String]] = []
+    // кэш учителя: ВСЕ ответы с отметкой kept (старые кэши — только взятые, без
+    // отметки); вопросы, которых в кэше нет, догенерируются
+    var cache: [[String: String]] = []
     if FileManager.default.fileExists(atPath: cacheURL.path) {
-        data = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as! [[String: String]]
-        print("ответы учителя — из \(cacheURL.lastPathComponent): \(data.count)")
-    } else {
-        let keep = try NSRegularExpression(pattern: args.keepRegex, options: [.caseInsensitive])
-        let skillRe = try NSRegularExpression(pattern: "стих|поэ|poem|poet", options: [.caseInsensitive])
-        var kept = [String: Int](), total = [String: Int]()
-        for line in try lines(args.trainQuestions) {
-            guard let colon = line.firstIndex(of: ":") else { print("строка без вида: \(line)"); exit(2) }
-            let kind = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
-            var q = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-            guard ["id", "skill", "poem", "gen", "fact"].contains(kind) else {
-                print("вид \(kind)? (id | skill | poem | gen | fact)"); exit(2)
-            }
-            var factRe: NSRegularExpression? = nil
-            if kind == "fact" {
-                let parts = q.components(separatedBy: " :: ")
-                guard parts.count == 2 else { print("fact: «регэксп :: вопрос»: \(line)"); exit(2) }
-                factRe = try NSRegularExpression(pattern: parts[0], options: [.caseInsensitive])
-                q = parts[1]
-            }
-            for s in 0 ..< args.teacherSamples {
-                var state = base.startState()
-                let cfg = GenerationConfig(
-                    maxTokens: args.maxTokens, stopStrings: ["\n\nUser:", "\n\nSystem:"], stopTokens: [0],
-                    sampling: SamplingConfig(temperature: args.temp, topP: args.topP, seed: args.seed &+ UInt64(s)))
-                let r = base.generate(prompt: tok.encode(systemPart + userPart(q)), config: cfg,
-                                      tokenizer: tok, state: &state)
-                let a = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                total[kind, default: 0] += 1
-                let ok: Bool
-                switch kind {
-                case "id": ok = keep.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
-                case "skill": ok = skillRe.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
-                case "fact": ok = r.stopReason != .maxTokens
-                    && factRe!.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
-                case "poem": ok = a.split(separator: "\n").count >= 3
-                default: ok = r.stopReason != .maxTokens        // оборванные посторонние ответы не учим
-                }
-                if ok { data.append(["kind": kind, "question": q, "answer": a, "raw": r.text]); kept[kind, default: 0] += 1 }
-            }
-        }
-        print("учитель: оставлено \(kept) из \(total)")
-        try JSONSerialization.data(withJSONObject: data, options: [.prettyPrinted, .sortedKeys]).write(to: cacheURL)
+        cache = try JSONSerialization.jsonObject(with: Data(contentsOf: cacheURL)) as! [[String: String]]
+        print("ответы учителя — из \(cacheURL.lastPathComponent): \(cache.count)")
     }
+    let asked = Set(cache.map { $0["question"]! })
+    var wanted = Set<String>()
+    let keep = try NSRegularExpression(pattern: args.keepRegex, options: [.caseInsensitive])
+    let skillRe = try NSRegularExpression(pattern: "стих|поэ|poem|poet", options: [.caseInsensitive])
+    var kept = [String: Int](), total = [String: Int]()
+    for line in try lines(args.trainQuestions) {
+        guard let colon = line.firstIndex(of: ":") else { print("строка без вида: \(line)"); exit(2) }
+        let kind = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
+        var q = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        guard ["id", "skill", "poem", "gen", "fact"].contains(kind) else {
+            print("вид \(kind)? (id | skill | poem | gen | fact)"); exit(2)
+        }
+        var factRe: NSRegularExpression? = nil
+        if kind == "fact" {
+            let parts = q.components(separatedBy: " :: ")
+            guard parts.count == 2 else { print("fact: «регэксп :: вопрос»: \(line)"); exit(2) }
+            factRe = try NSRegularExpression(pattern: parts[0], options: [.caseInsensitive])
+            q = parts[1]
+        }
+        wanted.insert(q)
+        if asked.contains(q) { continue }
+        for s in 0 ..< args.teacherSamples {
+            var state = base.startState()
+            let cfg = GenerationConfig(
+                maxTokens: args.maxTokens, stopStrings: ["\n\nUser:", "\n\nSystem:"], stopTokens: [0],
+                sampling: SamplingConfig(temperature: args.temp, topP: args.topP, seed: args.seed &+ UInt64(s)))
+            let r = base.generate(prompt: tok.encode(systemPart + userPart(q)), config: cfg,
+                                  tokenizer: tok, state: &state)
+            let a = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            total[kind, default: 0] += 1
+            let ok: Bool
+            switch kind {
+            case "id": ok = keep.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
+            case "skill": ok = skillRe.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
+            case "fact": ok = r.stopReason != .maxTokens
+                && factRe!.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
+            case "poem": ok = a.split(separator: "\n").count >= 3
+            default: ok = r.stopReason != .maxTokens        // оборванные посторонние ответы не учим
+            }
+            cache.append(["kind": kind, "question": q, "answer": a, "raw": r.text, "kept": ok ? "1" : "0"])
+            if ok { kept[kind, default: 0] += 1 }
+        }
+    }
+    if !total.isEmpty {
+        print("учитель (новые вопросы): оставлено \(kept) из \(total)")
+        try JSONSerialization.data(withJSONObject: cache, options: [.prettyPrinted, .sortedKeys]).write(to: cacheURL)
+    }
+    var data = cache.filter { ($0["kept"] ?? "1") == "1" && wanted.contains($0["question"]!) }
+    if let pattern = args.rejectRegex {
+        // например, повтор системной строки: учитель иногда пересказывает промпт
+        let re = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+        let before = data.count
+        data = data.filter { d in
+            let a = d["raw"] ?? d["answer"]!
+            return re.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) == nil
+        }
+        print("--reject-regex «\(pattern)»: отброшено \(before - data.count) из \(before)")
+    }
+    var byKind = [String: Int]()
+    for d in data { byKind[d["kind"]!, default: 0] += 1 }
+    print("в обучение: \(data.count) ответов \(byKind.sorted { $0.key < $1.key })")
     guard !data.isEmpty else { print("нечему учить"); exit(1) }
 
     // последовательности ученика: без системной строки; цели вопроса < 0
@@ -229,7 +255,7 @@ func distill() throws {
     cfg.lr = args.lr; cfg.lrMin = args.lr / 10; cfg.maxSteps = args.steps; cfg.warmupSteps = min(20, args.steps / 10)
     cfg.train = args.parts == "all" ? StateTrainableSet.Part.allCases : [.wkv]
     cfg.logEvery = args.logEvery
-    cfg.gradClip = args.gradClip
+    if let c = args.gradClip { cfg.gradClip = c }        // иначе — умолчание библиотеки (1.0)
     let initial: RWKVBatchState? = args.initMode == "fold" ? base.foldPrompt(tok.encode(systemPart)) : nil
     let t1 = Date()
     let out = StateTuning.run(base, nextBatch: nextBatch, config: cfg, initial: initial,
@@ -240,7 +266,7 @@ func distill() throws {
             fflush(stdout)
         }
     })
-    let note = "distill \(args.initMode), \(args.steps) шагов, lr \(args.lr), отсечение \(args.gradClip)"
+    let note = "distill \(args.initMode), \(args.steps) шагов, lr \(args.lr), отсечение \(cfg.gradClip)"
     _ = try StateFile.save(out.state, base: base, to: URL(fileURLWithPath: expand(args.stateOut)),
                            kind: .tuned, trained: cfg.train, note: note)
     print(String(format: "состояние сохранено: %@ (%@), %.0f с", args.stateOut, note, Date().timeIntervalSince(t1)))
