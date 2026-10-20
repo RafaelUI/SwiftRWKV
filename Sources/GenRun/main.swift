@@ -25,7 +25,8 @@ import RWKVGen
 //               --batch 4] --state-out s.safetensors
 //  Строки t.txt — «вид: вопрос»: id (ответ обязан совпасть с --keep-regex),
 //  skill (ответ упоминает стихи), poem (в ответе не меньше трёх строк), gen
-//  (берётся, если не оборван лимитом токенов). Учитель —
+//  (берётся, если не оборван лимитом токенов), fact («fact: регэксп :: вопрос»
+//  — берётся только ВЕРНЫЙ ответ учителя). Учитель —
 //  та же модель с системной строкой; его ответы фильтруются по виду и
 //  сохраняются в --teacher-cache (повторный запуск берёт их оттуда — у плеч
 //  одни данные). Ученик — та же модель БЕЗ системной строки с обучаемым
@@ -40,7 +41,7 @@ struct Args {
     var think = false
     var distill = false, trainQuestions = "", teacherCache = "", stateOut = ""
     var teacherSamples = 4, steps = 300, lr: Float = 3e-4, batch = 4, initMode = "zero"
-    var keepRegex = "neuron|нейрон", parts = "wkv"
+    var keepRegex = "neuron|нейрон", parts = "wkv", gradClip: Float = 0, logEvery = 25
 }
 
 func parse() -> Args {
@@ -73,6 +74,8 @@ func parse() -> Args {
         case "--init": a.initMode = v()
         case "--keep-regex": a.keepRegex = v()
         case "--state-parts": a.parts = v()
+        case "--grad-clip": a.gradClip = Float(v()) ?? 0
+        case "--log-every": a.logEvery = max(1, Int(v()) ?? 25)
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!); exit(2)
         }
@@ -144,8 +147,17 @@ func distill() throws {
         for line in try lines(args.trainQuestions) {
             guard let colon = line.firstIndex(of: ":") else { print("строка без вида: \(line)"); exit(2) }
             let kind = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
-            let q = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-            guard ["id", "skill", "poem", "gen"].contains(kind) else { print("вид \(kind)? (id | skill | poem | gen)"); exit(2) }
+            var q = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            guard ["id", "skill", "poem", "gen", "fact"].contains(kind) else {
+                print("вид \(kind)? (id | skill | poem | gen | fact)"); exit(2)
+            }
+            var factRe: NSRegularExpression? = nil
+            if kind == "fact" {
+                let parts = q.components(separatedBy: " :: ")
+                guard parts.count == 2 else { print("fact: «регэксп :: вопрос»: \(line)"); exit(2) }
+                factRe = try NSRegularExpression(pattern: parts[0], options: [.caseInsensitive])
+                q = parts[1]
+            }
             for s in 0 ..< args.teacherSamples {
                 var state = base.startState()
                 let cfg = GenerationConfig(
@@ -159,6 +171,8 @@ func distill() throws {
                 switch kind {
                 case "id": ok = keep.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
                 case "skill": ok = skillRe.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
+                case "fact": ok = r.stopReason != .maxTokens
+                    && factRe!.firstMatch(in: a, range: NSRange(a.startIndex..., in: a)) != nil
                 case "poem": ok = a.split(separator: "\n").count >= 3
                 default: ok = r.stopReason != .maxTokens        // оборванные посторонние ответы не учим
                 }
@@ -214,18 +228,19 @@ func distill() throws {
     var cfg = StateTuneConfig()
     cfg.lr = args.lr; cfg.lrMin = args.lr / 10; cfg.maxSteps = args.steps; cfg.warmupSteps = min(20, args.steps / 10)
     cfg.train = args.parts == "all" ? StateTrainableSet.Part.allCases : [.wkv]
-    cfg.logEvery = 25
+    cfg.logEvery = args.logEvery
+    cfg.gradClip = args.gradClip
     let initial: RWKVBatchState? = args.initMode == "fold" ? base.foldPrompt(tok.encode(systemPart)) : nil
     let t1 = Date()
     let out = StateTuning.run(base, nextBatch: nextBatch, config: cfg, initial: initial,
-                              onStep: { step, loss, _, peakMB in
-        if step % 25 == 0 || step == 1 {
-            print(String(format: "  шаг %d: лосс %.4f, пик MLX %.0f МБ, %.0f с", step, loss, peakMB,
-                         Date().timeIntervalSince(t1)))
+                              onStep: { step, loss, gradNorm, peakMB in
+        if step % args.logEvery == 0 || step == 1 {
+            print(String(format: "  шаг %d: лосс %.4f, норма градиента %.3g, пик MLX %.0f МБ, %.0f с", step, loss,
+                         gradNorm, peakMB, Date().timeIntervalSince(t1)))
             fflush(stdout)
         }
     })
-    let note = "distill \(args.initMode), \(args.steps) шагов, lr \(args.lr)"
+    let note = "distill \(args.initMode), \(args.steps) шагов, lr \(args.lr), отсечение \(args.gradClip)"
     _ = try StateFile.save(out.state, base: base, to: URL(fileURLWithPath: expand(args.stateOut)),
                            kind: .tuned, trained: cfg.train, note: note)
     print(String(format: "состояние сохранено: %@ (%@), %.0f с", args.stateOut, note, Date().timeIntervalSince(t1)))
