@@ -111,6 +111,19 @@ public final class InstructionCache {
         return lookup(prefix)
     }
 
+    /// Банк свёрнутых инструкций (батч K): строка k — состояние после
+    /// `prefixes[k]`. Старт для банка состояний на инструкцию
+    /// (`StateBankTrainableSet`): с ним запрос «Query: q» со строкой k считается
+    /// так же, как «prefixes[k]Query: q» в строке.
+    public func bank(_ prefixes: [String]) -> RWKVBatchState {
+        precondition(!prefixes.isEmpty, "bank: пустой список инструкций")
+        refresh()
+        let ss = prefixes.map { lookup($0) }
+        return RWKVBatchState(wkv: concatenated(ss.map(\.wkv), axis: 1),
+                              tmixShift: concatenated(ss.map(\.tmixShift), axis: 1),
+                              cmixShift: concatenated(ss.map(\.cmixShift), axis: 1)).evaluated()
+    }
+
     /// Векторы запросов [N, D] со свёрнутыми инструкциями. Строки без
     /// инструкции векторизуются как есть. Порядок строк сохраняется.
     /// Подключённое состояние модели после вызова — прежнее (те же массивы).

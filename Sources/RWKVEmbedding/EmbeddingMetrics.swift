@@ -113,12 +113,15 @@ public enum EmbeddingMetrics {
     ///
     /// `role` — роль ВСЕХ текстов списка (`EmbeddingModel.stateScope`): при
     /// `.queriesOnly` документы идут без подключённого состояния.
+    /// `states` — номер состояния банка у каждого текста
+    /// (`X070Backbone.initialStateBank`); nil — без банка.
     public static func embedAll(model: EmbeddingModel, tokenizer: WorldTokenizer,
                                 texts: [String], batchSize: Int = 16,
                                 terminator: Int = 0,
                                 maxTokens: Int? = 512,
                                 batchTokens: Int = EmbeddingMetrics.evaluationBatchTokens,
-                                role: TextRole? = nil) -> MLXArray {
+                                role: TextRole? = nil, states: [Int]? = nil) -> MLXArray {
+        precondition(states == nil || states!.count == texts.count, "номеров состояний \(states!.count), текстов \(texts.count)")
         let rows = texts.map { encodeRow(tokenizer: tokenizer, text: $0, terminator: terminator, maxTokens: maxTokens) }
         let frozen = SequentialBody.Plan(names: [], nLayer: model.backbone.cfg.nLayer)
         var parts: [MLXArray] = []
@@ -137,7 +140,10 @@ public enum EmbeddingMetrics {
             // `model.embed`, но одним ленивым графом всё тело держало ~1 ГБ
             // активаций уже на 2048 токенах батча (0.1B), по блокам — треть.
             let v = model.backbone.withoutGradientPath { () -> MLXArray in
-                let top = model.building(role) { SequentialBody.forward(model.backbone, ids: idx, plan: frozen).top }
+                let picked = states.map { MLXArray($0[i ..< end].map { Int32($0) }) }
+                let top = model.building(role, rows: picked) {
+                    SequentialBody.forward(model.backbone, ids: idx, plan: frozen).top
+                }
                 return model.embedFromTop(top, poolIndex: pool)
             }
             eval(v)                       // иначе ленивый граф удержит активации
@@ -199,6 +205,12 @@ public enum EmbeddingMetrics {
             candidates = unique
         }
 
+        let states = rows.map(\.state)
+        let anchorStates: [Int]? = states.allSatisfy { $0 == nil } ? nil : states.map { s in
+            guard let s else { preconditionFailure("у части запросов оценки есть номер состояния банка, у части нет") }
+            return s
+        }
+        precondition(anchorStates == nil || !foldInstructions, "свёртка инструкций и банк состояний вместе не бывают")
         let a: MLXArray
         if foldInstructions {
             precondition(model.pooling == .last, InstructionCacheError.meanPooling.description)
@@ -207,7 +219,7 @@ public enum EmbeddingMetrics {
             instructionCacheObserver?(cache)
         } else {
             a = embedAll(model: model, tokenizer: tokenizer, texts: anchors,
-                         terminator: terminator, maxTokens: maxTokens, role: .query)
+                         terminator: terminator, maxTokens: maxTokens, role: .query, states: anchorStates)
         }
         let c = embedAll(model: model, tokenizer: tokenizer, texts: candidates,
                          terminator: terminator, maxTokens: maxTokens, role: .document)
@@ -274,6 +286,7 @@ public enum EmbeddingMetrics {
                                    terminator: Int = 0,
                                    maxTokens: Int? = 512) -> PairwiseMetrics {
         precondition(!rows.isEmpty, "оценка на пустой выборке бессмысленна")
+        precondition(rows.allSatisfy { $0.state == nil }, "банк состояний — только у retrieval")
         // Стороны пары равноправны: роль «запрос» у всех трёх (при
         // `.queriesOnly` состояние у всех — как при `.allTexts`).
         let a = embedAll(model: model, tokenizer: tokenizer,
@@ -319,6 +332,7 @@ public enum EmbeddingMetrics {
                                               useFullPool: Bool = true,
                                               terminator: Int = 0,
                                               maxTokens: Int? = 512) -> AccuracyMetrics {
+        precondition(rows.allSatisfy { $0.state == nil }, "банк состояний — только у retrieval")
         // Строки, где верный ответ вне предъявленного пула, отбрасываются:
         // они не про качество модели, а про разметку.
         var anchors: [String] = []

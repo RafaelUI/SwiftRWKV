@@ -155,6 +155,18 @@ public final class EmbeddingModel {
     /// Роль nil при `.queriesOnly` — ошибка вызывающего: догадка «это запрос»
     /// молча испортила бы векторы документов, «это документ» — запросов.
     public func building<T>(_ role: TextRole?, _ body: () throws -> T) rethrows -> T {
+        try building(role, rows: nil, body)
+    }
+
+    /// То же со строками банка состояний (`X070Backbone.initialStateBank`):
+    /// строка i запроса стартует с состояния `rows[i]`. Банк — только для
+    /// запросов и только при `.queriesOnly` (документы его не видят).
+    public func building<T>(_ role: TextRole?, rows: MLXArray?, _ body: () throws -> T) rethrows -> T {
+        if let rows {
+            precondition(stateScope == .queriesOnly && role == .query,
+                         "банк состояний — только для запросов при stateScope = .queriesOnly")
+            return try backbone.withInitialRows(rows, body)
+        }
         guard stateScope == .queriesOnly else { return try body() }
         guard let role else {
             preconditionFailure("stateScope = .queriesOnly: укажи роль текста (запрос или документ)")
@@ -166,8 +178,9 @@ public final class EmbeddingModel {
     /// либо длина строки (для .mean). Возвращает [B,D], L2-нормировано.
     /// `role` — см. `stateScope`; при `.allTexts` ни на что не влияет.
     public func embed(_ idx: MLXArray, poolIndex: MLXArray,
-                      headParameters: [MLXArray]? = nil, role: TextRole? = nil) -> MLXArray {
-        let h = building(role) { backbone.body(idx) }    // [B,T,D]
+                      headParameters: [MLXArray]? = nil, role: TextRole? = nil,
+                      rows: MLXArray? = nil) -> MLXArray {
+        let h = building(role, rows: rows) { backbone.body(idx) }    // [B,T,D]
         let pooled = pool(h, poolIndex: poolIndex)
         return l2Normalize(head.apply(pooled, parameters: headParameters ?? head.parameters))
     }

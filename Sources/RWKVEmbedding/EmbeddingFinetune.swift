@@ -293,12 +293,9 @@ public enum EmbeddingFinetune {
         // голова) forward-ядро работает при любой длине, и добивать батч до
         // кратности 16 значило бы считать лишние токены задаром.
         let pad = model.backbone.trainLayers.isEmpty ? nil : WKV7_CHUNK
-        let truncated = stage.train.map {
-            EmbeddingSample(anchor: String($0.anchor.prefix(stage.maxChars)),
-                            positive: String($0.positive.prefix(stage.maxChars)),
-                            negative: String($0.negative.prefix(stage.maxChars)),
-                            task: $0.task)
-        }
+        let truncated = stage.train.map { $0.truncated(stage.maxChars) }
+        precondition(stage.task == .retrieval || truncated.allSatisfy { $0.state == nil },
+                     "банк состояний — только у retrieval")
 
         switch stage.task {
         case .retrieval, .sts:

@@ -20,13 +20,24 @@ public struct EmbeddingSample: Sendable {
     public let positive: String
     public let negative: String
     public let task: EmbeddingTask
+    /// Номер состояния банка для якоря (`X070Backbone.initialStateBank`) —
+    /// своё начальное состояние у запроса, например на его инструкцию. nil —
+    /// без банка. Документы банка не видят (состояние только для запросов).
+    public let state: Int?
 
     public init(anchor: String, positive: String, negative: String,
-                task: EmbeddingTask) {
+                task: EmbeddingTask, state: Int? = nil) {
         self.anchor = anchor
         self.positive = positive
         self.negative = negative
         self.task = task
+        self.state = state
+    }
+
+    /// Те же тексты, обрезанные до `maxChars` символов; номер состояния тот же.
+    func truncated(_ maxChars: Int) -> EmbeddingSample {
+        EmbeddingSample(anchor: String(anchor.prefix(maxChars)), positive: String(positive.prefix(maxChars)),
+                        negative: String(negative.prefix(maxChars)), task: task, state: state)
     }
 }
 
@@ -293,7 +304,17 @@ public struct TripletBatch {
     public let anchorIdx: MLXArray, anchorPool: MLXArray
     public let positiveIdx: MLXArray, positivePool: MLXArray
     public let negativeIdx: MLXArray, negativePool: MLXArray
+    /// [B] int32 — номер состояния банка у каждого якоря; nil — без банка.
+    public var anchorRows: MLXArray? = nil
     public var batchSize: Int { anchorIdx.shape[0] }
+}
+
+/// Номера состояний банка у строк: все nil → nil; иначе у всех должен быть.
+func stateRows(_ rows: [EmbeddingSample]) -> MLXArray? {
+    let states = rows.map(\.state)
+    if states.allSatisfy({ $0 == nil }) { return nil }
+    precondition(states.allSatisfy { $0 != nil }, "у части строк батча есть номер состояния банка, у части нет")
+    return MLXArray(states.map { Int32($0!) })
 }
 
 public struct TripletBatcher {
@@ -335,7 +356,8 @@ public struct TripletBatcher {
                             padMultiple: padMultiple)
         return TripletBatch(anchorIdx: a.idx, anchorPool: a.poolIndex,
                             positiveIdx: p.idx, positivePool: p.poolIndex,
-                            negativeIdx: n.idx, negativePool: n.poolIndex)
+                            negativeIdx: n.idx, negativePool: n.poolIndex,
+                            anchorRows: stateRows(rows))
     }
 }
 
