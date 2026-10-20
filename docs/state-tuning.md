@@ -65,6 +65,12 @@ let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
 try StateFile.save(state, base: base, to: url, note: "world 0.1b")
 ```
 
+- **Gradients are clipped at a global norm of 1.0 by default.** Without
+  clipping, a state trained from zero on a 0.4B model diverged at step 13 of
+  300 (loss 1.03 → 10.98, gradient norm 233) and never recovered; clipping at
+  10 did not prevent it (the norm before the jump was 12.2). Typical norms are
+  3–17, so 1.0 clips almost every step; Adam rescales by its own running
+  magnitude, and the step stays bounded by `lr`.
 - **The learning rate is the sensitive part.** The schedule often quoted for
   state-tuning, 1 -> 0.01, destroys the model here: Adam moves every one of the
   state's hundreds of thousands of numbers by about `lr` per step, and the

@@ -251,7 +251,14 @@ public struct StateTuneConfig: Sendable {
     public var schedule: LRSchedule = .cosine
     public var warmupSteps = 10
     public var maxSteps = 500
-    public var gradClip: Float = 0          // 0 — без отсечения
+    /// Отсечение по глобальной норме (<= 0 — без него). 1.0, а не 0 и не 10:
+    /// g1d 0.4B, состояние с нуля, ответы учителя (20.10) — без отсечения
+    /// обучение срывается детерминированно на шаге 13 (лосс 1.03 → 10.98, норма
+    /// градиента 233, дальше не восстанавливается: 1.32 против 0.38 к шагу 300);
+    /// с отсечением 10 — тот же срыв (норма шага 12 — 12.2, срезана лишь на
+    /// 18 %); с 1.0 срыва нет. Обычные нормы здесь 3–17, так что 1.0 режет
+    /// почти каждый шаг: Adam делит на свой же масштаб, и шаг ограничивает lr.
+    public var gradClip: Float = 1.0
     public var beta1: Float = 0.9
     public var beta2: Float = 0.99
     public var adamEps: Float = 1e-8

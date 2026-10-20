@@ -298,7 +298,10 @@ final class StateTuningTests: XCTestCase {
         let c = StateTuneConfig()
         XCTAssertEqual(c.train, [.wkv])
         XCTAssertTrue(c.sequentialBackward)
-        XCTAssertEqual(c.lr, 3e-4); XCTAssertEqual(c.lrMin, 3e-5); XCTAssertEqual(c.gradClip, 0)
+        XCTAssertEqual(c.lr, 3e-4); XCTAssertEqual(c.lrMin, 3e-5)
+        // без отсечения и с 10 обучение состояния срывается (g1d 0.4B, 20.10)
+        XCTAssertEqual(c.gradClip, 1.0)
+        XCTAssertEqual(c.training.gradClip, 1.0)
     }
 
     /// Обучение идёт по блокам, выключатель даёт то же состояние, лосс падает,
