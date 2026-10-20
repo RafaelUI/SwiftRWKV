@@ -48,14 +48,21 @@ import RWKVKernel
 
 /// Начальное состояние одного слоя, батч 1.
 public struct InitialLayerState {
-    public var wkv: MLXArray          // [H, S, S] fp32 — всегда
-    public var tmixShift: MLXArray    // [1, 1, D]
+    public var wkv: MLXArray          // [H, S, S] fp32 — всегда (у строк банка — [B, H, S, S])
+    public var tmixShift: MLXArray    // [1, 1, D] (у строк банка — [B, 1, D])
     public var cmixShift: MLXArray    // [1, 1, D]
+    /// Уже на строку батча (выбрано из банка, `InitialStateBank.swift`).
+    var perRow = false
 
     /// То же на `batch` строк (трансляцией, без копии): wkv [B, H, S, S],
     /// сдвиги [B, 1, D]. Сдвиги к типу потока приводит token-shift.
     func broadcast(batch B: Int) -> InitialLayerState {
-        InitialLayerState(
+        if perRow {
+            precondition(wkv.shape[0] == B, "строк состояния банка \(wkv.shape[0]), строк батча \(B)")
+            return InitialLayerState(wkv: wkv.asType(.float32), tmixShift: tmixShift, cmixShift: cmixShift,
+                                     perRow: true)
+        }
+        return InitialLayerState(
             wkv: MLX.broadcast(wkv.asType(.float32).expandedDimensions(axis: 0), to: [B] + wkv.shape),
             tmixShift: MLX.broadcast(tmixShift, to: [B, 1, tmixShift.shape[2]]),
             cmixShift: MLX.broadcast(cmixShift, to: [B, 1, cmixShift.shape[2]]))

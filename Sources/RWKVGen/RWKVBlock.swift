@@ -398,7 +398,16 @@ final class BackboneBlockContext: RWKVBlockContext {
     var castWKVOutput: Bool { backbone.castWKVOutputToComputeDType }
 
     var initialState: InitialLayerState? {
-        backbone.initialStateSuspended ? nil : backbone.initialLayers?[layer]
+        if backbone.initialStateSuspended { return nil }
+        if let rows = backbone.initialRows {
+            guard let bank = backbone.initialBank else {
+                preconditionFailure("заданы строки банка состояний, а банк не подключён")
+            }
+            return bank[layer].selecting(rows)
+        }
+        precondition(backbone.initialBank == nil,
+                     "подключён банк состояний, а строки батча не заданы (withInitialRows)")
+        return backbone.initialLayers?[layer]
     }
 
     var frozenKernels: FrozenPassKernels {

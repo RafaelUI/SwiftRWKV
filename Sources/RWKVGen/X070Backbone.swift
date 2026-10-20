@@ -194,6 +194,13 @@ public final class X070Backbone {
     /// Подключённое состояние ВЫКЛЮЧЕНО (`withoutInitialState`): блоки
     /// стартуют так, как без него. Само состояние остаётся подключённым.
     var initialStateSuspended = false { didSet { stepVersion &+= 1 } }
+    /// Банк начальных состояний по слоям (`InitialStateBank.swift`): K
+    /// состояний, wkv [K, H, S, S], сдвиги [K, 1, D]. Строка батча берёт
+    /// своё по `initialRows`. nil ⇒ банка нет.
+    var initialBank: [InitialLayerState]? = nil { didSet { stepVersion &+= 1 } }
+    /// Номер состояния банка для каждой строки батча [B] (int32); задаётся
+    /// на время прохода (`withInitialRows`).
+    var initialRows: MLXArray? = nil { didSet { stepVersion &+= 1 } }
 
     /// Подмена весов на обучаемые (fp32) во время valueAndGrad для full-weight
     /// partial-finetune верхних слоёв. nil ⇒ читаются frozen-веса (инференс не меняется).
