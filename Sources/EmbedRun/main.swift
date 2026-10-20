@@ -60,6 +60,7 @@ struct Args {
     var thenState = 0
     var thenStateLR: Float = 3e-4
     var thenHead = false
+    var thenBank = 0               // вторая стадия: своё состояние на каждую инструкцию (банк), шагов
     var dedupePool = false         // retrieval: сливать одинаковые тексты кандидатов оценки
     var foldInstructions = false   // retrieval: инструкции запросов оценки свёрнуты в состояние
     var compareFolded = false      // после первой стадии (или вместо обучения): в строке против свёрнутой
@@ -126,6 +127,7 @@ func parse() -> Args {
         case "--then-state": a.thenState = Int(v()) ?? 0
         case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
         case "--then-head": a.thenHead = true
+        case "--then-bank": a.thenBank = Int(v()) ?? 0
         case "--state-scope": a.stateScope = v()
         case "--dedupe-pool": a.dedupePool = true
         case "--fold-instructions": a.foldInstructions = true
@@ -634,6 +636,90 @@ if let mode {
         report["second_stage"] = args.thenHead ? "head" : "state"
     }
 
+    if args.thenBank > 0 {
+        // ВТОРАЯ СТАДИЯ: СВОЁ состояние на каждую инструкцию (банк) поверх
+        // только что обученного эмбеддера. Запрос «Instruct: X\nQuery: q»
+        // становится хвостом «Query: q» с номером инструкции X; банк стартует
+        // со свёрнутых инструкций (X070Backbone.initialStateBank, строка k —
+        // состояние после «Instruct: X_k\n»), то есть ровно с качества с
+        // инструкцией в строке. База и голова заморожены, обучается банк
+        // (--state-parts) на тех же обучающих строках; документы — без
+        // состояния (stateScope .queriesOnly). Батч смешивает инструкции как
+        // раньше: у каждой строки своё состояние. --then-head — контроль: те
+        // же шаги обучают голову, банк остаётся свёрнутым.
+        guard args.thenState == 0 else { print("--then-bank и --then-state вместе не бывают"); exit(2) }
+        guard task == .retrieval else { print("--then-bank: только retrieval"); exit(2) }
+        var prefixes: [String] = [], index: [String: Int] = [:]
+        func banked(_ s: EmbeddingSample) -> EmbeddingSample {
+            let a = String(s.anchor.prefix(args.maxChars))          // как его видели оценка и обучение
+            guard let (p, tail) = InstructionCache.split(a) else {
+                print("--then-bank: строка без инструкции «Instruct: …\\nQuery: …»"); exit(2)
+            }
+            let k: Int
+            if let have = index[p] { k = have } else { k = prefixes.count; index[p] = k; prefixes.append(p) }
+            return EmbeddingSample(anchor: tail, positive: s.positive, negative: s.negative, task: s.task, state: k)
+        }
+        let trainB = train.map(banked)
+        let seen = Set(trainB.compactMap(\.state))
+        let heldB = heldOut.map(banked)
+        let unseen = Set(heldB.compactMap(\.state)).subtracting(seen).count
+        let unseenRows = heldB.filter { !seen.contains($0.state!) }.count
+        let instructRows = perRow
+        base.trainLayers = []
+        model.stateScope = .queriesOnly
+        let cache = InstructionCache(model: model, tokenizer: tok)
+        let tf = Date()
+        let bank = cache.bank(prefixes)
+        let bankMB = Double(bank.wkv.size + bank.tmixShift.size + bank.cmixShift.size) * 4 / 1e6
+        print(String(format: "ВТОРАЯ СТАДИЯ: банк на инструкцию — %d инструкций (%d токенов свёрнуто за %.1f с, %.0f МБ); "
+                     + "в отложенных %d из них нет в обучении (%d запросов)",
+                     prefixes.count, cache.foldedTokens, Date().timeIntervalSince(tf), bankMB, unseen, unseenRows))
+        var stage2 = EmbeddingStage(
+            task: task, train: trainB, heldOut: heldB,
+            config: TrainingConfig(lr: args.thenStateLR, lrMin: args.thenStateLR / 10, schedule: .cosine,
+                                   warmupSteps: min(50, args.thenBank / 5), gradClip: 0,
+                                   maxSteps: args.thenBank),
+            batchSize: args.batch, maxTokens: args.maxTokens, maxChars: args.maxChars, seed: args.seed &+ 1)
+        stage2.config.logEvery = args.logEvery
+        stage2.config.cacheLimitGB = args.cacheGB
+        if let c = args.chunkTokens { stage2.bodyChunkTokens = c }
+        stage2.traceStride = args.traceStride
+        stage2.evaluationCacheLimitGB = args.evalCacheGB
+        stage2.dedupeEvaluationPool = args.dedupePool
+        let parts: [StateTrainableSet.Part] = args.stateParts == "all" ? StateTrainableSet.Part.allCases : [.wkv]
+        let set: TrainableSet
+        if args.thenHead {
+            base.initialStateBank = bank
+            set = EmbeddingHeadTrainableSet(model.head)
+        } else {
+            set = StateBankTrainableSet(base, train: parts, initial: bank)
+        }
+        let numbers = set.initialParameters().reduce(0) { $0 + $1.size }
+        print("ВТОРАЯ СТАДИЯ: обучается \(args.thenHead ? "голова (КОНТРОЛЬ), банк свёрнутый" : "банк")"
+              + " — \(numbers) чисел, шаг \(args.thenStateLR), \(args.thenBank) шагов")
+        let t2 = Date()
+        let r2 = try EmbeddingFinetune.runStage(model: model, tokenizer: tok, trainable: set, stage: stage2,
+                                                onStep: { s in
+            if s.step % args.logEvery == 0 {
+                print(String(format: "  шаг %d: лосс %.4f, %.2f с от начала стадии", s.step, s.loss,
+                             Date().timeIntervalSince(t2)))
+                fflush(stdout)
+            }
+        })
+        print("с инструкцией в строке (после первой стадии): \(r.after?.description ?? "—")")
+        print("банк свёрнутых инструкций: \(r2.before?.description ?? "—")")
+        print("\(args.thenHead ? "голова дообучена при свёрнутом банке (контроль)" : "банк обучен"): \(r2.after?.description ?? "—")")
+        report["instruct"] = r.after?.headline ?? Double.nan
+        report["bank_folded"] = r2.before?.headline ?? Double.nan
+        report["bank_after"] = r2.after?.headline ?? Double.nan
+        report["per_row_instruct"] = instructRows
+        if allRows.count >= 2 { report["per_row_bank_folded"] = allRows[allRows.count - 2] }
+        report["bank_size"] = prefixes.count; report["bank_mb"] = bankMB
+        report["bank_unseen_instructions"] = unseen; report["bank_unseen_rows"] = unseenRows
+        report["per_row_unseen"] = heldB.map { seen.contains($0.state!) ? 0 : 1 }
+        report["state_final_loss"] = Double(r2.finalLoss); report["second_stage_seconds"] = r2.seconds
+        report["second_stage"] = args.thenHead ? "bank-head" : "bank"
+    }
 } else {
     if args.cacheGB > 0 { MLX.Memory.cacheLimit = Int(args.cacheGB * 1e9) }
     _ = EmbeddingMetrics.embedAll(model: model, tokenizer: tok, texts: ["прогрев"], role: .query)   // первое касание весов — не в замер
