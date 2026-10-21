@@ -659,9 +659,24 @@ over the instruction and +0.018 over the control. The second stage takes
 ~175 s against ~78 s for the head (the gradient goes through every layer), and
 the process footprint is 2.72 GB against 2.11 GB (the bank and its Adam
 moments); swap unchanged over every run. The bank carries far more numbers than
-the head (56.6 M), and roughly 20 training queries per instruction; a stronger
-control — the same steps on the top layers with the instruction inline — was
-not run.
+the head (56.6 M), and roughly 20 training queries per instruction.
+
+**The strong control beats it (21.10).** `embed-run --then-top 200` spends the
+same 200 extra steps on what the first stage trains — the top 4 layers and the
+head, instruction inline, same rows, same batch order as the bank (seed + 1),
+the first stage's schedule; the second stage continues the first on the same
+trainable set. Three seeds:
+
+| difference (Δ MRR [95 %]) | |
+|---|---|
+| top layers, 200 more steps − with instruction | +0.049 [+0.030; +0.068] |
+| trained bank − top layers, 200 more steps | **−0.023 [−0.042; −0.004]** |
+
+(0.696 against 0.674 for the bank.) The bank's gain over the head-only control
+is extra training with more parameters; the top layers trained further give
+twice as much. Use a bank where its locality matters — it touches no shared
+weights and reproduces the instruction exactly for instructions it was not
+trained on — not for quality.
 
 ### Training top layers over a quantized base
 

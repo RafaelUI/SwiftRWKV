@@ -308,6 +308,19 @@ started from the folded instructions, adds +0.026 [+0.015; +0.037] over the
 instruction inline and +0.017 [+0.006; +0.027] over a head trained the same
 way (three seeds) — the first arm in this series that beats the instruction.
 
+**The strong control (21.10) explains that gain away.** The same 200 extra steps
+spent on what the first stage trains — the top 4 layers and the head, with the
+instruction inline, on the same rows in the same batch order (`embed-run
+--then-top 200`; the second stage continues the first with the same trainable
+set and its fp32 master) — reach 0.696 against 0.648 with the instruction after
+the first stage: +0.049 [+0.030; +0.068]. The trained bank is **below** it:
+−0.023 [−0.042; −0.004] (three seeds, 300 held-out queries). The bank's edge over
+the head-only control came from extra training with more parameters, not from a
+state per instruction as such; ordinary steps on the top layers give twice as
+much. What the bank still offers is locality: on queries whose instruction had
+no training rows it reproduces the instruction exactly, and it leaves the shared
+weights untouched, so it can be added or dropped per task.
+
 ### Cost of a step
 
 Embedder, state and head trained; all three texts of a triplet at full length
@@ -337,6 +350,6 @@ compressed base fits at 1 × 512, where its top layers do not.
 - A state per instruction is done (folded: `InstructionCache`; trained: a
   state bank, `StateBankTrainableSet`) for retrieval queries only. Not done: a
   bank for sts and classification, a bank file format (`StateFile` holds one
-  state), and a stronger control for the trained bank (the same steps on the
-  top layers with the instruction inline).
+  state). The strong control for the trained bank is done (21.10): the same
+  steps on the top layers beat the bank (−0.023 [−0.042; −0.004]).
 - Neuro (the iOS app) does not use states yet; the file format and API are ready.
