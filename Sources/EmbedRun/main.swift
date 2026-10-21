@@ -35,6 +35,14 @@ import RWKVEmbedding
 //
 //      [{"data": "ret.jsonl", "task": "retrieval", "steps": 300},
 //       {"data": "sts.jsonl", "task": "sts", "steps": 200, "lr": 1e-5}]
+//
+//  --then-top N [--then-lr L]: вторая стадия — ещё N шагов ТЕМ ЖЕ обучаемым
+//  множеством (то же множество и fp32-мастер, `EmbeddingFinetune.run` с двумя
+//  стадиями), на тех же строках с инструкцией в строке. Сид порядка — сид + 1,
+//  как у второй стадии --then-bank / --then-state, — те же батчи, что у банка.
+//  Расписание — как у первой стадии (косинус до L/20, разогрев min(50, N/5),
+//  отсечение по умолчанию); L по умолчанию — --lr. Сильный контроль банка:
+//  отделяет «больше шагов» от «своё состояние на инструкцию».
 // ───────────────────────────────────────────────────────────────────────
 
 struct Args {
@@ -61,6 +69,8 @@ struct Args {
     var thenStateLR: Float = 3e-4
     var thenHead = false
     var thenBank = 0               // вторая стадия: своё состояние на каждую инструкцию (банк), шагов
+    var thenTop = 0                // вторая стадия: ещё шагов того же обучаемого множества (контроль банка)
+    var thenLR: Float? = nil       // шаг второй стадии --then-top (иначе --lr)
     var dedupePool = false         // retrieval: сливать одинаковые тексты кандидатов оценки
     var foldInstructions = false   // retrieval: инструкции запросов оценки свёрнуты в состояние
     var compareFolded = false      // после первой стадии (или вместо обучения): в строке против свёрнутой
@@ -128,6 +138,8 @@ func parse() -> Args {
         case "--then-state-lr": a.thenStateLR = Float(v()) ?? a.thenStateLR
         case "--then-head": a.thenHead = true
         case "--then-bank": a.thenBank = Int(v()) ?? 0
+        case "--then-top": a.thenTop = Int(v()) ?? 0
+        case "--then-lr": a.thenLR = Float(v())
         case "--state-scope": a.stateScope = v()
         case "--dedupe-pool": a.dedupePool = true
         case "--fold-instructions": a.foldInstructions = true
@@ -529,13 +541,33 @@ if args.probe {
         GPU.resetPeakMemory()
     }
 }
+var stages = [stage]
+if args.thenTop > 0 {
+    guard args.thenState == 0, args.thenBank == 0 else {
+        print("--then-top не бывает вместе с --then-state / --then-bank"); exit(2)
+    }
+    guard case .some = mode else { print("--then-top: нужен режим обучения (--mode)"); exit(2) }
+    let lr = args.thenLR ?? args.lr
+    var stage2 = EmbeddingStage(
+        task: task, train: train, heldOut: heldOut,
+        config: TrainingConfig(lr: lr, lrMin: lr / 20, schedule: .cosine,
+                               warmupSteps: min(50, args.thenTop / 5), maxSteps: args.thenTop),
+        batchSize: args.batch, gradCacheChunk: args.gradCache,
+        maxTokens: args.maxTokens, maxChars: args.maxChars, seed: args.seed &+ 1)
+    applyRunSettings(&stage2)
+    stages.append(stage2)
+    print("ВТОРАЯ СТАДИЯ (--then-top): ещё \(args.thenTop) шагов того же обучаемого множества, шаг \(lr), "
+          + "инструкция в строке, сид порядка \(args.seed &+ 1)")
+}
 if let mode {
     // Оценку до и после делает сама стадия (`EmbeddingFinetune.run`) — отдельно
     // её здесь не гоняем, иначе отложенная выборка считалась бы трижды.
     GPU.resetPeakMemory()
     t = Date()
     var last = Date(), abTime: [[Double]] = [[], []], abPeak: [[Double]] = [[], []]
-    let results = try EmbeddingFinetune.run(model: model, tokenizer: tok, mode: mode, stages: [stage],
+    var stageNo = 0
+    let results = try EmbeddingFinetune.run(model: model, tokenizer: tok, mode: mode, stages: stages,
+                                            onStage: { _ in stageNo += 1 },
                                             onStep: { _, s in
         if args.pipelineAB {
             // шаг s.step только что кончился в режиме (s.step - 1) % 2; следующий — в другом
@@ -548,7 +580,7 @@ if let mode {
             GPU.resetPeakMemory()
             last = Date()
         }
-        if s.step == 1 {
+        if s.step == 1 && stageNo == 0 {
             print(String(format: "  пик footprint до конца первого шага (загрузка, оценка, сборка ядер): %.2f ГБ",
                          watch.take()))
         }
@@ -574,6 +606,23 @@ if let mode {
     report["final_loss"] = Double(r.finalLoss); report["train_seconds"] = r.seconds
     report["train_peak_gb"] = Double(GPU.peakMemory) / 1e9
     if args.compareFolded { compareFolded(stage) }
+
+    if args.thenTop > 0 {
+        // allRows: до и после первой стадии, до и после второй
+        let r2 = results[1]
+        let instructRows = allRows[allRows.count - 3]
+        let same = allRows[allRows.count - 2] == instructRows
+        print("с инструкцией (после первой стадии): \(r.after?.description ?? "—")")
+        print("вторая стадия, до (обязана совпасть с концом первой поштучно): \(same ? "совпала" : "НЕ СОВПАЛА")")
+        print(String(format: "ещё %d шагов верхних слоёв с инструкцией (контроль): %@ | %.1f с, лосс %.4f",
+                     r2.steps, r2.after?.description ?? "—", r2.seconds, r2.finalLoss))
+        report["instruct"] = r.after?.headline ?? Double.nan
+        report["top_after"] = r2.after?.headline ?? Double.nan
+        report["per_row_instruct"] = instructRows
+        report["second_stage_before_equal"] = same
+        report["state_final_loss"] = Double(r2.finalLoss); report["second_stage_seconds"] = r2.seconds
+        report["second_stage"] = "top"
+    }
 
     if args.thenState > 0 {
         // ВТОРАЯ СТАДИЯ: начальное состояние ВМЕСТО строки инструкции поверх
