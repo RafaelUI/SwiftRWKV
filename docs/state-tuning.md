@@ -321,6 +321,56 @@ much. What the bank still offers is locality: on queries whose instruction had
 no training rows it reproduces the instruction exactly, and it leaves the shared
 weights untouched, so it can be added or dropped per task.
 
+### In place of a system prompt (generation, 20–21.10)
+
+g1d 0.4B with the system line «Ты — Neuron, языковая модель. Ты умеешь писать
+стихи.» ("You are Neuron, a language model. You can write poems."). The state
+is distilled from the same model *with* the line: the teacher answers training
+questions (4 samples, temperature 1.0, top-p 0.6), answers are filtered by kind
+— questions about who it is keep only answers naming Neuron, factual questions
+keep only **correct** answers, answers that recite the system line are dropped —
+and the student, the model without the line, trains only its WKV state on them
+(loss on the answer only, ending with `\n\nUser:`), starting from the folded
+system line, 300 steps, lr 3e-4, batch 4, clipping 1.0; three seeds. `gen-run
+--distill` in this repository runs exactly this.
+
+General ability is measured on 199 questions with a checkable answer (capitals,
+authors, science, geography, arithmetic, units, translation both ways; 130
+Russian, 69 English; disjoint from training by question and by fact), a regex
+on each answer, 12 answers per question; paired bootstrap over questions:
+
+| arm | all 199 | translation (32) | arithmetic (36) | other facts (131) |
+|---|---|---|---|---|
+| no system line | 0.443 | 0.281 | 0.688 | 0.415 |
+| system line in the prompt | 0.314 | 0.253 | 0.690 | 0.225 |
+| state, 31 correct facts in training | 0.399 | 0.495 | 0.812 | 0.263 |
+| state, 109 correct facts in training | **0.506** | 0.661 | 0.889 | 0.363 |
+
+| difference (Δ [95 %]) | all | other facts |
+|---|---|---|
+| prompt − no line | −0.129 [−0.164; −0.095] | −0.190 [−0.234; −0.146] |
+| state (109 facts) − no line | **+0.063 [+0.020; +0.105]** | **−0.052 [−0.090; −0.016]** |
+| state (109 facts) − prompt | +0.192 [+0.153; +0.234] | +0.137 [+0.094; +0.181] |
+| state: 109 facts − 31 facts | +0.106 [+0.075; +0.139] | +0.100 [+0.062; +0.140] |
+
+- **The prompt itself damages facts**, and a state learned from a prompted
+  teacher inherits that unless the data keeps only correct answers. The more
+  correct facts in the data, the smaller the damage.
+- **The state's gain over the model without the line is form, not knowledge.**
+  It comes entirely from question templates that also occur in the training
+  facts — "translate the word …" (+0.380) and "how much is …" (+0.201), where
+  the bare model often answers with a definition or a derivation and the state
+  answers with the word or the number. On other factual questions the state is
+  still below the bare model (−0.052), though a third of the prompt's damage.
+- **The persona holds better than with the prompt.** Naming itself Neuron
+  (10 samples, 5 questions): 3–10 of 10 with the state, mostly 7–10, against 2–4 with the
+  prompt; on "Are you ChatGPT?" it gives another model's name 0–1 of 10 against
+  3 with the prompt. English questions about the name need English examples in
+  the data (without them the state answered "Qwen"). The more facts in the
+  data, the smaller the persona's share and the weaker it holds.
+- Measure general ability next to the target behaviour, and per kind of
+  question: the overall difference hid two opposite effects.
+
 ### Cost of a step
 
 Embedder, state and head trained; all three texts of a triplet at full length
