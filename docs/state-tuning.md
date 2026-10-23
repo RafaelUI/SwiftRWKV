@@ -87,6 +87,39 @@ try StateFile.save(state, base: base, to: url, note: "world 0.1b")
 - `config.train = StateTrainableSet.Part.allCases` also trains the shifts;
   `initial:` starts from a given state, e.g. a folded prompt.
 
+### Weight streaming (opt-in)
+
+Block-by-block backward keeps one block's activations in memory, but the weights of
+the whole model still sit there: 3 GB for a 1.5B model in bf16. A backbone built
+with `X070Backbone.loadStreaming(safetensors:)` reads its weights lazily from the
+file (MLX reads a tensor when it is first evaluated), and the block-by-block paths
+let go of what they read: a block's weights after that block in the forward and in
+the backward pass, the embedding table after the stem, the head after the loss.
+What was let go is read from the file again the next time it is needed.
+
+```swift
+let base = try X070Backbone.loadStreaming(safetensors: URL(fileURLWithPath: "/tmp/g1j_1.5b.safetensors"))
+let ids = MLXArray((0 ..< 33).map { Int32($0) }, [1, 33])
+let batch: LoRABatch = (x: ids[0..., 0 ..< 32], y: ids[0..., 1 ... 32])   // T % 16 == 0
+let (_, state) = StateTuning.run(base, nextBatch: { batch }, config: StateTuneConfig())
+print(state.wkv.shape, base.isWeightStreaming)
+```
+
+The numbers are those of the same file loaded into memory, bit for bit. g1j 1.5B
+bf16, one sequence of 320 tokens, block by block, M4, separate processes, two
+rounds:
+
+| | step | peak process footprint |
+|---|---|---|
+| weights in memory | 1.683 / 1.636 s | 3.84 / 3.79 GB |
+| streaming | 1.816 / 1.765 s (+8 %) | **0.95 / 0.93 GB** |
+
+The file was in the operating system's cache here; on a phone it is read from
+storage on every pass. Only dense `.safetensors` checkpoints stream; a `.rwkvq` base
+is kept in memory. A whole-graph pass (`bb(ids)`, training with
+`sequentialBackward = false`) reads every weight and keeps it until
+`releaseAllStreamedWeights()`.
+
 ## Attaching, prompts and caches
 
 ```swift
@@ -452,6 +485,9 @@ recomputed once — in exchange for memory (4.5–4.9 GB against 7.5); compiling
 whole step (`mx.compile`, measured in rwkv-metal) gives another 5.5 %.
 
 ## Not done
+
+- Weight streaming covers dense `.safetensors` only; a `.rwkvq` base (re-laid out at
+  load) is not streamed, and rwkv-metal has no streaming.
 
 - A state per instruction is done (folded: `InstructionCache`; trained: a
   state bank, `StateBankTrainableSet`) for retrieval queries only. Not done: a

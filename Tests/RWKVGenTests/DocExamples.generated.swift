@@ -1455,6 +1455,27 @@ func doc_state_tuning_1() throws {
                              vocab: weights["head.weight"]!.shape[0])
         return X070Backbone(weights: weights, cfg: cfg)
     }
+    let base = try X070Backbone.loadStreaming(safetensors: URL(fileURLWithPath: "/tmp/g1j_1.5b.safetensors"))
+    let ids = MLXArray((0 ..< 33).map { Int32($0) }, [1, 33])
+    let batch: LoRABatch = (x: ids[0..., 0 ..< 32], y: ids[0..., 1 ... 32])   // T % 16 == 0
+    let (_, state) = StateTuning.run(base, nextBatch: { batch }, config: StateTuneConfig())
+    print(state.wkv.shape, base.isWeightStreaming)
+}
+
+func doc_state_tuning_2() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
     let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
     let (loaded, info) = try StateFile.load(url, base: base)   // checks the base
