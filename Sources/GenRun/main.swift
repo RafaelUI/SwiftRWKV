@@ -34,6 +34,17 @@ import RWKVGen
 //  обучение идут только вопросы текущего --train-questions). Ученик — та же модель БЕЗ системной строки с обучаемым
 //  начальным состоянием (с нуля или со свёрнутой системной строки); лосс
 //  только по ответу (цели вопроса < 0).
+//
+//  Замер шага state-tuning (--state-bench):
+//      gen-run --model M --vocab V --state-bench tokens.txt [--steps 30]
+//              [--sb-warm 5] [--sb-whole] [--sb-cache ГБ] [--sb-profile]
+//              [--sb-cast | --sb-nocast] [--sb-cast-ab N --sb-arms off,wkv,lin] [--out o.json]
+//  tokens.txt — T+1 номеров токенов через пробел (одна строка, батч 1; T
+//  кратна 16); шаг — `StateTuning.run` с умолчаниями `StateTuneConfig`
+//  (обратный проход по блокам; --sb-whole — одним графом). Печатает медиану
+//  времени шага после разогрева и ток/с. Типы: умолчание — приведение входа
+//  проекций (StateTuneConfig.castProjectionInput), --sb-cast — выход WKV,
+//  --sb-nocast — без приведения; --sb-cast-ab N — плечи вперемежку в одном процессе.
 // ───────────────────────────────────────────────────────────────────────
 
 struct Args {
@@ -45,6 +56,8 @@ struct Args {
     var teacherSamples = 4, steps = 300, lr: Float = 3e-4, batch = 4, initMode = "zero"
     var keepRegex = "neuron|нейрон", parts = "wkv", gradClip: Float? = nil, logEvery = 25
     var rejectRegex: String? = nil
+    var stateBench: String? = nil, sbWarm = 5, sbWhole = false, sbCache: Double? = nil, sbProfile = false
+    var sbCastAB = 0, sbCast = false, sbNoCast = false, sbArms = "off,wkv,lin"
 }
 
 func parse() -> Args {
@@ -80,6 +93,15 @@ func parse() -> Args {
         case "--grad-clip": a.gradClip = Float(v())
         case "--reject-regex": a.rejectRegex = v()
         case "--log-every": a.logEvery = max(1, Int(v()) ?? 25)
+        case "--state-bench": a.stateBench = v()
+        case "--sb-warm": a.sbWarm = max(0, Int(v()) ?? 5)
+        case "--sb-whole": a.sbWhole = true
+        case "--sb-cache": a.sbCache = Double(v())
+        case "--sb-cast": a.sbCast = true          // castWKVOutputToComputeDType = true
+        case "--sb-cast-ab": a.sbCastAB = Int(v()) ?? 0   // кругов A/B флага в одном процессе
+        case "--sb-arms": a.sbArms = v()                  // плечи A/B: off | wkv | lin (через запятую)
+        case "--sb-nocast": a.sbNoCast = true             // без приведения (как до 23.10)
+        case "--sb-profile": a.sbProfile = true      // фазы шага (по блокам): прямой, голова+лосс, блоки, Adam
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!); exit(2)
         }
@@ -104,7 +126,7 @@ func loadBase(_ path: String) throws -> X070Backbone {
 }
 
 let args = parse()
-guard !args.model.isEmpty, !args.vocab.isEmpty, !args.questions.isEmpty || args.distill else {
+guard !args.model.isEmpty, !args.vocab.isEmpty, !args.questions.isEmpty || args.distill || args.stateBench != nil else {
     print("нужны --model, --vocab, --questions"); exit(2)
 }
 guard ["inline", "fold", "none"].contains(args.mode) else { print("--mode: inline | fold | none"); exit(2) }
@@ -117,7 +139,7 @@ func lines(_ path: String) throws -> [String] {
         .split(separator: "\n").map(String.init)
         .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }
 }
-let questions = args.distill ? [] : try lines(args.questions)
+let questions = args.distill || args.stateBench != nil ? [] : try lines(args.questions)
 
 let t0 = Date()
 let base = try loadBase(args.model)
@@ -131,6 +153,93 @@ func userPart(_ q: String) -> String { "User: \(q)\n\n\(assistant)" }
 if args.distill {
     try distill()
     exit(0)
+}
+if let path = args.stateBench {
+    try stateBench(path)
+    exit(0)
+}
+
+/// Замер шага state-tuning на одной последовательности (см. шапку).
+func stateBench(_ path: String) throws {
+    let ids = try String(contentsOfFile: expand(path), encoding: .utf8)
+        .split(whereSeparator: { $0 == " " || $0 == "\n" }).compactMap { Int32($0) }
+    let T = ids.count - 1
+    guard T > 0, T % 16 == 0 else { print("--state-bench: нужно T+1 токенов, T кратна 16 (сейчас T = \(T))"); exit(2) }
+    let x = MLXArray(Array(ids.dropLast()), [1, T]), y = MLXArray(Array(ids.dropFirst()), [1, T])
+    var cfg = StateTuneConfig()
+    cfg.maxSteps = args.steps; cfg.logEvery = 1; cfg.sequentialBackward = !args.sbWhole
+    // типы на время шага — из cfg (StateTuning.run выставляет флаги бэкбона сам): умолчание
+    // библиотеки — приведение входа проекций; --sb-cast — выход WKV; --sb-nocast — как до 23.10
+    if args.sbCast { cfg.castWKVOutput = true; cfg.castProjectionInput = false }
+    if args.sbNoCast { cfg.castProjectionInput = false }
+    if args.sbCastAB > 0 {
+        // A/B нескольких способов не пускать fp32 в веса: off — как есть; wkv — приведение выхода
+        // WKV (castWKVOutputToComputeDType); lin — приведение входа плотной проекции к типу веса
+        // (castDenseProjectionInput). Плечи вперемежку в одном процессе, порядок сдвигается по кругам.
+        if let c = args.sbCache { cfg.cacheLimitGB = c }
+        let arms = args.sbArms.split(separator: ",").map(String.init)
+        var med: [String: [Double]] = [:], loss: [String: [Float]] = [:]
+        for round in 0 ..< args.sbCastAB {
+            let order = (0 ..< arms.count).map { arms[($0 + round) % arms.count] }
+            for arm in order {
+                cfg.castWKVOutput = arm == "wkv"
+                cfg.castProjectionInput = arm == "lin"
+                base.initialState = nil
+                var marks = [Date()], ls: [Float] = []
+                StateTuning.run(base, nextBatch: { (x: x, y: y) }, config: cfg, onStep: { _, l, _, _ in
+                    marks.append(Date()); ls.append(l)
+                })
+                let ts = zip(marks, marks.dropFirst()).map { $1.timeIntervalSince($0) }.dropFirst(args.sbWarm).sorted()
+                med[arm, default: []].append(ts[ts.count / 2]); loss[arm] = ls
+                print(String(format: "  круг %d, %@: %.3f с/шаг, лосс %.5f -> %.5f", round, arm as NSString,
+                             ts[ts.count / 2], ls.first ?? .nan, ls.last ?? .nan)); fflush(stdout)
+            }
+        }
+        func m(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
+        print("A/B ТИПОВ, \(args.sbWhole ? "одним графом" : "по блокам"), T \(T): " + arms.map {
+            String(format: "%@ %.3f с/шаг (лосс шага 1 %.6f)", $0 as NSString, m(med[$0]!), loss[$0]![0]) }.joined(separator: "; "))
+        return
+    }
+    if let c = args.sbCache { cfg.cacheLimitGB = c }
+    var marks = [Date()], losses: [Float] = []
+    // --sb-profile: время между отметками SequentialBody.probe (каждая — после eval) на шагах после
+    // разогрева; фаза «adam» — от последней отметки шага до конца обновления.
+    var phase: [String: [Double]] = [:], last = Date(), stepNo = 0
+    if args.sbProfile {
+        SequentialBody.probe = { name in
+            let now = Date()
+            if stepNo >= args.sbWarm {
+                let key = name.hasPrefix("block") ? "блоки" : name == "loss" ? "голова+лосс" : name
+                phase[key, default: []].append(now.timeIntervalSince(last))
+            }
+            last = now
+            if name == "adam" { stepNo += 1 }
+        }
+    }
+    StateTuning.run(base, nextBatch: { (x: x, y: y) }, config: cfg, onStep: { _, loss, _, _ in
+        marks.append(Date()); losses.append(loss)
+    })
+    SequentialBody.probe = nil
+    let times = zip(marks, marks.dropFirst()).map { $1.timeIntervalSince($0) }
+    if args.sbProfile && stepNo > args.sbWarm {
+        let n = Double(stepNo - args.sbWarm)
+        print("фазы шага (среднее за шаг, \(Int(n)) шагов):")
+        for (k, v) in phase.sorted(by: { $0.value.reduce(0, +) > $1.value.reduce(0, +) }) {
+            print(String(format: "  %-12@ %.3f с  (%d отметок за шаг)", k as NSString, v.reduce(0, +) / n, Int(Double(v.count) / n)))
+        }
+    }
+    let tail = Array(times.dropFirst(min(args.sbWarm, max(0, times.count - 1)))).sorted()
+    let med = tail[tail.count / 2]
+    let report: [String: Any] = ["arm": args.sbWhole ? "swift_whole" : "swift_seq", "T": T, "B": 1,
+                                 "cache": cfg.cacheLimitGB, "median_s": med, "tok_s": Double(T) / med,
+                                 "times": times, "loss_first": Double(losses.first ?? .nan),
+                                 "loss_last": Double(losses.last ?? .nan), "model": args.model]
+    print(String(format: "state-bench %@: T %d, медиана шага %.3f с, %.0f ток/с, лосс %.4f -> %.4f",
+                 args.sbWhole ? "одним графом" : "по блокам", T, med, Double(T) / med,
+                 losses.first ?? .nan, losses.last ?? .nan))
+    if let out = args.out {
+        try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]).write(to: URL(fileURLWithPath: expand(out)))
+    }
 }
 
 /// Обучение состояния вместо системной строки (см. шапку).
