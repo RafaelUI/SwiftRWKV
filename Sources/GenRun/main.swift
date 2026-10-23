@@ -21,8 +21,13 @@ import RWKVGen
 //  Обучение состояния вместо системной строки (--distill):
 //      gen-run --model M --vocab V --system "…" --distill
 //              --train-questions t.txt --teacher-cache d.json
-//              [--teacher-samples 4] [--init zero|fold] [--steps 300 --lr 3e-4
-//               --batch 4] --state-out s.safetensors
+//              [--teacher-samples 4] [--init zero|fold|fold-wkv] [--steps 300 --lr 3e-4
+//               --batch 4] [--held-out N --eval-every 25 --patience 3 --min-delta 0]
+//              --state-out s.safetensors
+//  fold-wkv — свёртка системной строки без сдвигов токена (переносится в .pth).
+//  --held-out N — N обучающих последовательностей (выбор по сиду) уходят в
+//  отложенные: ранняя остановка по их лоссу (StateTuneConfig.evalEvery), в файл
+//  идёт лучшее по ним состояние.
 //  Строки t.txt — «вид: вопрос»: id (ответ обязан совпасть с --keep-regex),
 //  skill (ответ упоминает стихи), poem (в ответе не меньше трёх строк), gen
 //  (берётся, если не оборван лимитом токенов), fact («fact: регэксп :: вопрос»
@@ -34,6 +39,15 @@ import RWKVGen
 //  обучение идут только вопросы текущего --train-questions). Ученик — та же модель БЕЗ системной строки с обучаемым
 //  начальным состоянием (с нуля или со свёрнутой системной строки); лосс
 //  только по ответу (цели вопроса < 0).
+//
+//  Перевод формата: gen-run --model M --vocab V --state-in a --state-out b
+//  (без --distill) — .safetensors ↔ .pth, на базе M.
+//
+//  Формат RWKV-PEFT: --state-out / --state-in с расширением .pth — состояние
+//  в файле torch (`blocks.{i}.att.time_state`, для RWKV Runner, Ai00 и т. п.).
+//  Сдвиги токена формат не хранит: при --state-parts all запись отказывает,
+//  пока не задан --drop-shifts. Отпечатка базы в .pth нет — сверяется только
+//  архитектура.
 //
 //  Замер шага state-tuning (--state-bench):
 //      gen-run --model M --vocab V --state-bench tokens.txt [--steps 30]
@@ -56,6 +70,8 @@ struct Args {
     var teacherSamples = 4, steps = 300, lr: Float = 3e-4, batch = 4, initMode = "zero"
     var keepRegex = "neuron|нейрон", parts = "wkv", gradClip: Float? = nil, logEvery = 25
     var rejectRegex: String? = nil
+    var dropShifts = false
+    var heldOut = 0, evalEvery = 25, patience = 3, minDelta: Float = 0
     var stateBench: String? = nil, sbWarm = 5, sbWhole = false, sbCache: Double? = nil, sbProfile = false
     var stream = false
     var sbCastAB = 0, sbCast = false, sbNoCast = false, sbArms = "off,wkv,lin"
@@ -85,6 +101,11 @@ func parse() -> Args {
         case "--teacher-cache": a.teacherCache = v()
         case "--teacher-samples": a.teacherSamples = max(1, Int(v()) ?? 4)
         case "--state-out": a.stateOut = v()
+        case "--held-out": a.heldOut = max(0, Int(v()) ?? 0)   // обучающих последовательностей в отложенные
+        case "--eval-every": a.evalEvery = max(1, Int(v()) ?? 25)
+        case "--patience": a.patience = max(1, Int(v()) ?? 3)
+        case "--min-delta": a.minDelta = Float(v()) ?? 0
+        case "--drop-shifts": a.dropShifts = true        // .pth RWKV-PEFT: записать без сдвигов токена
         case "--steps": a.steps = Int(v()) ?? a.steps
         case "--lr": a.lr = Float(v()) ?? a.lr
         case "--batch": a.batch = max(1, Int(v()) ?? a.batch)
@@ -129,11 +150,13 @@ func loadBase(_ path: String) throws -> X070Backbone {
 }
 
 let args = parse()
-guard !args.model.isEmpty, !args.vocab.isEmpty, !args.questions.isEmpty || args.distill || args.stateBench != nil else {
+guard !args.model.isEmpty, !args.vocab.isEmpty, !args.questions.isEmpty || args.distill || args.stateBench != nil
+        || (args.stateIn != nil && !args.stateOut.isEmpty) else {
     print("нужны --model, --vocab, --questions"); exit(2)
 }
 guard ["inline", "fold", "none"].contains(args.mode) else { print("--mode: inline | fold | none"); exit(2) }
-guard args.mode == "none" || !args.system.isEmpty else { print("--mode \(args.mode): нужен --system"); exit(2) }
+guard args.mode == "none" || !args.system.isEmpty || args.stateBench != nil
+        || (!args.distill && args.stateIn != nil && !args.stateOut.isEmpty) else { print("--mode \(args.mode): нужен --system"); exit(2) }
 guard let tok = WorldTokenizer(vocabURL: URL(fileURLWithPath: expand(args.vocab))) else {
     print("не удалось прочитать словарь"); exit(2)
 }
@@ -142,7 +165,8 @@ func lines(_ path: String) throws -> [String] {
         .split(separator: "\n").map(String.init)
         .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }
 }
-let questions = args.distill || args.stateBench != nil ? [] : try lines(args.questions)
+let convert = !args.distill && args.stateIn != nil && !args.stateOut.isEmpty
+let questions = args.distill || args.stateBench != nil || convert ? [] : try lines(args.questions)
 
 let t0 = Date()
 let base = try loadBase(args.model)
@@ -160,6 +184,24 @@ if args.distill {
 if let path = args.stateBench {
     try stateBench(path)
     exit(0)
+}
+if convert {
+    try convertState(args.stateIn!, args.stateOut)
+    exit(0)
+}
+
+/// Перевод состояния между форматами (.safetensors ↔ .pth RWKV-PEFT) на этой базе.
+func convertState(_ src: String, _ dst: String) throws {
+    let state = src.hasSuffix(".pth")
+        ? try StateFile.importPEFT(URL(fileURLWithPath: expand(src)), base: base).state
+        : try StateFile.load(URL(fileURLWithPath: expand(src)), base: base).state
+    if dst.hasSuffix(".pth") {
+        try StateFile.exportPEFT(state, to: URL(fileURLWithPath: expand(dst)), dropShifts: args.dropShifts)
+    } else {
+        _ = try StateFile.save(state, base: base, to: URL(fileURLWithPath: expand(dst)), kind: .tuned,
+                               note: "переведено из \((src as NSString).lastPathComponent)")
+    }
+    print("состояние переведено: \(src) → \(dst)")
 }
 
 /// Замер шага state-tuning на одной последовательности (см. шапку).
@@ -250,7 +292,7 @@ func distill() throws {
     guard !args.system.isEmpty, !args.trainQuestions.isEmpty, !args.teacherCache.isEmpty, !args.stateOut.isEmpty else {
         print("--distill: нужны --system, --train-questions, --teacher-cache, --state-out"); exit(2)
     }
-    guard ["zero", "fold"].contains(args.initMode) else { print("--init: zero | fold"); exit(2) }
+    guard ["zero", "fold", "fold-wkv"].contains(args.initMode) else { print("--init: zero | fold | fold-wkv"); exit(2) }
     let cacheURL = URL(fileURLWithPath: expand(args.teacherCache))
     // кэш учителя: ВСЕ ответы с отметкой kept (старые кэши — только взятые, без
     // отметки); вопросы, которых в кэше нет, догенерируются
@@ -346,14 +388,20 @@ func distill() throws {
     print("ученик: \(seqs.count) последовательностей, токенов ответа \(answerTokens), вопроса (вне лосса) \(masked); "
           + "стык вопрос/ответ токенизирован иначе у \(mismatched)")
 
-    var order = Array(seqs.indices), cursor = order.count
-    var gen = SplitMix64Shuffle(seed: args.seed)
-    func nextBatch() -> LoRABatch {
-        var rows: [(x: [Int32], y: [Int32])] = []
-        while rows.count < args.batch {
-            if cursor == order.count { order.shuffle(using: &gen); cursor = 0 }
-            rows.append(seqs[order[cursor]]); cursor += 1
-        }
+    // отложенные: --held-out последовательностей, выбранных перемешиванием со своим сидом
+    var heldSeqs: [(x: [Int32], y: [Int32])] = []
+    if args.heldOut > 0 {
+        precondition(args.heldOut < seqs.count, "--held-out \(args.heldOut): последовательностей всего \(seqs.count)")
+        var idx = Array(seqs.indices)
+        var hg = SplitMix64Shuffle(seed: args.seed ^ 0x6865_6C64)
+        idx.shuffle(using: &hg)
+        let held = Set(idx.prefix(args.heldOut))
+        heldSeqs = held.sorted().map { seqs[$0] }
+        seqs = seqs.indices.filter { !held.contains($0) }.map { seqs[$0] }
+        print("отложено \(heldSeqs.count) последовательностей, в обучении \(seqs.count); проверка каждые "
+              + "\(args.evalEvery) шагов, терпение \(args.patience), minDelta \(args.minDelta)")
+    }
+    func pack(_ rows: [(x: [Int32], y: [Int32])]) -> LoRABatch {
         let T = ((rows.map(\.x.count).max()! + 15) / 16) * 16           // кратно WKV7_CHUNK
         var xs: [Int32] = [], ys: [Int32] = []
         for r in rows {
@@ -362,15 +410,38 @@ func distill() throws {
         }
         return (x: MLXArray(xs, [rows.count, T]), y: MLXArray(ys, [rows.count, T]))
     }
+    let heldBatches = stride(from: 0, to: heldSeqs.count, by: args.batch).map {
+        pack(Array(heldSeqs[$0 ..< min($0 + args.batch, heldSeqs.count)]))
+    }
+    var order = Array(seqs.indices), cursor = order.count
+    var gen = SplitMix64Shuffle(seed: args.seed)
+    func nextBatch() -> LoRABatch {
+        var rows: [(x: [Int32], y: [Int32])] = []
+        while rows.count < args.batch {
+            if cursor == order.count { order.shuffle(using: &gen); cursor = 0 }
+            rows.append(seqs[order[cursor]]); cursor += 1
+        }
+        return pack(rows)
+    }
 
     var cfg = StateTuneConfig()
     cfg.lr = args.lr; cfg.lrMin = args.lr / 10; cfg.maxSteps = args.steps; cfg.warmupSteps = min(20, args.steps / 10)
     cfg.train = args.parts == "all" ? StateTrainableSet.Part.allCases : [.wkv]
     cfg.logEvery = args.logEvery
     if let c = args.gradClip { cfg.gradClip = c }        // иначе — умолчание библиотеки (1.0)
-    let initial: RWKVBatchState? = args.initMode == "fold" ? base.foldPrompt(tok.encode(systemPart)) : nil
+    var initial: RWKVBatchState? = args.initMode == "zero" ? nil : base.foldPrompt(tok.encode(systemPart))
+    if args.initMode == "fold-wkv", let f = initial {
+        // свёртка без сдвигов токена: такое состояние переносится в .pth RWKV-PEFT без потерь
+        initial = RWKVBatchState(wkv: f.wkv, tmixShift: zeros(like: f.tmixShift), cmixShift: zeros(like: f.cmixShift))
+    }
+    if !heldBatches.isEmpty { cfg.evalEvery = args.evalEvery; cfg.patience = args.patience; cfg.minDelta = args.minDelta }
     let t1 = Date()
-    let out = StateTuning.run(base, nextBatch: nextBatch, config: cfg, initial: initial,
+    let out = StateTuning.run(base, nextBatch: nextBatch, config: cfg, initial: initial, heldOut: heldBatches,
+                              onEval: { step, loss, best in
+        print(String(format: "  проверка: шаг %d, отложенный лосс %.4f%@, %.0f с", step, loss, best ? " (лучший)" : "",
+                     Date().timeIntervalSince(t1)))
+        fflush(stdout)
+    },
                               onStep: { step, loss, gradNorm, peakMB in
         if step % args.logEvery == 0 || step == 1 {
             print(String(format: "  шаг %d: лосс %.4f, норма градиента %.3g, пик MLX %.0f МБ, %.0f с", step, loss,
@@ -378,9 +449,17 @@ func distill() throws {
             fflush(stdout)
         }
     })
-    let note = "distill \(args.initMode), \(args.steps) шагов, lr \(args.lr), отсечение \(cfg.gradClip)"
-    _ = try StateFile.save(out.state, base: base, to: URL(fileURLWithPath: expand(args.stateOut)),
-                           kind: .tuned, trained: cfg.train, note: note)
+    var note = "distill \(args.initMode), \(args.steps) шагов, lr \(args.lr), отсечение \(cfg.gradClip)"
+    if let r = out.result.heldOut {
+        note += String(format: "; отложено %d, сделано шагов %d, лучший по отложенным — шаг %d (%.4f)%@", heldSeqs.count,
+                       out.result.steps, r.bestStep, r.bestLoss, r.stoppedEarly ? ", остановлено терпением" : "")
+    }
+    if args.stateOut.hasSuffix(".pth") {
+        try StateFile.exportPEFT(out.state, to: URL(fileURLWithPath: expand(args.stateOut)), dropShifts: args.dropShifts)
+    } else {
+        _ = try StateFile.save(out.state, base: base, to: URL(fileURLWithPath: expand(args.stateOut)),
+                               kind: .tuned, trained: cfg.train, note: note)
+    }
     print(String(format: "состояние сохранено: %@ (%@), %.0f с", args.stateOut, note, Date().timeIntervalSince(t1)))
 }
 
@@ -398,9 +477,16 @@ struct SplitMix64Shuffle: RandomNumberGenerator {
 }
 
 if let path = args.stateIn {
-    let (state, info) = try StateFile.load(URL(fileURLWithPath: expand(path)), base: base)
-    base.initialState = state
-    print("подключено состояние: \(info.kind), \(info.note)")
+    if path.hasSuffix(".pth") {
+        let (state, ignored) = try StateFile.importPEFT(URL(fileURLWithPath: expand(path)), base: base)
+        base.initialState = state
+        print("подключено состояние RWKV-PEFT (.pth; базу не сверить — отпечатка в формате нет)"
+              + (ignored.isEmpty ? "" : ", пропущены ключи: \(ignored.prefix(5))\(ignored.count > 5 ? "…" : "")"))
+    } else {
+        let (state, info) = try StateFile.load(URL(fileURLWithPath: expand(path)), base: base)
+        base.initialState = state
+        print("подключено состояние: \(info.kind), \(info.note)")
+    }
 }
 if args.mode == "fold" {
     precondition(args.stateIn == nil, "--mode fold и --state-in вместе: свёртка стартовала бы с обученного")
