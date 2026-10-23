@@ -425,6 +425,32 @@ against 1736) while memory is about the same as two layers (1.57 against 1.68 GB
 2.36 against 2.41). Only 0.4B at 4 × 1024 exceeds a 3 GB budget; 1.5B over a
 compressed base fits at 1 × 512, where its top layers do not.
 
+**Types on a dense bf16 base (23.10).** The WKV kernel returns fp32, and without a
+cast that fp32 flows into the residual stream, so every projection then lifts its
+whole bf16 weight to an fp32 copy on every pass. `StateTuneConfig` now controls this
+for the duration of training (the backbone's own flags are restored afterwards):
+
+- `castProjectionInput` (**on** by default) — a dense projection runs its matmul in
+  the weight's type and returns the input's type, `(x.asType(W.dtype) @ Wᵀ).asType(x.dtype)`;
+  the residual stream stays fp32.
+- `castWKVOutput` (off) — the WKV output is cast to the compute type, the way the
+  official implementation and mlx-lm do it.
+
+g1j 1.5B bf16, one sequence of 320 tokens, M4, arms interleaved in one process:
+
+| | step, block by block | step, whole graph | state gradient vs all-fp32, zero / random S₀ |
+|---|---|---|---|
+| no cast (before 23.10) | 1.767 s | swaps (12 GB) | 5.1 % / 6.6 % |
+| `castProjectionInput` (default) | **1.475 s** | 1.158 s, 7.5 GB | 5.7 % / 7.0 % |
+| `castWKVOutput` | 1.291 s | **1.013 s**, 5.1 GB | 12.0 % / 9.3 % |
+
+The WKV-output cast is the fastest and matches Preen (RWKV-7 state tuning in
+mlx-lm, 0.98 s per step on the same machine), but it doubles the gradient's error;
+the projection cast keeps it close to the uncast path, which is why it is the
+default. Block by block the step stays slower than one graph — each block is
+recomputed once — in exchange for memory (4.5–4.9 GB against 7.5); compiling the
+whole step (`mx.compile`, measured in rwkv-metal) gives another 5.5 %.
+
 ## Not done
 
 - A state per instruction is done (folded: `InstructionCache`; trained: a
