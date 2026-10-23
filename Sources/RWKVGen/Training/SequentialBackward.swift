@@ -264,7 +264,6 @@ extension LoRAFinetune {
         // ── 2. ln_out, голова и лосс: по кускам, каждый — свой vjp и eval ──
         let h = bb.finalNorm(x, T: T)
         eval(h)
-        let V = bb.cfg.vocab
         let masked = LoRAFinetune.ignoresTargets(batch.y)          // цели < 0 — вне лосса
         let scale = MLXArray(Float(1) / Float(masked ? LoRAFinetune.lossTokens(batch.y) : B * T))
         let step = lossPieceTokens(chunk: lossChunk, batch: B, length: T)
@@ -274,13 +273,8 @@ extension LoRAFinetune {
         while from < T {
             let to = Swift.min(from + step, T)
             let targets = batch.y[0..., from ..< to].reshaped([-1]).asType(.int32)
-            let (value, g) = vjp({ ins in
-                let lg = bb.projectForBlock(ins[0], "head.weight", lora: nil)
-                return [masked
-                    ? LoRAFinetune.maskedCrossEntropySum(logits: lg.reshaped([-1, V]), targets: targets)
-                    : crossEntropy(logits: lg.reshaped([-1, V]), targets: targets,
-                                   reduction: .sum).asType(.float32)]
-            }, primals: [h[0..., from ..< to]], cotangents: [scale])
+            let (value, g) = vjp({ ins in [headLossSum(bb, ins[0], targets, masked: masked)] },
+                                 primals: [h[0..., from ..< to]], cotangents: [scale])
             eval(value[0], g[0])
             SequentialBody.probe?("loss")
             total = total + value[0]
@@ -301,5 +295,53 @@ extension LoRAFinetune {
         return (loss, grads.enumerated().map { i, g in
             g ?? MLXArray.zeros(parameters[i].shape, dtype: parameters[i].dtype)
         })
+    }
+
+    /// Сумма кросс-энтропии куска (fp32) по выходу ln_out: голова и лосс — один счёт
+    /// для обучения (`sequentialGradients`) и для отложенного лосса (`heldOutLoss`).
+    static func headLossSum(_ bb: X070Backbone, _ h: MLXArray, _ targets: MLXArray, masked: Bool) -> MLXArray {
+        let V = bb.cfg.vocab
+        let lg = bb.projectForBlock(h, "head.weight", lora: nil)
+        return masked
+            ? LoRAFinetune.maskedCrossEntropySum(logits: lg.reshaped([-1, V]), targets: targets)
+            : crossEntropy(logits: lg.reshaped([-1, V]), targets: targets, reduction: .sum).asType(.float32)
+    }
+
+    /// Средний по токенам лосс на пачках прямым проходом по блокам, без градиента, при
+    /// параметрах, подключённых сейчас. Счёт прямого прохода и лосса — тот же, что у
+    /// `sequentialGradients`: на одной пачке при тех же параметрах — то же число бит в бит.
+    /// Пачки взвешиваются числом токенов в лоссе (цели ≥ 0). Вход блоков не копится
+    /// (запись только нижнего блока); с подкачкой весов блоки отпускаются по ходу.
+    static func heldOutLoss(_ bb: X070Backbone, set: TrainableSet, batches: [LoRABatch],
+                            lossChunk: Int) -> Float {
+        precondition(!batches.isEmpty, "отложенный лосс без пачек")
+        let plan = SequentialBody.Plan(names: set.parameterNames, nLayer: bb.cfg.nLayer)
+        var weighted = 0.0, tokens = 0
+        for batch in batches {
+            let T = batch.x.shape[1], B = batch.x.shape[0]
+            let trace = SequentialBody.forward(bb, ids: batch.x, plan: plan, stride: bb.cfg.nLayer)
+            let h = bb.finalNorm(trace.top, T: T)
+            eval(h)
+            let masked = ignoresTargets(batch.y)
+            let n = masked ? lossTokens(batch.y) : B * T
+            let scale = MLXArray(Float(1) / Float(n))
+            let step = lossPieceTokens(chunk: lossChunk, batch: B, length: T)
+            var total = MLXArray(Float(0))
+            var from = 0
+            while from < T {
+                let to = Swift.min(from + step, T)
+                let targets = batch.y[0..., from ..< to].reshaped([-1]).asType(.int32)
+                let value = headLossSum(bb, h[0..., from ..< to], targets, masked: masked)
+                eval(value)
+                total = total + value
+                from = to
+            }
+            let loss = total * scale
+            eval(loss)
+            bb.releaseStreamedHead()
+            weighted += Double(loss.item(Float.self)) * Double(n)
+            tokens += n
+        }
+        return Float(weighted / Double(tokens))
     }
 }

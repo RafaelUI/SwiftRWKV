@@ -88,6 +88,23 @@ public struct LoRAConfig: Sendable {
 public struct LoRATrainResult: Sendable {
     public let finalLoss: Float
     public let steps: Int
+    /// Ход ранней остановки по отложенному лоссу (`StateTuning.run(heldOut:)`); nil — её не было.
+    public var heldOut: HeldOutReport? = nil
+}
+
+/// Ход ранней остановки по отложенному лоссу.
+public struct HeldOutReport: Sendable, Equatable {
+    public struct Point: Sendable, Equatable {
+        public let step: Int
+        public let loss: Float
+    }
+    /// Проверки по порядку; шаг 0 — до обучения.
+    public let history: [Point]
+    /// Шаг лучшей проверки: её состояние возвращено и подключено (0 — исходное).
+    public let bestStep: Int
+    public let bestLoss: Float
+    /// Остановлено терпением раньше `maxSteps`.
+    public let stoppedEarly: Bool
 }
 
 // Резидентная память процесса, МБ (phys_footprint — то, по чему считает jetsam).

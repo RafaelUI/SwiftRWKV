@@ -281,6 +281,14 @@ public struct StateTuneConfig: Sendable {
     /// Быстрее (по блокам 1.291 с, одним графом 1.013 с — вровень с Preen), но ошибка
     /// градиента к fp32 вдвое больше: 12.0 % / 9.3 %. Выключено.
     public var castWKVOutput = false
+    /// Ранняя остановка по отложенному лоссу (`StateTuning.run(heldOut:)`): лосс на отложенных
+    /// пачках — до обучения и каждые `evalEvery` шагов (и на последнем); `patience` проверок
+    /// подряд без улучшения больше чем на `minDelta` — остановка. Подключается и возвращается
+    /// ЛУЧШЕЕ состояние, а не последнее. 0 — без проверок: путь тот же, что без этих полей.
+    /// Проверки обучения не трогают: шаги и лоссы те же, что без них, бит в бит.
+    public var evalEvery = 0
+    public var patience = 3
+    public var minDelta: Float = 0
 
     public init() {}
 
@@ -302,12 +310,18 @@ public enum StateTuning {
     /// адаптеры, если они есть. `initial` — стартовое состояние (например,
     /// после промпта); nil — подключённое либо нули. Возвращает обученное
     /// состояние (батч 1); оно остаётся подключённым к модели.
+    ///
+    /// `heldOut` — отложенные пачки для ранней остановки (`cfg.evalEvery` > 0, см.
+    /// `StateTuneConfig.evalEvery`); тогда возвращается лучшее по ним состояние, а ход
+    /// проверок — в `result.heldOut` и `onEval(шаг, лосс, лучший ли)`.
     @discardableResult
     public static func run(
         _ bb: X070Backbone,
         nextBatch: () -> LoRABatch,
         config cfg: StateTuneConfig = StateTuneConfig(),
         initial: RWKVBatchState? = nil,
+        heldOut: [LoRABatch] = [],
+        onEval: (_ step: Int, _ loss: Float, _ best: Bool) -> Void = { _,_,_ in },
         isCancelled: () -> Bool = { false },
         onStep: (_ step: Int, _ loss: Float, _ gradNorm: Float, _ peakMB: Double) -> Void = { _,_,_,_ in }
     ) -> (result: LoRATrainResult, state: RWKVBatchState) {
@@ -320,8 +334,13 @@ public enum StateTuning {
         bb.useBlockCheckpoint = false
         bb.castDenseProjectionInput = cfg.castProjectionInput
         bb.castWKVOutputToComputeDType = cfg.castWKVOutput
+        precondition((cfg.evalEvery > 0) == !heldOut.isEmpty,
+                     "ранняя остановка: нужны и evalEvery > 0, и отложенные пачки (evalEvery \(cfg.evalEvery), "
+                     + "пачек \(heldOut.count))")
+        precondition(cfg.patience >= 1, "patience \(cfg.patience): нужно ≥ 1")
         let set = StateTrainableSet(bb, train: cfg.train, initial: initial)
         var checked = false
+        var report: HeldOutReport? = nil
         let res = withoutActuallyEscaping(nextBatch) { escapingNext -> TrainingResult in
             let source: () -> LoRABatch = {
                 let b = escapingNext()
@@ -343,11 +362,37 @@ public enum StateTuning {
                 trainable: set,
                 objective: { LoRAFinetune.languageModelLoss(bb, $0, chunk: cfg.lossChunkTokens) },
                 nextBatch: source, config: cfg.training, gradient: provider)
-            return trainer.run(isCancelled: isCancelled) { s in
-                onStep(s.step, s.loss, s.gradNorm, s.peakMemoryMB)
+            let log: (TrainingStep) -> Void = { s in onStep(s.step, s.loss, s.gradNorm, s.peakMemoryMB) }
+            guard cfg.evalEvery > 0 else { return trainer.run(isCancelled: isCancelled, onStep: log) }
+
+            // ── ранняя остановка: обучение отрезками по evalEvery шагов (тренер продолжает с
+            //    того же шага с теми же моментами Adam), между ними — отложенный лосс ──
+            func evaluate() -> Float {
+                LoRAFinetune.heldOutLoss(bb, set: set, batches: heldOut, lossChunk: cfg.lossChunkTokens)
             }
+            var best = (step: 0, loss: evaluate(), params: set.initialParameters())
+            var history = [HeldOutReport.Point(step: 0, loss: best.loss)]
+            onEval(0, best.loss, true)
+            var done = 0, since = 0, stopped = false
+            var last = TrainingResult(finalLoss: .nan, steps: 0)
+            while done < cfg.maxSteps && !isCancelled() {
+                let length = Swift.min(cfg.evalEvery, cfg.maxSteps - done)
+                var calls = 0
+                last = trainer.run(isCancelled: { calls += 1; return calls > length || isCancelled() }, onStep: log)
+                if last.steps == done { break }                  // отменено до первого шага отрезка
+                done = last.steps
+                let loss = evaluate()
+                let better = loss < best.loss - cfg.minDelta
+                history.append(.init(step: done, loss: loss))
+                if better { best = (done, loss, trainer.currentParameters); since = 0 } else { since += 1 }
+                onEval(done, loss, better)
+                if since >= cfg.patience && done < cfg.maxSteps { stopped = true; break }
+            }
+            set.commit(best.params)
+            report = HeldOutReport(history: history, bestStep: best.step, bestLoss: best.loss, stoppedEarly: stopped)
+            return TrainingResult(finalLoss: last.finalLoss, steps: done)
         }
-        return (LoRATrainResult(finalLoss: res.finalLoss, steps: res.steps), bb.initialState!)
+        return (LoRATrainResult(finalLoss: res.finalLoss, steps: res.steps, heldOut: report), bb.initialState!)
     }
 }
 

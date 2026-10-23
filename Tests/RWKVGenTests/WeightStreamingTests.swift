@@ -76,6 +76,26 @@ final class WeightStreamingTests: XCTestCase {
         XCTAssertTrue(same(st.wkv, rt.wkv), "обученное состояние разошлось")
     }
 
+    /// Ранняя остановка с подкачкой: тот же ход проверок и то же состояние, что в памяти;
+    /// после обучения с проверками отложенного лосса прочитанных весов не остаётся.
+    func testEarlyStoppingSameAsResidentAndReleases() throws {
+        let s = try X070Backbone.loadStreaming(safetensors: Self.file, computeDType: .bfloat16)
+        let r = try resident()
+        let train = batch(seed: 5), held = [batch(seed: 6), batch(B: 1, seed: 7)]
+        var c = StateTuneConfig()
+        c.lr = 0.05; c.lrMin = 0.01; c.warmupSteps = 0; c.maxSteps = 4; c.logEvery = 0; c.cacheLimitGB = 0
+        c.lossChunkTokens = 0; c.evalEvery = 2
+        let (rs, st) = StateTuning.run(s, nextBatch: { train }, config: c, heldOut: held)
+        let (rr, rt) = StateTuning.run(r, nextBatch: { train }, config: c, heldOut: held)
+        XCTAssertEqual(rs.heldOut, rr.heldOut)
+        XCTAssertEqual(rs.heldOut?.history.map(\.step), [0, 2, 4])
+        XCTAssertTrue(same(st.wkv, rt.wkv), "состояние разошлось")
+        eval(st.wkv)
+        let before = GPU.activeMemory
+        s.releaseAllStreamedWeights()
+        XCTAssertLessThan(before - GPU.activeMemory, blockBytes(r) / 2, "после проверок остались прочитанные веса")
+    }
+
     /// Во время шага по блокам в памяти живут веса не больше двух блоков (пик), после
     /// шага — ни одного; у бэкбона в памяти — все.
     func testOnlyOneBlockResidentDuringStep() throws {
