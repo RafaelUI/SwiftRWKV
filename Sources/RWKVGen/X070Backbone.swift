@@ -230,6 +230,12 @@ public final class X070Backbone {
     /// Флаг переключается на живом объекте, так что обе ветки сравниваются в
     /// ОДНОМ процессе — замер «до и после» разными сборками недействителен.
     public var castWKVOutputToComputeDType = false { didSet { stepVersion &+= 1 } }
+    /// ЭКСПЕРИМЕНТ (23.10), по умолчанию ВЫКЛЮЧЕН: плотная проекция считает матмул в типе
+    /// ВЕСА — `(x.asType(W.dtype) @ Wᵀ).asType(x.dtype)` — вместо того, чтобы fp32-вход из
+    /// остаточного потока поднимал до fp32 весь вес. Остаточный поток остаётся fp32. То же,
+    /// что `_matmul_cast` квантованного слоя rwkv-metal (22.08, решение владельца: KL-сдвиг +3 %
+    /// против +23 % у приведения выхода WKV). Флаг живой — A/B в одном процессе.
+    public var castDenseProjectionInput = false { didSet { stepVersion &+= 1 } }
     /// LoRA-адаптеры по таргету: "blocks.L.tmix.r_proj" и т.п.
     var loraA: [String: MLXArray] = [:] { didSet { stepVersion &+= 1 } }      // [rank, in]
     var loraB: [String: MLXArray] = [:] { didSet { stepVersion &+= 1 } }      // [out, rank]
@@ -674,7 +680,11 @@ public final class X070Backbone {
             if let dense = rwkvqWeight(wKey, x.dtype) {
                 return matmul(x, dense.transposed())
             }
-            return matmul(x, wv(wKey).transposed())
+            let W = wv(wKey)
+            if castDenseProjectionInput && x.dtype != W.dtype {
+                return matmul(x.asType(W.dtype), W.transposed()).asType(x.dtype)
+            }
+            return matmul(x, W.transposed())
         }
         if decode || shortKernel, let world = rwkvqKeys[wKey], let sc = rwkvqSidecar {
             let lead = Array(x.shape.dropLast())

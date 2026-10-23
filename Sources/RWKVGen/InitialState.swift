@@ -269,6 +269,18 @@ public struct StateTuneConfig: Sendable {
     public var lossChunkTokens = 256
     public var cacheLimitGB = 0.25
     public var logEvery = 20
+    /// На время обучения: плотные проекции считают матмул в типе веса, остаточный поток
+    /// остаётся fp32 (`X070Backbone.castDenseProjectionInput`). Без этого fp32-выход ядра
+    /// WKV поднимает каждый bf16-вес до fp32 копией на каждом проходе. g1j 1.5B bf16, T 320,
+    /// батч 1, M4, A/B в одном процессе (23.10): шаг по блокам 1.767 → 1.475 с (одним графом
+    /// 1.158 с); градиент состояния к счёту целиком в fp32 — ‖Δ‖/‖g‖ 5.1 % → 5.7 % (нулевое
+    /// S0), 6.6 % → 7.0 % (случайное). Как `_matmul_cast` квантованного слоя rwkv-metal (22.08).
+    public var castProjectionInput = true
+    /// На время обучения: выход WKV приводится к типу вычислений
+    /// (`castWKVOutputToComputeDType`) — так считают официальная реализация и mlx-lm.
+    /// Быстрее (по блокам 1.291 с, одним графом 1.013 с — вровень с Preen), но ошибка
+    /// градиента к fp32 вдвое больше: 12.0 % / 9.3 %. Выключено.
+    public var castWKVOutput = false
 
     public init() {}
 
@@ -300,8 +312,14 @@ public enum StateTuning {
         onStep: (_ step: Int, _ loss: Float, _ gradNorm: Float, _ peakMB: Double) -> Void = { _,_,_,_ in }
     ) -> (result: LoRATrainResult, state: RWKVBatchState) {
         let savedLayers = bb.trainLayers, savedCheckpoint = bb.useBlockCheckpoint
-        defer { bb.trainLayers = savedLayers; bb.useBlockCheckpoint = savedCheckpoint }
+        let savedProjectionCast = bb.castDenseProjectionInput, savedWKVCast = bb.castWKVOutputToComputeDType
+        defer {
+            bb.trainLayers = savedLayers; bb.useBlockCheckpoint = savedCheckpoint
+            bb.castDenseProjectionInput = savedProjectionCast; bb.castWKVOutputToComputeDType = savedWKVCast
+        }
         bb.useBlockCheckpoint = false
+        bb.castDenseProjectionInput = cfg.castProjectionInput
+        bb.castWKVOutputToComputeDType = cfg.castWKVOutput
         let set = StateTrainableSet(bb, train: cfg.train, initial: initial)
         var checked = false
         let res = withoutActuallyEscaping(nextBatch) { escapingNext -> TrainingResult in
