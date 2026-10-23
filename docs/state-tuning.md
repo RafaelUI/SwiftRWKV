@@ -321,7 +321,7 @@ much. What the bank still offers is locality: on queries whose instruction had
 no training rows it reproduces the instruction exactly, and it leaves the shared
 weights untouched, so it can be added or dropped per task.
 
-### In place of a system prompt (generation, 20–21.10)
+### In place of a system prompt (generation, 20–23.10)
 
 g1d 0.4B with the system line «Ты — Neuron, языковая модель. Ты умеешь писать
 стихи.» ("You are Neuron, a language model. You can write poems."). The state
@@ -364,12 +364,42 @@ on each answer, 12 answers per question; paired bootstrap over questions:
   still below the bare model (−0.052), though a third of the prompt's damage.
 - **The persona holds better than with the prompt.** Naming itself Neuron
   (10 samples, 5 questions): 3–10 of 10 with the state, mostly 7–10, against 2–4 with the
-  prompt; on "Are you ChatGPT?" it gives another model's name 0–1 of 10 against
-  3 with the prompt. English questions about the name need English examples in
+  prompt; on "Are you ChatGPT?" it says yes in 0–2 of 10 samples, the prompt
+  in 2, the bare model in 5 (counted as an answer starting with "yes" or saying
+  "I am ChatGPT" without "not"). English questions about the name need English examples in
   the data (without them the state answered "Qwen"). The more facts in the
   data, the smaller the persona's share and the weaker it holds.
 - Measure general ability next to the target behaviour, and per kind of
   question: the overall difference hid two opposite effects.
+- **On 0.4B the form is tied to the question template.** 40 new items (words to
+  translate, sums), each asked twice — in the template of the training facts
+  and in a new wording ("How do you say «нож» in English?", "Multiply 5 by
+  8."): the state gains +0.242 [+0.160; +0.325] on the template and nothing on
+  the new wording (−0.008 [−0.083; +0.067]); new wordings of translation even
+  lose (−0.158), the "I write poems" persona leaking into the answer once the
+  template no longer holds it. For a small model the data has to cover
+  wordings, not only kinds of questions.
+
+**1.5B (g1j, `reduction` base, 23.10)** — the same data, protocol and seeds. The
+teacher answers half the facts correctly (243 of 484 samples), so the data has
+366 answers. A step takes ~4 s (300 steps in 20 minutes), peak process
+footprint 3.0–3.1 GB; the state is trained through the compressed projections.
+
+| arm | all 199 | translation | arithmetic | other facts | Russian | English |
+|---|---|---|---|---|---|---|
+| no system line | 0.799 | 0.836 | 0.951 | 0.748 | 0.710 | 0.967 |
+| system line in the prompt | 0.706 | 0.706 | 0.942 | 0.641 | 0.663 | 0.786 |
+| state | **0.816** | 0.833 | 0.986 | 0.765 | 0.759 | 0.923 |
+
+- prompt − no line: −0.093 [−0.122; −0.064]; state − no line: +0.017
+  [−0.009; +0.041] (other facts +0.017 [−0.011; +0.046]); state − prompt:
+  +0.110 [+0.084; +0.136]. The larger model's state costs nothing measurable
+  in general ability, while the prompt still does.
+- The form transfers: on the new wordings the state gains +0.102 [+0.052;
+  +0.152] over the bare model (+0.046 on the template).
+- The persona: Neuron 10 of 10 on four of five questions about itself on all
+  three seeds (prompt: 1–9 of 10); on "Are you ChatGPT?" the prompt says yes
+  in 6 of 10 samples, the state in 1–2.
 
 ### Cost of a step
 
