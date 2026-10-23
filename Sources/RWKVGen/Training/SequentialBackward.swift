@@ -116,6 +116,7 @@ public enum SequentialBody {
             for j in from ..< l {
                 let (xo, _) = bb.blockForward(x, j > 0 ? vFirst : nil, j)
                 eval(xo)
+                bb.releaseStreamed(layer: j)
                 x = xo
                 blockInput[j + 1] = x
                 SequentialBody.probe?("retrace")
@@ -138,12 +139,19 @@ public enum SequentialBody {
                      "слои \(first)..<\(plan.nLayer) обязаны идти дифференцируемым ядром (trainLayers)")
         var x = bb.stem(ids)
         eval(x)
+        bb.releaseStreamedStem()
         let trace = Trace(ids: ids, top: x)
         var vFirst: MLXArray? = nil
+        var unreleased: [Int] = []          // блоки, посчитанные с прошлого settle (подкачка весов)
         for l in 0 ..< plan.nLayer {
             if l >= first && (l - first) % Swift.max(1, stride) == 0 { trace.blockInput[l] = x }
             let (xo, vf) = bb.blockForward(x, vFirst, l)
-            if (l + 1) % Swift.max(1, forwardSettleEvery) == 0 || l == plan.nLayer - 1 { settle([xo, vf]) }
+            unreleased.append(l)
+            if (l + 1) % Swift.max(1, forwardSettleEvery) == 0 || l == plan.nLayer - 1 {
+                settle([xo, vf])
+                for j in unreleased { bb.releaseStreamed(layer: j) }
+                unreleased = []
+            }
             x = xo
             vFirst = vf
         }
@@ -205,6 +213,7 @@ public enum SequentialBody {
             }
             for (j, i) in idx.enumerated() { add(i, g[nData + j]); ready.append(grads[i]!) }
             settle(ready)
+            bb.releaseStreamed(layer: l)
             trace.blockInput[l] = nil
             probe?("block \(l)")
         }
@@ -221,6 +230,7 @@ public enum SequentialBody {
             inject(parameters)
             for (j, i) in idx.enumerated() { add(i, g[j]) }
             eval(idx.map { grads[$0]! })
+            bb.releaseStreamedStem()
             probe?("stem")
         }
     }
@@ -281,6 +291,7 @@ extension LoRAFinetune {
         let dx = vjp({ ins in [bb.finalNorm(ins[0], T: T)] }, primals: [x], cotangents: [dh]).1[0]
         let loss = total * scale
         eval(dx, loss)
+        bb.releaseStreamedHead()
         pieces = []
 
         // ── 3. блоки сверху вниз ──

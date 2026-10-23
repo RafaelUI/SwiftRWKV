@@ -166,6 +166,9 @@ public final class X070Backbone {
         return ok
     }
     var w: [String: MLXArray] { didSet { stepVersion &+= 1 } }
+    /// Подкачка весов с диска (`X070Backbone.loadStreaming`): откуда брать свежие ленивые ссылки
+    /// на веса блока, таблицы эмбеддингов и головы. nil — веса живут в памяти (умолчание).
+    var weightStream: WeightStream? = nil
 
     // ── LoRA / QLoRA / training hooks ──
     // Инертны для обычного инференса (пустые словари + trainLayers пуст) ⇒
