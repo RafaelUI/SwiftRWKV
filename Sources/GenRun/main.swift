@@ -57,6 +57,7 @@ struct Args {
     var keepRegex = "neuron|нейрон", parts = "wkv", gradClip: Float? = nil, logEvery = 25
     var rejectRegex: String? = nil
     var stateBench: String? = nil, sbWarm = 5, sbWhole = false, sbCache: Double? = nil, sbProfile = false
+    var stream = false
     var sbCastAB = 0, sbCast = false, sbNoCast = false, sbArms = "off,wkv,lin"
 }
 
@@ -94,6 +95,7 @@ func parse() -> Args {
         case "--reject-regex": a.rejectRegex = v()
         case "--log-every": a.logEvery = max(1, Int(v()) ?? 25)
         case "--state-bench": a.stateBench = v()
+        case "--stream": a.stream = true                  // подкачка весов с диска (плотный .safetensors)
         case "--sb-warm": a.sbWarm = max(0, Int(v()) ?? 5)
         case "--sb-whole": a.sbWhole = true
         case "--sb-cache": a.sbCache = Double(v())
@@ -114,6 +116,7 @@ func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
 func loadBase(_ path: String) throws -> X070Backbone {
     let p = expand(path)
     if p.hasSuffix(".rwkvq") { return try X070Backbone.load(fromRwkvq: p) }
+    if args.stream { return try X070Backbone.loadStreaming(safetensors: URL(fileURLWithPath: p)) }
     let weights = try loadArrays(url: URL(fileURLWithPath: p))
     let nLayer = weights.keys.compactMap { k -> Int? in
         guard k.hasPrefix("blocks.") else { return nil }
