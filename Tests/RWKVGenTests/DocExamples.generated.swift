@@ -1517,3 +1517,24 @@ func doc_state_tuning_3() throws {
     _ = decode
     base.initialState = nil                                     // detach
 }
+
+func doc_state_tuning_4() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    let (state, _) = try StateFile.load(URL(fileURLWithPath: "/tmp/task.state.safetensors"), base: base)
+    try StateFile.exportPEFT(state, to: URL(fileURLWithPath: "/tmp/task.pth"))
+    let (back, ignored) = try StateFile.importPEFT(URL(fileURLWithPath: "/tmp/task.pth"), base: base)
+    print(back.wkv.shape, ignored)          // keys other than blocks.{i}.att.time_state
+}

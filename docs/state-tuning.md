@@ -154,6 +154,13 @@ print(result.heldOut!.bestStep, result.heldOut!.stoppedEarly, state.wkv.shape)
   and loss, and whether patience stopped the run. Works with weight streaming;
   the check lets go of the weights it read.
 
+Measured on g1j 1.5B, "Neuron" (a system prompt distilled into a state, folded
+start, batch 4, 300 steps), with 40 of the 366 teacher answers held out and a
+check every 25 steps: held-out loss 1.044 before training, 0.890 at step 100,
+0.873 at step 200 (best), 0.875–0.876 from 225 to 300. No overfitting by step
+300, a plateau from about 200; `patience = 3` would have stopped at 275 and
+returned step 200. A check of 10 batches took ~12 s (a step ~4.5 s).
+
 ## Attaching, prompts and caches
 
 ```swift
@@ -210,6 +217,45 @@ As the measurements below show, the refusal is stricter than quality requires
 between a model and its own quantized files; it is kept so that a state is never
 silently used on an unrelated model. Pass `allowOtherBase: true` to move a
 state between a dense model and its `.rwkvq` files.
+
+### RWKV-PEFT `.pth`
+
+`StateFile.exportPEFT` writes a state the way RWKV-PEFT state tuning saves it, a
+torch file read by RWKV Runner, Ai00 and other runners; `StateFile.importPEFT`
+reads one. No torch is needed on either side.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+let (state, _) = try StateFile.load(URL(fileURLWithPath: "/tmp/task.state.safetensors"), base: base)
+try StateFile.exportPEFT(state, to: URL(fileURLWithPath: "/tmp/task.pth"))
+let (back, ignored) = try StateFile.importPEFT(URL(fileURLWithPath: "/tmp/task.pth"), base: base)
+print(back.wkv.shape, ignored)          // keys other than blocks.{i}.att.time_state
+```
+
+- Keys `blocks.{i}.att.time_state`, shape (heads, S, S), fp32, in the same layout
+  as here (x070 runners take it untransposed). Checked on g1j 1.5B: a 64-token
+  prompt folded here and in mlx-lm (the path Preen exports through, checked in
+  RWKV Runner) — relative difference 8.4e-7 as is, 1.40 transposed, in both
+  directions; `torch.load(weights_only=True)` reads the file.
+- The reader understands what `torch.save` writes for a dict of tensors (fp32,
+  bf16, fp16 storages, shared storage with offsets, strided views,
+  `nn.Parameter`, `_metadata`) and executes nothing: an unknown global or opcode
+  is refused, as with `weights_only=True`. Compressed or zip64 files are refused.
+- The file has no base fingerprint: `importPEFT(base:)` checks the architecture
+  (layers, heads, head size) only.
+- **The format has no token shifts.** Exporting a state with non-zero shifts is
+  refused unless `dropShifts: true`; importing gives zero shifts. A state trained
+  only on WKV from zero has none, but one trained from a folded prompt keeps the
+  fold's shifts, and the trained matrix leans on them. g1j 1.5B, "Neuron" (system
+  prompt distilled into a state, 300 steps, folded start): the persona answers
+  the name questions 10/10 with its shifts and 0/10 with them dropped. Started
+  from the fold with the shifts zeroed (`gen-run --init fold-wkv`), the same
+  training reaches a lower loss (0.391 against 0.419) and, loaded from the
+  `.pth`, answers the four name questions 10/10 each again ("what can you do?"
+  3/10 against 10/10). General questions (199 checkable answers, one training
+  seed, 4 samples each): 0.828 against 0.818 with shifts (+0.010 [−0.014;
+  +0.035]) and 0.799 for the model without a prompt. For a state that will be
+  exported, start from zero or from a fold without shifts.
 
 ## Embeddings
 
@@ -522,6 +568,8 @@ whole step (`mx.compile`, measured in rwkv-metal) gives another 5.5 %.
 
 - Weight streaming covers dense `.safetensors` only; a `.rwkvq` base (re-laid out at
   load) is not streamed, and rwkv-metal has no streaming.
+- The `.pth` export and early stopping are in SwiftRWKV only; rwkv-metal has
+  neither.
 
 - A state per instruction is done (folded: `InstructionCache`; trained: a
   state bank, `StateBankTrainableSet`) for retrieval queries only. Not done: a
