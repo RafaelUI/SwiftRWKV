@@ -1477,6 +1477,34 @@ func doc_state_tuning_2() throws {
         return X070Backbone(weights: weights, cfg: cfg)
     }
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    let ids = MLXArray((0 ..< 130).map { Int32($0 % 60000) }, [2, 65])
+    let train: LoRABatch = (x: ids[0 ..< 1, 0 ..< 64], y: ids[0 ..< 1, 1 ... 64])
+    let held: LoRABatch = (x: ids[1 ..< 2, 0 ..< 64], y: ids[1 ..< 2, 1 ... 64])
+
+    var config = StateTuneConfig()
+    config.maxSteps = 500
+    config.evalEvery = 25            // held-out loss before training and every 25 steps
+    config.patience = 3              // stop after 3 checks in a row without improvement
+    let (result, state) = StateTuning.run(base, nextBatch: { train }, config: config, heldOut: [held],
+                                          onEval: { step, loss, best in print(step, loss, best) })
+    print(result.heldOut!.bestStep, result.heldOut!.stoppedEarly, state.wkv.shape)
+}
+
+func doc_state_tuning_3() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
     let url = URL(fileURLWithPath: "/tmp/task.state.safetensors")
     let (loaded, info) = try StateFile.load(url, base: base)   // checks the base
     base.initialState = loaded               // body / prefill / embedder start from it

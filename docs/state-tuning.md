@@ -120,6 +120,40 @@ is kept in memory. A whole-graph pass (`bb(ids)`, training with
 `sequentialBackward = false`) reads every weight and keeps it until
 `releaseAllStreamedWeights()`.
 
+### Early stopping on held-out loss
+
+Pass held-out batches and `evalEvery`, and training stops when the held-out loss
+stops improving; the state that comes back (and stays attached) is the best one,
+not the last.
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+let ids = MLXArray((0 ..< 130).map { Int32($0 % 60000) }, [2, 65])
+let train: LoRABatch = (x: ids[0 ..< 1, 0 ..< 64], y: ids[0 ..< 1, 1 ... 64])
+let held: LoRABatch = (x: ids[1 ..< 2, 0 ..< 64], y: ids[1 ..< 2, 1 ... 64])
+
+var config = StateTuneConfig()
+config.maxSteps = 500
+config.evalEvery = 25            // held-out loss before training and every 25 steps
+config.patience = 3              // stop after 3 checks in a row without improvement
+let (result, state) = StateTuning.run(base, nextBatch: { train }, config: config, heldOut: [held],
+                                      onEval: { step, loss, best in print(step, loss, best) })
+print(result.heldOut!.bestStep, result.heldOut!.stoppedEarly, state.wkv.shape)
+```
+
+- The held-out loss is computed block by block, like the training step: on the
+  same batch with the same state it is the training loss bit for bit. Batches are
+  weighted by the number of tokens in the loss (targets ≥ 0).
+- Training runs in segments of `evalEvery` steps on one trainer (same step
+  counter, same Adam moments, same schedule): the checks do not change training —
+  every step's loss is the same bit for bit as without them.
+- An improvement is a loss below the best by more than `minDelta`; `patience`
+  checks without one stop training. Cancelling (`isCancelled`) mid-segment still
+  checks the steps done.
+- `result.heldOut` holds every check (step 0 is before training), the best step
+  and loss, and whether patience stopped the run. Works with weight streaming;
+  the check lets go of the weights it read.
+
 ## Attaching, prompts and caches
 
 ```swift
