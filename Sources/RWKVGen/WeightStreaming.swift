@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import RWKVQuant
 
 // ───────────────────────────────────────────────────────────────────────
 //  Обучение с подкачкой весов с диска — по выбору, не по умолчанию (23.10).
@@ -22,15 +23,26 @@ import MLX
 //  слоёв и эмбеддера по блокам. Проход одним графом (`bb(ids)`, обучение без
 //  `sequentialBackward`) веса прочитает и оставит в памяти до
 //  `releaseAllStreamedWeights()`.
+//
+//  Уже собранная модель (в первую очередь из `.rwkvq`, 24.10) — через
+//  `enableWeightStreaming(cache:)`: веса блоков, таблица эмбеддингов и голова
+//  (у квантованной базы — её буферы) один раз выгружаются в файл-кэш
+//  safetensors как есть, и дальше модель читает их оттуда так же лениво. Байты
+//  те же — числа те же до бита.
 // ───────────────────────────────────────────────────────────────────────
 
 /// Откуда брать веса заново: файл, тип вычислений, имена по частям модели.
 struct WeightStream {
     let url: URL
-    let dtype: DType
+    /// К какому типу приводить прочитанное; nil — как в файле (выгрузка).
+    let dtype: DType?
     let byLayer: [[String]]
-    static let stemKeys = ["emb.weight"]
-    static let headKeys = ["head.weight"]
+    let stem: [String]
+    let head: [String]
+    /// Имена в файле — с префиксом части модели (выгрузка): `w/` — словарь весов,
+    /// `sc/` — буферы квантованной базы, `emb/` — сжатая таблица эмбеддингов.
+    /// Иначе — ключи словаря весов как есть (плотный чекпоинт).
+    let prefixed: Bool
 
     /// Свежие ленивые ссылки на веса `keys` (данные не читаются до вычисления).
     func fresh(_ keys: [String]) -> [String: MLXArray] {
@@ -41,7 +53,7 @@ struct WeightStream {
         var out: [String: MLXArray] = [:]
         for k in keys {
             guard let v = all[k] else { preconditionFailure("подкачка весов: в \(url.lastPathComponent) нет \(k)") }
-            out[k] = v.asType(dtype)
+            out[k] = dtype.map { v.asType($0) } ?? v
         }
         return out
     }
@@ -63,8 +75,47 @@ extension X070Backbone {
         let bb = X070Backbone(weights: w, cfg: cfg, computeDType: computeDType)
         var byLayer = [[String]](repeating: [], count: nLayer)
         for k in w.keys where k.hasPrefix("blocks.") { byLayer[Int(k.split(separator: ".")[1])!].append(k) }
-        bb.weightStream = WeightStream(url: url, dtype: computeDType, byLayer: byLayer.map { $0.sorted() })
+        bb.weightStream = WeightStream(url: url, dtype: computeDType, byLayer: byLayer.map { $0.sorted() },
+                                       stem: ["emb.weight"], head: ["head.weight"], prefixed: false)
         return bb
+    }
+
+    /// Подкачка весов для уже собранной модели — например из `.rwkvq`, где плотного
+    /// чекпоинта нет. Веса блоков, таблица эмбеддингов и голова (у квантованной базы —
+    /// её буферы, сжатыми) выгружаются в `cache` (safetensors, байты как в памяти; файл
+    /// перезаписывается), после чего модель держит на них ленивые ссылки и отпускает
+    /// прочитанное так же, как `loadStreaming(safetensors:)`. Числа всех путей — те же до
+    /// бита. Нормы основания и выхода (малые) остаются в памяти. Отказ: подкачка уже
+    /// включена; база переложена в родной контейнер MLX (`useNativeKernel`).
+    public func enableWeightStreaming(cache url: URL) throws {
+        guard weightStream == nil else { throw WeightStreamingError.alreadyStreaming }
+        guard rwkvqNative.isEmpty else { throw WeightStreamingError.nativeKernel }
+        var arrays: [String: MLXArray] = [:]
+        var byLayer = [[String]](repeating: [], count: cfg.nLayer), stem: [String] = [], head: [String] = []
+        // `owner` — имя, по которому решается часть модели: ключ веса или тензора базы
+        func put(_ file: String, _ owner: String, _ v: MLXArray) {
+            if owner.hasPrefix("blocks."), let l = Int(owner.split(separator: ".")[1]), l < cfg.nLayer {
+                byLayer[l].append(file)
+            } else if owner.hasPrefix("emb.") { stem.append(file) }
+            else if owner.hasPrefix("head.") { head.append(file) }
+            else { return }
+            arrays[file] = v
+        }
+        for (k, v) in w { put("w/" + k, k, v) }
+        if let sc = rwkvqSidecar {
+            for (k, v) in sc.spillBuffers {
+                let owner = k.hasPrefix("fused::") ? k.components(separatedBy: "::")[1] : k
+                put("sc/" + k, owner, v)
+            }
+        }
+        if let t = rwkvqEmbTable { for (k, v) in t.spillBuffers { put("emb/" + k, "emb.weight", v) } }
+        eval(Array(arrays.values))
+        try MLX.save(arrays: arrays, url: url)
+        weightStream = WeightStream(url: url, dtype: nil, byLayer: byLayer.map { $0.sorted() },
+                                    stem: stem.sorted(), head: head.sorted(), prefixed: true)
+        arrays = [:]
+        releaseAllStreamedWeights()
+        GPU.clearCache()
     }
 
     /// Включена ли подкачка весов.
@@ -73,7 +124,7 @@ extension X070Backbone {
     /// Отпустить прочитанные веса всех частей модели (после прохода одним графом).
     public func releaseAllStreamedWeights() {
         guard let s = weightStream else { return }
-        replace(s.fresh(s.byLayer.flatMap { $0 } + WeightStream.stemKeys + WeightStream.headKeys))
+        replace(s.fresh(s.byLayer.flatMap { $0 } + s.stem + s.head))
     }
 
     /// Веса блока `layer` — свежими ленивыми ссылками (прочитанные освобождаются).
@@ -85,26 +136,47 @@ extension X070Backbone {
     /// Таблица эмбеддингов — после основания.
     func releaseStreamedStem() {
         guard let s = weightStream else { return }
-        replace(s.fresh(WeightStream.stemKeys))
+        replace(s.fresh(s.stem))
     }
 
     /// Голова — после лосса.
     func releaseStreamedHead() {
         guard let s = weightStream else { return }
-        replace(s.fresh(WeightStream.headKeys))
+        replace(s.fresh(s.head))
     }
 
     private func replace(_ fresh: [String: MLXArray]) {
-        var nw = w
-        for (k, v) in fresh { nw[k] = v }
-        w = nw
+        guard weightStream?.prefixed == true else {
+            var nw = w
+            for (k, v) in fresh { nw[k] = v }
+            w = nw
+            return
+        }
+        var nw: [String: MLXArray] = [:], sc: [String: MLXArray] = [:], emb: [String: MLXArray] = [:]
+        for (k, v) in fresh {
+            if k.hasPrefix("w/") { nw[String(k.dropFirst(2))] = v }
+            else if k.hasPrefix("sc/") { sc[String(k.dropFirst(3))] = v }
+            else if k.hasPrefix("emb/") { emb[String(k.dropFirst(4))] = v }
+        }
+        if !nw.isEmpty {
+            var all = w
+            for (k, v) in nw { all[k] = v; denseTargetCast[k] = nil }
+            w = all
+        }
+        if !sc.isEmpty, let s = rwkvqSidecar { rwkvqSidecar = s.replacingSpilled(sc) }
+        if !emb.isEmpty, let t = rwkvqEmbTable { rwkvqEmbTable = t.replacingSpilled(emb) }
     }
 }
 
 public enum WeightStreamingError: Error, CustomStringConvertible {
     case notAModel(String)
+    case alreadyStreaming
+    case nativeKernel
     public var description: String {
         switch self {
+        case .alreadyStreaming: return "подкачка весов уже включена"
+        case .nativeKernel:
+            return "подкачка весов: база переложена в родной контейнер MLX (useNativeKernel) — не поддержано"
         case .notAModel(let f): return "подкачка весов: \(f) — не плотный чекпоинт RWKV-7 (нет blocks.*, ln_out, head)"
         }
     }
