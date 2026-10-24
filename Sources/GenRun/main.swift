@@ -27,7 +27,10 @@ import RWKVGen
 //  fold-wkv — свёртка системной строки без сдвигов токена (переносится в .pth).
 //  --held-out N — N обучающих последовательностей (выбор по сиду) уходят в
 //  отложенные: ранняя остановка по их лоссу (StateTuneConfig.evalEvery), в файл
-//  идёт лучшее по ним состояние.
+//  идёт лучшее по ним состояние. --eval-states a,b,zero [--eval-out o.json] —
+//  вместо обучения: отложенный лосс готовых состояний по последовательностям.
+//  --compute fp32|bf16|fp16 — тип вычислений плотной базы; --cast off|lin|wkv —
+//  приведение в обучении состояния (умолчание lin = StateTuneConfig).
 //  Строки t.txt — «вид: вопрос»: id (ответ обязан совпасть с --keep-regex),
 //  skill (ответ упоминает стихи), poem (в ответе не меньше трёх строк), gen
 //  (берётся, если не оборван лимитом токенов), fact («fact: регэксп :: вопрос»
@@ -72,8 +75,9 @@ struct Args {
     var rejectRegex: String? = nil
     var dropShifts = false
     var heldOut = 0, evalEvery = 25, patience = 3, minDelta: Float = 0
+    var compute = "bf16", cast = "lin", evalStates: [String] = [], evalOut: String? = nil, keepLast = false
     var stateBench: String? = nil, sbWarm = 5, sbWhole = false, sbCache: Double? = nil, sbProfile = false
-    var stream = false
+    var stream = false, streamCache: String? = nil
     var sbCastAB = 0, sbCast = false, sbNoCast = false, sbArms = "off,wkv,lin"
 }
 
@@ -105,6 +109,11 @@ func parse() -> Args {
         case "--eval-every": a.evalEvery = max(1, Int(v()) ?? 25)
         case "--patience": a.patience = max(1, Int(v()) ?? 3)
         case "--min-delta": a.minDelta = Float(v()) ?? 0
+        case "--compute": a.compute = v()                 // тип вычислений плотной базы: fp32 | bf16 | fp16
+        case "--cast": a.cast = v()                       // приведение в обучении состояния: off | lin | wkv
+        case "--eval-states": a.evalStates = v().split(separator: ",").map(String.init)   // zero = без состояния
+        case "--eval-out": a.evalOut = v()
+        case "--keep-last": a.keepLast = true              // с --held-out: в файл — последнее состояние, не лучшее
         case "--drop-shifts": a.dropShifts = true        // .pth RWKV-PEFT: записать без сдвигов токена
         case "--steps": a.steps = Int(v()) ?? a.steps
         case "--lr": a.lr = Float(v()) ?? a.lr
@@ -116,6 +125,7 @@ func parse() -> Args {
         case "--reject-regex": a.rejectRegex = v()
         case "--log-every": a.logEvery = max(1, Int(v()) ?? 25)
         case "--state-bench": a.stateBench = v()
+        case "--stream-cache": a.streamCache = v()       // файл выгрузки для --stream с .rwkvq
         case "--stream": a.stream = true                  // подкачка весов с диска (плотный .safetensors)
         case "--sb-warm": a.sbWarm = max(0, Int(v()) ?? 5)
         case "--sb-whole": a.sbWhole = true
@@ -136,8 +146,18 @@ func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
 
 func loadBase(_ path: String) throws -> X070Backbone {
     let p = expand(path)
-    if p.hasSuffix(".rwkvq") { return try X070Backbone.load(fromRwkvq: p) }
-    if args.stream { return try X070Backbone.loadStreaming(safetensors: URL(fileURLWithPath: p)) }
+    if p.hasSuffix(".rwkvq") {
+        let bb = try X070Backbone.load(fromRwkvq: p)
+        if args.stream {
+            // подкачка собранной модели: буферы базы выгружаются в файл-кэш и читаются оттуда
+            guard let c = args.streamCache else { print("--stream с .rwkvq: нужен --stream-cache файл"); exit(2) }
+            try bb.enableWeightStreaming(cache: URL(fileURLWithPath: expand(c)))
+        }
+        return bb
+    }
+    let dtypes: [String: DType] = ["fp32": .float32, "bf16": .bfloat16, "fp16": .float16]
+    guard let dt = dtypes[args.compute] else { print("--compute: fp32 | bf16 | fp16"); exit(2) }
+    if args.stream { return try X070Backbone.loadStreaming(safetensors: URL(fileURLWithPath: p), computeDType: dt) }
     let weights = try loadArrays(url: URL(fileURLWithPath: p))
     let nLayer = weights.keys.compactMap { k -> Int? in
         guard k.hasPrefix("blocks.") else { return nil }
@@ -146,7 +166,7 @@ func loadBase(_ path: String) throws -> X070Backbone {
     let cfg = X070Config(nLayer: nLayer, nEmbd: weights["ln_out.weight"]!.shape[0],
                          headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
                          vocab: weights["head.weight"]!.shape[0])
-    return X070Backbone(weights: weights, cfg: cfg, computeDType: .bfloat16)
+    return X070Backbone(weights: weights, cfg: cfg, computeDType: dt)
 }
 
 let args = parse()
@@ -289,7 +309,8 @@ func stateBench(_ path: String) throws {
 
 /// Обучение состояния вместо системной строки (см. шапку).
 func distill() throws {
-    guard !args.system.isEmpty, !args.trainQuestions.isEmpty, !args.teacherCache.isEmpty, !args.stateOut.isEmpty else {
+    guard !args.system.isEmpty, !args.trainQuestions.isEmpty, !args.teacherCache.isEmpty,
+          !args.stateOut.isEmpty || !args.evalStates.isEmpty else {
         print("--distill: нужны --system, --train-questions, --teacher-cache, --state-out"); exit(2)
     }
     guard ["zero", "fold", "fold-wkv"].contains(args.initMode) else { print("--init: zero | fold | fold-wkv"); exit(2) }
@@ -429,12 +450,45 @@ func distill() throws {
     cfg.train = args.parts == "all" ? StateTrainableSet.Part.allCases : [.wkv]
     cfg.logEvery = args.logEvery
     if let c = args.gradClip { cfg.gradClip = c }        // иначе — умолчание библиотеки (1.0)
+    guard ["off", "lin", "wkv"].contains(args.cast) else { print("--cast: off | lin | wkv"); exit(2) }
+    cfg.castProjectionInput = args.cast == "lin"
+    cfg.castWKVOutput = args.cast == "wkv"
+
+    if !args.evalStates.isEmpty {
+        // отложенный лосс готовых состояний по последовательностям — без обучения
+        guard !heldSeqs.isEmpty else { print("--eval-states: нужен --held-out N"); exit(2) }
+        var report: [String: Any] = ["compute": args.compute, "cast": args.cast, "held_out": heldSeqs.count]
+        var states: [String: Any] = [:]
+        for path in args.evalStates {
+            let state: RWKVBatchState? = path == "zero" ? nil
+                : path.hasSuffix(".pth") ? try StateFile.importPEFT(URL(fileURLWithPath: expand(path)), base: base).state
+                : try StateFile.load(URL(fileURLWithPath: expand(path)), base: base).state
+            var losses: [Float] = [], tokens: [Int] = []
+            for q in heldSeqs {
+                losses.append(StateTuning.heldOutLoss(base, state: state, batches: [pack([q])], config: cfg))
+                tokens.append(q.y.filter { $0 >= 0 }.count)
+            }
+            let mean = zip(losses, tokens).reduce(0.0) { $0 + Double($1.0) * Double($1.1) } / Double(tokens.reduce(0, +))
+            print(String(format: "отложенный лосс %@: %.4f (%d последовательностей, %@, приведение %@)",
+                         path, mean, losses.count, args.compute, args.cast))
+            states[path] = ["mean": mean, "per_seq": losses, "tokens": tokens]
+        }
+        report["states"] = states
+        if let o = args.evalOut {
+            try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                .write(to: URL(fileURLWithPath: expand(o)))
+        }
+        return
+    }
     var initial: RWKVBatchState? = args.initMode == "zero" ? nil : base.foldPrompt(tok.encode(systemPart))
     if args.initMode == "fold-wkv", let f = initial {
         // свёртка без сдвигов токена: такое состояние переносится в .pth RWKV-PEFT без потерь
         initial = RWKVBatchState(wkv: f.wkv, tmixShift: zeros(like: f.tmixShift), cmixShift: zeros(like: f.cmixShift))
     }
-    if !heldBatches.isEmpty { cfg.evalEvery = args.evalEvery; cfg.patience = args.patience; cfg.minDelta = args.minDelta }
+    if !heldBatches.isEmpty {
+        cfg.evalEvery = args.evalEvery; cfg.patience = args.patience; cfg.minDelta = args.minDelta
+        cfg.restoreBest = !args.keepLast
+    }
     let t1 = Date()
     let out = StateTuning.run(base, nextBatch: nextBatch, config: cfg, initial: initial, heldOut: heldBatches,
                               onEval: { step, loss, best in
