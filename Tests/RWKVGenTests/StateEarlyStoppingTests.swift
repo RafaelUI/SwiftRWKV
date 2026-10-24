@@ -71,7 +71,7 @@ final class StateEarlyStoppingTests: XCTestCase {
     // ── Ранняя остановка ────────────────────────────────────────────────
 
     func train(evalEvery: Int, patience: Int = 100, minDelta: Float = 0, maxSteps: Int = 8,
-               cancelAfter: Int? = nil) -> (losses: [Float], out: (result: LoRATrainResult, state: RWKVBatchState),
+               cancelAfter: Int? = nil, restoreBest: Bool = true) -> (losses: [Float], out: (result: LoRATrainResult, state: RWKVBatchState),
                                             bb: X070Backbone, initial: RWKVBatchState) {
         let bb = model()
         let initial = start(bb)
@@ -79,7 +79,7 @@ final class StateEarlyStoppingTests: XCTestCase {
         var cfg = StateTuneConfig()
         cfg.maxSteps = maxSteps; cfg.warmupSteps = 2; cfg.logEvery = 1; cfg.lr = 1e-2; cfg.lrMin = 1e-3
         cfg.cacheLimitGB = 0; cfg.lossChunkTokens = 0
-        cfg.evalEvery = evalEvery; cfg.patience = patience; cfg.minDelta = minDelta
+        cfg.evalEvery = evalEvery; cfg.patience = patience; cfg.minDelta = minDelta; cfg.restoreBest = restoreBest
         var i = 0
         var losses: [Float] = []
         let out = StateTuning.run(bb, nextBatch: { defer { i += 1 }; return data[i % data.count] }, config: cfg,
@@ -115,6 +115,21 @@ final class StateEarlyStoppingTests: XCTestCase {
         t.bb.castDenseProjectionInput = true                         // как во время обучения (fp32: без разницы)
         let again = LoRAFinetune.heldOutLoss(t.bb, set: set, batches: [batch(99, mask: 3), batch(98)], lossChunk: 0)
         XCTAssertEqual(again, r.bestLoss)
+    }
+
+    /// `restoreBest = false`: проверки только наблюдают — возвращено последнее состояние, ход тот же.
+    func testKeepLast() {
+        // minDelta огромный: улучшений нет, лучшее — исходное (шаг 0), терпение не кончается
+        let best = train(evalEvery: 3, minDelta: 1e9)
+        let last = train(evalEvery: 3, minDelta: 1e9, restoreBest: false)
+        let plain = train(evalEvery: 0)
+        XCTAssertEqual(best.out.result.heldOut, last.out.result.heldOut)
+        XCTAssertEqual(best.out.result.heldOut!.bestStep, 0)
+        XCTAssertEqual(last.out.result.steps, 8)
+        XCTAssertTrue(bitwise(best.out.state.wkv, best.initial.wkv))
+        XCTAssertTrue(bitwise(last.out.state.wkv, plain.out.state.wkv), "возвращено не последнее состояние")
+        XCTAssertTrue(bitwise(last.bb.initialState!.wkv, plain.out.state.wkv), "подключено не последнее состояние")
+        XCTAssertFalse(bitwise(best.out.state.wkv, last.out.state.wkv))
     }
 
     /// Ни одного улучшения: стоп после `patience` проверок, возвращено исходное состояние.

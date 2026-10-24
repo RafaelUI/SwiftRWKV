@@ -289,6 +289,9 @@ public struct StateTuneConfig: Sendable {
     public var evalEvery = 0
     public var patience = 3
     public var minDelta: Float = 0
+    /// С проверками: вернуть и подключить лучшее по отложенному лоссу состояние (умолчание)
+    /// либо последнее (`false` — проверки только наблюдают: кривая и остановка терпением).
+    public var restoreBest = true
 
     public init() {}
 
@@ -388,11 +391,35 @@ public enum StateTuning {
                 onEval(done, loss, better)
                 if since >= cfg.patience && done < cfg.maxSteps { stopped = true; break }
             }
-            set.commit(best.params)
+            if cfg.restoreBest { set.commit(best.params) }
             report = HeldOutReport(history: history, bestStep: best.step, bestLoss: best.loss, stoppedEarly: stopped)
             return TrainingResult(finalLoss: last.finalLoss, steps: done)
         }
         return (LoRATrainResult(finalLoss: res.finalLoss, steps: res.steps, heldOut: report), bb.initialState!)
+    }
+}
+
+extension StateTuning {
+
+    /// Средний по токенам лосс языковой модели на пачках при начальном состоянии `state`
+    /// (nil — нули) — тем же счётом, что отложенный лосс ранней остановки: проход по блокам,
+    /// приведения типов из `config`. Пачки взвешиваются токенами в лоссе (цели ≥ 0). Модель
+    /// после вызова — как до него: флаги и подключённое состояние возвращаются.
+    public static func heldOutLoss(_ bb: X070Backbone, state: RWKVBatchState?, batches: [LoRABatch],
+                                   config cfg: StateTuneConfig = StateTuneConfig()) -> Float {
+        let savedLayers = bb.trainLayers, savedCheckpoint = bb.useBlockCheckpoint
+        let savedProjectionCast = bb.castDenseProjectionInput, savedWKVCast = bb.castWKVOutputToComputeDType
+        let savedState = bb.initialLayers
+        defer {
+            bb.trainLayers = savedLayers; bb.useBlockCheckpoint = savedCheckpoint
+            bb.castDenseProjectionInput = savedProjectionCast; bb.castWKVOutputToComputeDType = savedWKVCast
+            bb.initialLayers = savedState
+        }
+        bb.useBlockCheckpoint = false
+        bb.castDenseProjectionInput = cfg.castProjectionInput
+        bb.castWKVOutputToComputeDType = cfg.castWKVOutput
+        let set = StateTrainableSet(bb, train: cfg.train, initial: state ?? bb.zeroInitialState())
+        return LoRAFinetune.heldOutLoss(bb, set: set, batches: batches, lossChunk: cfg.lossChunkTokens)
     }
 }
 

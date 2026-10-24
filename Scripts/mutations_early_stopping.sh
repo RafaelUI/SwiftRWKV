@@ -20,7 +20,9 @@ run "minDelta не учитывается" \
 run "улучшение — рост лосса" \
     "$IS" '                let better = loss < best.loss - cfg.minDelta' '                let better = loss > best.loss - cfg.minDelta'
 run "возвращается последнее состояние, а не лучшее" \
-    "$IS" '            set.commit(best.params)' '            _ = best.params'
+    "$IS" '            if cfg.restoreBest { set.commit(best.params) }' '            if cfg.restoreBest { _ = best.params }'
+run "restoreBest = false не действует" \
+    "$IS" '            if cfg.restoreBest { set.commit(best.params) }' '            set.commit(best.params)'
 run "лучшее запоминается без своих параметров" \
     "$IS" 'best = (done, loss, trainer.currentParameters)' 'best = (done, loss, best.params)'
 run "терпение на проверку длиннее" \
