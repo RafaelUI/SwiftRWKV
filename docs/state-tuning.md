@@ -115,8 +115,24 @@ rounds:
 | streaming | 1.816 / 1.765 s (+8 %) | **0.95 / 0.93 GB** |
 
 The file was in the operating system's cache here; on a phone it is read from
-storage on every pass. Only dense `.safetensors` checkpoints stream; a `.rwkvq` base
-is kept in memory. A whole-graph pass (`bb(ids)`, training with
+storage on every pass.
+
+A model that is already built — in the first place one loaded from `.rwkvq`, which
+has no dense checkpoint to read from — streams through a spill file:
+`enableWeightStreaming(cache:)` writes the block weights, the embedding table and
+the head once (a quantized base as its compressed buffers, the r/k/v groups once)
+and from then on reads them from that file the same way.
+
+```swift
+let base = try X070Backbone.load(fromRwkvq: "/tmp/1p5b_reduction.rwkvq")
+try base.enableWeightStreaming(cache: URL(fileURLWithPath: "/tmp/1p5b_reduction.spill.safetensors"))
+print(base.isWeightStreaming)
+```
+
+g1j 1.5B `reduction` (fp16), the same step: 1.813 / 1.814 s and 2.68 GB in memory,
+2.001 / 1.996 s (+10 %) and **1.58 GB** streaming (the spill file is 1.5 GB). The
+rest of the footprint is the step itself. A base re-laid out for MLX's own
+quantized kernels (`useNativeKernel: true`) is refused. A whole-graph pass (`bb(ids)`, training with
 `sequentialBackward = false`) reads every weight and keeps it until
 `releaseAllStreamedWeights()`.
 
@@ -151,7 +167,8 @@ print(result.heldOut!.bestStep, result.heldOut!.stoppedEarly, state.wkv.shape)
   checks without one stop training. Cancelling (`isCancelled`) mid-segment still
   checks the steps done.
 - `result.heldOut` holds every check (step 0 is before training), the best step
-  and loss, and whether patience stopped the run. Works with weight streaming;
+  and loss, and whether patience stopped the run. `restoreBest = false` keeps the
+  last state instead: the checks then only watch (the curve, and patience). Works with weight streaming;
   the check lets go of the weights it read.
 
 Measured on g1j 1.5B, "Neuron" (a system prompt distilled into a state, folded
@@ -558,16 +575,41 @@ g1j 1.5B bf16, one sequence of 320 tokens, M4, arms interleaved in one process:
 | `castWKVOutput` | 1.291 s | **1.013 s**, 5.1 GB | 12.0 % / 9.3 % |
 
 The WKV-output cast is the fastest and matches Preen (RWKV-7 state tuning in
-mlx-lm, 0.98 s per step on the same machine), but it doubles the gradient's error;
-the projection cast keeps it close to the uncast path, which is why it is the
-default. Block by block the step stays slower than one graph — each block is
-recomputed once — in exchange for memory (4.5–4.9 GB against 7.5); compiling the
-whole step (`mx.compile`, measured in rwkv-metal) gives another 5.5 %.
+mlx-lm, 0.98 s per step on the same machine). Block by block the step stays slower
+than one graph — each block is recomputed once — in exchange for memory (4.5–4.9 GB
+against 7.5); compiling the whole step (`mx.compile`, measured in rwkv-metal) gives
+another 5.5 %.
+
+**Gradient error and training outcome (24.10).** Re-measured on 16 windows of 320
+tokens (g1j 1.5B, `StateCastDump`), relative error of the state gradient against an
+all-fp32 pass, zero S₀, median; the ratio to the default is a bootstrap over windows:
+
+| compute type, cast | error | to the default |
+|---|---|---|
+| bf16, none | 4.9 % | ×0.86 |
+| bf16, `castProjectionInput` (default) | 5.8 % | ×1 |
+| bf16, `castWKVOutput` | 10.5 % | ×1.78 [1.58; 2.00] |
+| fp16, none | 0.6 % | ×0.10 |
+| fp16, `castProjectionInput` | 1.3 % | ×0.26 |
+| fp16, `castWKVOutput` | 1.6 % | ×0.32 |
+
+The WKV-output cast does double the error in bf16, and fp16 is four to ten times
+closer to fp32 than bf16 (more mantissa bits; on M4 a fp16 step costs the same as
+bf16: 1.661 / 1.647 s against 1.648 / 1.648, 1.5B dense, separate processes). The
+trained state does not see the difference. g1d 0.4B, "Neuron" (a system prompt
+distilled into a state, 300 steps, 3 seeds, 30 teacher answers held out), the last
+state's held-out loss evaluated the same way for every arm, minus the fp32-trained
+arm (bootstrap over seed × sequence): bf16 none +0.002 [−0.005; +0.010], projection
+cast +0.009 [−0.001; +0.020], WKV-output cast −0.007 [−0.019; +0.005]; fp16 none
++0.005, projection cast +0.013 [+0.003; +0.022], WKV-output cast +0.002. The
+held-out curves of all seven arms agree within 0.006 at every check. So on this
+task neither the compute type nor the cast changes what is learned; the default
+stays as it was.
 
 ## Not done
 
-- Weight streaming covers dense `.safetensors` only; a `.rwkvq` base (re-laid out at
-  load) is not streamed, and rwkv-metal has no streaming.
+- rwkv-metal streams dense `.safetensors` only; a `.rwkvq` base is streamed in
+  SwiftRWKV (through a spill file) but not there.
 - The `.pth` export and early stopping are in SwiftRWKV only; rwkv-metal has
   neither.
 

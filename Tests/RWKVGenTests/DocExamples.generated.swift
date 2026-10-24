@@ -1476,6 +1476,25 @@ func doc_state_tuning_2() throws {
                              vocab: weights["head.weight"]!.shape[0])
         return X070Backbone(weights: weights, cfg: cfg)
     }
+    let base = try X070Backbone.load(fromRwkvq: "/tmp/1p5b_reduction.rwkvq")
+    try base.enableWeightStreaming(cache: URL(fileURLWithPath: "/tmp/1p5b_reduction.spill.safetensors"))
+    print(base.isWeightStreaming)
+}
+
+func doc_state_tuning_3() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
     let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
     let ids = MLXArray((0 ..< 130).map { Int32($0 % 60000) }, [2, 65])
     let train: LoRABatch = (x: ids[0 ..< 1, 0 ..< 64], y: ids[0 ..< 1, 1 ... 64])
@@ -1490,7 +1509,7 @@ func doc_state_tuning_2() throws {
     print(result.heldOut!.bestStep, result.heldOut!.stoppedEarly, state.wkv.shape)
 }
 
-func doc_state_tuning_3() throws {
+func doc_state_tuning_4() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -1518,7 +1537,7 @@ func doc_state_tuning_3() throws {
     base.initialState = nil                                     // detach
 }
 
-func doc_state_tuning_4() throws {
+func doc_state_tuning_5() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
