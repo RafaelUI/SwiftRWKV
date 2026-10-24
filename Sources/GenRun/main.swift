@@ -462,13 +462,17 @@ func distill() throws {
         for path in args.evalStates {
             let state: RWKVBatchState? = path == "zero" ? nil
                 : path.hasSuffix(".pth") ? try StateFile.importPEFT(URL(fileURLWithPath: expand(path)), base: base).state
-                : try StateFile.load(URL(fileURLWithPath: expand(path)), base: base).state
+                // та же база в другом типе вычислений (fp16) даёт другой отпечаток — сравнение типов
+                // ровно об этом, поэтому база не сверяется
+                : try StateFile.load(URL(fileURLWithPath: expand(path)), base: base, allowOtherBase: true).state
             var losses: [Float] = [], tokens: [Int] = []
             for q in heldSeqs {
                 losses.append(StateTuning.heldOutLoss(base, state: state, batches: [pack([q])], config: cfg))
                 tokens.append(q.y.filter { $0 >= 0 }.count)
             }
             let mean = zip(losses, tokens).reduce(0.0) { $0 + Double($1.0) * Double($1.1) } / Double(tokens.reduce(0, +))
+            let packed = StateTuning.heldOutLoss(base, state: state, batches: heldBatches, config: cfg)
+            print(String(format: "  пачками по %d (как в ранней остановке): %.4f", args.batch, packed))
             print(String(format: "отложенный лосс %@: %.4f (%d последовательностей, %@, приведение %@)",
                          path, mean, losses.count, args.compute, args.cast))
             states[path] = ["mean": mean, "per_seq": losses, "tokens": tokens]
