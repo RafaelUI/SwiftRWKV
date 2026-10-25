@@ -30,7 +30,7 @@ import RWKVGen
 //  идёт лучшее по ним состояние. --eval-states a,b,zero [--eval-out o.json] —
 //  вместо обучения: отложенный лосс готовых состояний по последовательностям.
 //  --compute fp32|bf16|fp16 — тип вычислений плотной базы; --cast off|lin|wkv —
-//  приведение в обучении состояния (умолчание lin = StateTuneConfig).
+//  приведение в обучении состояния (умолчание wkv = StateTuneConfig, 25.10).
 //  Строки t.txt — «вид: вопрос»: id (ответ обязан совпасть с --keep-regex),
 //  skill (ответ упоминает стихи), poem (в ответе не меньше трёх строк), gen
 //  (берётся, если не оборван лимитом токенов), fact («fact: регэксп :: вопрос»
@@ -55,12 +55,12 @@ import RWKVGen
 //  Замер шага state-tuning (--state-bench):
 //      gen-run --model M --vocab V --state-bench tokens.txt [--steps 30]
 //              [--sb-warm 5] [--sb-whole] [--sb-cache ГБ] [--sb-profile]
-//              [--sb-cast | --sb-nocast] [--sb-cast-ab N --sb-arms off,wkv,lin] [--out o.json]
+//              [--sb-lin | --sb-nocast] [--sb-cast-ab N --sb-arms off,wkv,lin] [--out o.json]
 //  tokens.txt — T+1 номеров токенов через пробел (одна строка, батч 1; T
 //  кратна 16); шаг — `StateTuning.run` с умолчаниями `StateTuneConfig`
 //  (обратный проход по блокам; --sb-whole — одним графом). Печатает медиану
-//  времени шага после разогрева и ток/с. Типы: умолчание — приведение входа
-//  проекций (StateTuneConfig.castProjectionInput), --sb-cast — выход WKV,
+//  времени шага после разогрева и ток/с. Типы: умолчание — приведение выхода
+//  WKV (StateTuneConfig.castWKVOutput, 25.10), --sb-lin — входа проекций,
 //  --sb-nocast — без приведения; --sb-cast-ab N — плечи вперемежку в одном процессе.
 // ───────────────────────────────────────────────────────────────────────
 
@@ -75,10 +75,10 @@ struct Args {
     var rejectRegex: String? = nil
     var dropShifts = false
     var heldOut = 0, evalEvery = 25, patience = 3, minDelta: Float = 0
-    var compute = "bf16", cast = "lin", evalStates: [String] = [], evalOut: String? = nil, keepLast = false
+    var compute = "bf16", cast = "wkv", evalStates: [String] = [], evalOut: String? = nil, keepLast = false
     var stateBench: String? = nil, sbWarm = 5, sbWhole = false, sbCache: Double? = nil, sbProfile = false
     var stream = false, streamCache: String? = nil
-    var sbCastAB = 0, sbCast = false, sbNoCast = false, sbArms = "off,wkv,lin"
+    var sbCastAB = 0, sbLin = false, sbNoCast = false, sbArms = "off,wkv,lin"
 }
 
 func parse() -> Args {
@@ -130,7 +130,7 @@ func parse() -> Args {
         case "--sb-warm": a.sbWarm = max(0, Int(v()) ?? 5)
         case "--sb-whole": a.sbWhole = true
         case "--sb-cache": a.sbCache = Double(v())
-        case "--sb-cast": a.sbCast = true          // castWKVOutputToComputeDType = true
+        case "--sb-lin": a.sbLin = true            // приведение входа проекций вместо выхода WKV
         case "--sb-cast-ab": a.sbCastAB = Int(v()) ?? 0   // кругов A/B флага в одном процессе
         case "--sb-arms": a.sbArms = v()                  // плечи A/B: off | wkv | lin (через запятую)
         case "--sb-nocast": a.sbNoCast = true             // без приведения (как до 23.10)
@@ -234,9 +234,9 @@ func stateBench(_ path: String) throws {
     var cfg = StateTuneConfig()
     cfg.maxSteps = args.steps; cfg.logEvery = 1; cfg.sequentialBackward = !args.sbWhole
     // типы на время шага — из cfg (StateTuning.run выставляет флаги бэкбона сам): умолчание
-    // библиотеки — приведение входа проекций; --sb-cast — выход WKV; --sb-nocast — как до 23.10
-    if args.sbCast { cfg.castWKVOutput = true; cfg.castProjectionInput = false }
-    if args.sbNoCast { cfg.castProjectionInput = false }
+    // библиотеки — приведение выхода WKV (25.10); --sb-lin — входа проекций; --sb-nocast — как до 23.10
+    if args.sbLin { cfg.castWKVOutput = false; cfg.castProjectionInput = true }
+    if args.sbNoCast { cfg.castProjectionInput = false; cfg.castWKVOutput = false }
     if args.sbCastAB > 0 {
         // A/B нескольких способов не пускать fp32 в веса: off — как есть; wkv — приведение выхода
         // WKV (castWKVOutputToComputeDType); lin — приведение входа плотной проекции к типу веса

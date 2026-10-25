@@ -560,19 +560,19 @@ cast that fp32 flows into the residual stream, so every projection then lifts it
 whole bf16 weight to an fp32 copy on every pass. `StateTuneConfig` now controls this
 for the duration of training (the backbone's own flags are restored afterwards):
 
-- `castProjectionInput` (**on** by default) — a dense projection runs its matmul in
-  the weight's type and returns the input's type, `(x.asType(W.dtype) @ Wᵀ).asType(x.dtype)`;
+- `castWKVOutput` (**on** by default since 25.10) — the WKV output is cast to the
+  compute type, the way the official implementation and mlx-lm do it.
+- `castProjectionInput` (off) — a dense projection runs its matmul in the weight's
+  type and returns the input's type, `(x.asType(W.dtype) @ Wᵀ).asType(x.dtype)`;
   the residual stream stays fp32.
-- `castWKVOutput` (off) — the WKV output is cast to the compute type, the way the
-  official implementation and mlx-lm do it.
 
 g1j 1.5B bf16, one sequence of 320 tokens, M4, arms interleaved in one process:
 
 | | step, block by block | step, whole graph | state gradient vs all-fp32, zero / random S₀ |
 |---|---|---|---|
 | no cast (before 23.10) | 1.767 s | swaps (12 GB) | 5.1 % / 6.6 % |
-| `castProjectionInput` (default) | **1.475 s** | 1.158 s, 7.5 GB | 5.7 % / 7.0 % |
-| `castWKVOutput` | 1.291 s | **1.013 s**, 5.1 GB | 12.0 % / 9.3 % |
+| `castProjectionInput` | 1.475 s | 1.158 s, 7.5 GB | 5.7 % / 7.0 % |
+| `castWKVOutput` (default) | **1.291 s** | **1.013 s**, 5.1 GB | 12.0 % / 9.3 % |
 
 The WKV-output cast is the fastest and matches Preen (RWKV-7 state tuning in
 mlx-lm, 0.98 s per step on the same machine). Block by block the step stays slower
@@ -582,13 +582,13 @@ another 5.5 %.
 
 **Gradient error and training outcome (24.10).** Re-measured on 16 windows of 320
 tokens (g1j 1.5B, `StateCastDump`), relative error of the state gradient against an
-all-fp32 pass, zero S₀, median; the ratio to the default is a bootstrap over windows:
+all-fp32 pass, zero S₀, median; the ratio to the projection cast is a bootstrap over windows:
 
 | compute type, cast | error | to the default |
 |---|---|---|
 | bf16, none | 4.9 % | ×0.86 |
-| bf16, `castProjectionInput` (default) | 5.8 % | ×1 |
-| bf16, `castWKVOutput` | 10.5 % | ×1.78 [1.58; 2.00] |
+| bf16, `castProjectionInput` | 5.8 % | ×1 |
+| bf16, `castWKVOutput` (default) | 10.5 % | ×1.78 [1.58; 2.00] |
 | fp16, none | 0.6 % | ×0.10 |
 | fp16, `castProjectionInput` | 1.3 % | ×0.26 |
 | fp16, `castWKVOutput` | 1.6 % | ×0.32 |
@@ -603,8 +603,8 @@ arm (bootstrap over seed × sequence): bf16 none +0.002 [−0.005; +0.010], proj
 cast +0.009 [−0.001; +0.020], WKV-output cast −0.007 [−0.019; +0.005]; fp16 none
 +0.005, projection cast +0.013 [+0.003; +0.022], WKV-output cast +0.002. The
 held-out curves of all seven arms agree within 0.006 at every check. So on this
-task neither the compute type nor the cast changes what is learned; the default
-stays as it was.
+task neither the compute type nor the cast changes what is learned, and since 25.10
+the default is the fastest arm, the WKV-output cast (the dense base stays bf16).
 
 ## Not done
 
