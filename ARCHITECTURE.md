@@ -55,7 +55,24 @@ Two properties are non-negotiable, because both repos already depend on them:
 
 ## Where things stand
 
-Present in SwiftRWKV:
+**Today (25.10).** Everything listed as absent below now exists — pretraining,
+embeddings, reranking, the `.rwkvq` backend, batched boundary state for training
+and encoding, a shared trainer; the README lists what the package does. Three
+parts of this design were *not* carried out, and the sections below should be
+read with that in mind:
+
+- **The module split.** `RWKVCore` and `RWKVTraining` were not split out: the
+  backbone and the training infrastructure live inside `RWKVGen`, and there is
+  no umbrella target — the products are `RWKVGen`, `RWKVQuant`, `RWKVEmbedding`
+  and `RWKVRerank` (the reranker module is `RWKVRerank`, not `RWKVReranker`).
+  The compiled documentation lives in `Scripts/check_docs.sh`.
+- **Decode is still `B = 1`.** Batched state exists for the parallel pass; a
+  batched recurrent step does not.
+- **The tokenizer is still World-only.**
+
+What follows is the design record as written at the start of the port.
+
+**At the start of the port** (July 2026), present in SwiftRWKV:
 
 | Component | Status |
 |---|---|
