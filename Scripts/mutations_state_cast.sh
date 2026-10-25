@@ -10,10 +10,10 @@ BB=Sources/RWKVGen/X070Backbone.swift
 IS=Sources/RWKVGen/InitialState.swift
 FILTER='StateTuningCast'
 run() { local d="$1"; shift; printf '%-58s ' "$d"; "$M" "$@" --filter "$FILTER"; }
-run "умолчание castProjectionInput — выключено" \
-    "$IS" '    public var castProjectionInput = true' '    public var castProjectionInput = false'
-run "умолчание castWKVOutput — включено" \
-    "$IS" '    public var castWKVOutput = false' '    public var castWKVOutput = true'
+run "умолчание castProjectionInput — включено" \
+    "$IS" '    public var castProjectionInput = false' '    public var castProjectionInput = true'
+run "умолчание castWKVOutput — выключено" \
+    "$IS" '    public var castWKVOutput = true' '    public var castWKVOutput = false'
 run "run не выставляет приведение проекций (остаётся флаг бэкбона)" \
     "$IS" '        bb.castDenseProjectionInput = cfg.castProjectionInput' '        bb.castDenseProjectionInput = savedProjectionCast'
 run "приведение проекций берётся из поля WKV" \

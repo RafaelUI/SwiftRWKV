@@ -270,17 +270,19 @@ public struct StateTuneConfig: Sendable {
     public var cacheLimitGB = 0.25
     public var logEvery = 20
     /// На время обучения: плотные проекции считают матмул в типе веса, остаточный поток
-    /// остаётся fp32 (`X070Backbone.castDenseProjectionInput`). Без этого fp32-выход ядра
-    /// WKV поднимает каждый bf16-вес до fp32 копией на каждом проходе. g1j 1.5B bf16, T 320,
-    /// батч 1, M4, A/B в одном процессе (23.10): шаг по блокам 1.767 → 1.475 с (одним графом
-    /// 1.158 с); градиент состояния к счёту целиком в fp32 — ‖Δ‖/‖g‖ 5.1 % → 5.7 % (нулевое
-    /// S0), 6.6 % → 7.0 % (случайное). Как `_matmul_cast` квантованного слоя rwkv-metal (22.08).
-    public var castProjectionInput = true
+    /// остаётся fp32 (`X070Backbone.castDenseProjectionInput`) — второй способ не поднимать
+    /// bf16-веса до fp32 копией на каждом проходе (как `_matmul_cast` квантованного слоя
+    /// rwkv-metal, 22.08). g1j 1.5B bf16, T 320, M4: шаг по блокам 1.475 с (без приведения
+    /// 1.767); ошибка градиента состояния к fp32 5.8 % (без приведения 4.9 %). Выключено:
+    /// умолчание — приведение выхода WKV (решение 25.10).
+    public var castProjectionInput = false
     /// На время обучения: выход WKV приводится к типу вычислений
     /// (`castWKVOutputToComputeDType`) — так считают официальная реализация и mlx-lm.
-    /// Быстрее (по блокам 1.291 с, одним графом 1.013 с — вровень с Preen), но ошибка
-    /// градиента к fp32 вдвое больше: 12.0 % / 9.3 %. Выключено.
-    public var castWKVOutput = false
+    /// УМОЛЧАНИЕ (25.10): самое быстрое — по блокам 1.291 с, одним графом 1.013 с (вровень
+    /// с Preen). Ошибка градиента состояния к fp32 больше (10.5 % против 5.8 %, ×1.78
+    /// [1.58; 2.00], 16 окон), но исход обучения тот же: g1d 0.4B, Neuron, 3 сида —
+    /// отложенный лосс к обучению в fp32 −0.007 [−0.019; +0.005].
+    public var castWKVOutput = true
     /// Ранняя остановка по отложенному лоссу (`StateTuning.run(heldOut:)`): лосс на отложенных
     /// пачках — до обучения и каждые `evalEvery` шагов (и на последнем); `patience` проверок
     /// подряд без улучшения больше чем на `minDelta` — остановка. Подключается и возвращается
@@ -328,15 +330,8 @@ public enum StateTuning {
         isCancelled: () -> Bool = { false },
         onStep: (_ step: Int, _ loss: Float, _ gradNorm: Float, _ peakMB: Double) -> Void = { _,_,_,_ in }
     ) -> (result: LoRATrainResult, state: RWKVBatchState) {
-        let savedLayers = bb.trainLayers, savedCheckpoint = bb.useBlockCheckpoint
-        let savedProjectionCast = bb.castDenseProjectionInput, savedWKVCast = bb.castWKVOutputToComputeDType
-        defer {
-            bb.trainLayers = savedLayers; bb.useBlockCheckpoint = savedCheckpoint
-            bb.castDenseProjectionInput = savedProjectionCast; bb.castWKVOutputToComputeDType = savedWKVCast
-        }
-        bb.useBlockCheckpoint = false
-        bb.castDenseProjectionInput = cfg.castProjectionInput
-        bb.castWKVOutputToComputeDType = cfg.castWKVOutput
+        let restoreFlags = setTrainingFlags(bb, cfg)
+        defer { restoreFlags() }
         precondition((cfg.evalEvery > 0) == !heldOut.isEmpty,
                      "ранняя остановка: нужны и evalEvery > 0, и отложенные пачки (evalEvery \(cfg.evalEvery), "
                      + "пачек \(heldOut.count))")
@@ -401,23 +396,30 @@ public enum StateTuning {
 
 extension StateTuning {
 
+    /// Флаги бэкбона на время обучения и оценки состояния — из `cfg`; возвращает, как вернуть
+    /// прежние (слои дифференцируемого ядра, чекпоинт блока, оба приведения типов). Одно место
+    /// для `run` и `heldOutLoss`: отложенный лосс считается при тех же флагах, что обучение.
+    static func setTrainingFlags(_ bb: X070Backbone, _ cfg: StateTuneConfig) -> () -> Void {
+        let savedLayers = bb.trainLayers, savedCheckpoint = bb.useBlockCheckpoint
+        let savedProjectionCast = bb.castDenseProjectionInput, savedWKVCast = bb.castWKVOutputToComputeDType
+        bb.useBlockCheckpoint = false
+        bb.castDenseProjectionInput = cfg.castProjectionInput
+        bb.castWKVOutputToComputeDType = cfg.castWKVOutput
+        return {
+            bb.trainLayers = savedLayers; bb.useBlockCheckpoint = savedCheckpoint
+            bb.castDenseProjectionInput = savedProjectionCast; bb.castWKVOutputToComputeDType = savedWKVCast
+        }
+    }
+
     /// Средний по токенам лосс языковой модели на пачках при начальном состоянии `state`
     /// (nil — нули) — тем же счётом, что отложенный лосс ранней остановки: проход по блокам,
     /// приведения типов из `config`. Пачки взвешиваются токенами в лоссе (цели ≥ 0). Модель
     /// после вызова — как до него: флаги и подключённое состояние возвращаются.
     public static func heldOutLoss(_ bb: X070Backbone, state: RWKVBatchState?, batches: [LoRABatch],
                                    config cfg: StateTuneConfig = StateTuneConfig()) -> Float {
-        let savedLayers = bb.trainLayers, savedCheckpoint = bb.useBlockCheckpoint
-        let savedProjectionCast = bb.castDenseProjectionInput, savedWKVCast = bb.castWKVOutputToComputeDType
+        let restoreFlags = setTrainingFlags(bb, cfg)
         let savedState = bb.initialLayers
-        defer {
-            bb.trainLayers = savedLayers; bb.useBlockCheckpoint = savedCheckpoint
-            bb.castDenseProjectionInput = savedProjectionCast; bb.castWKVOutputToComputeDType = savedWKVCast
-            bb.initialLayers = savedState
-        }
-        bb.useBlockCheckpoint = false
-        bb.castDenseProjectionInput = cfg.castProjectionInput
-        bb.castWKVOutputToComputeDType = cfg.castWKVOutput
+        defer { restoreFlags(); bb.initialLayers = savedState }
         let set = StateTrainableSet(bb, train: cfg.train, initial: state ?? bb.zeroInitialState())
         return LoRAFinetune.heldOutLoss(bb, set: set, batches: batches, lossChunk: cfg.lossChunkTokens)
     }

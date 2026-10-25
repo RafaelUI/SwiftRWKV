@@ -37,3 +37,5 @@ run "evalEvery не делит обучение на отрезки" \
     "$IS" '                let length = Swift.min(cfg.evalEvery, cfg.maxSteps - done)' '                let length = cfg.maxSteps - done'
 run "отрезок, прерванный отменой, не проверяется" \
     "$IS" '                if last.steps == done { break }' '                if last.steps < done + length { break }'
+run "оценка готового состояния не возвращает подключённое" \
+    "$IS" '        defer { restoreFlags(); bb.initialLayers = savedState }' '        defer { restoreFlags(); _ = savedState }'

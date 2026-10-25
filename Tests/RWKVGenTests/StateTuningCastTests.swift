@@ -94,8 +94,8 @@ final class StateTuningCastTests: XCTestCase {
 
     func testDefaults() {
         let c = StateTuneConfig()
-        XCTAssertTrue(c.castProjectionInput, "умолчание — приведение входа проекций (23.10)")
-        XCTAssertFalse(c.castWKVOutput, "выход WKV в fp32 — умолчание: ошибка градиента вдвое меньше")
+        XCTAssertTrue(c.castWKVOutput, "умолчание — приведение выхода WKV (25.10): быстрее, исход тот же")
+        XCTAssertFalse(c.castProjectionInput, "приведение входа проекций — по выбору")
         let (bb, _) = bf16Tiny()
         XCTAssertFalse(bb.castDenseProjectionInput, "у самого бэкбона флаг выключен: инференс не меняется")
         XCTAssertFalse(bb.castWKVOutputToComputeDType)
@@ -122,20 +122,20 @@ final class StateTuningCastTests: XCTestCase {
         var base = StateTuneConfig()
         base.lr = 0.05; base.lrMin = 0.01; base.warmupSteps = 0; base.maxSteps = 3; base.logEvery = 0
         base.cacheLimitGB = 0; base.lossChunkTokens = 0
-        var noCast = base; noCast.castProjectionInput = false
-        var wkv = base; wkv.castProjectionInput = false; wkv.castWKVOutput = true
+        var noCast = base; noCast.castProjectionInput = false; noCast.castWKVOutput = false
+        var lin = base; lin.castProjectionInput = true; lin.castWKVOutput = false
 
         let (a, after1) = tune(base, pre: (false, false))
         let (a2, after2) = tune(base, pre: (true, true))
         let (n, after3) = tune(noCast, pre: (true, false))
         let (n2, _) = tune(noCast, pre: (false, true))
-        let (w, after4) = tune(wkv, pre: (false, false))
-        let (w2, _) = tune(wkv, pre: (true, false))
+        let (l, after4) = tune(lin, pre: (false, false))
+        let (l2, _) = tune(lin, pre: (false, true))
         XCTAssertTrue(same(a.wkv, a2.wkv), "умолчание: исход зависит от флагов бэкбона")
         XCTAssertTrue(same(n.wkv, n2.wkv), "без приведения: исход зависит от флагов бэкбона")
-        XCTAssertTrue(same(w.wkv, w2.wkv), "выход WKV: исход зависит от флагов бэкбона")
-        XCTAssertFalse(same(a.wkv, n.wkv), "castProjectionInput не действует")
-        XCTAssertFalse(same(w.wkv, n.wkv), "castWKVOutput не действует")
+        XCTAssertTrue(same(l.wkv, l2.wkv), "вход проекций: исход зависит от флагов бэкбона")
+        XCTAssertFalse(same(a.wkv, n.wkv), "castWKVOutput (умолчание) не действует")
+        XCTAssertFalse(same(l.wkv, n.wkv), "castProjectionInput не действует")
         XCTAssertTrue(after1 == (false, false) && after2 == (true, true) && after3 == (true, false)
                       && after4 == (false, false), "флаги бэкбона после обучения не возвращены")
     }

@@ -68,6 +68,26 @@ final class StateEarlyStoppingTests: XCTestCase {
         XCTAssertGreaterThan(abs(both - (l1 + l2) / 2), 1e-4 * abs(both), "пачки слишком похожи — проверка пуста")
     }
 
+    /// Публичная оценка готового состояния: то же число, что отложенный лосс при этом
+    /// состоянии; модель после вызова — как до него (флаги, подключённое состояние).
+    func testPublicHeldOutLossLeavesModelAsIs() {
+        let bb = model()
+        let s0 = start(bb)
+        let b = batch(5, mask: 7)
+        bb.initialState = nil
+        bb.castDenseProjectionInput = true; bb.castWKVOutputToComputeDType = false
+        let layers = bb.trainLayers
+        let got = StateTuning.heldOutLoss(bb, state: s0, batches: [b])
+        XCTAssertNil(bb.initialState, "подключённое состояние не возвращено")
+        XCTAssertTrue(bb.castDenseProjectionInput && !bb.castWKVOutputToComputeDType, "флаги не возвращены")
+        XCTAssertEqual(bb.trainLayers, layers)
+        let set = StateTrainableSet(bb, initial: s0)
+        let flags = StateTuning.setTrainingFlags(bb, StateTuneConfig())
+        let want = LoRAFinetune.heldOutLoss(bb, set: set, batches: [b], lossChunk: StateTuneConfig().lossChunkTokens)
+        flags()
+        XCTAssertEqual(got, want)
+    }
+
     // ── Ранняя остановка ────────────────────────────────────────────────
 
     func train(evalEvery: Int, patience: Int = 100, minDelta: Float = 0, maxSteps: Int = 8,
@@ -112,7 +132,7 @@ final class StateEarlyStoppingTests: XCTestCase {
         XCTAssertGreaterThan(r.bestStep, 0, "лучшее — исходное: проверка пуста")
         XCTAssertTrue(bitwise(t.bb.initialState!.wkv, t.out.state.wkv))
         let set = StateTrainableSet(t.bb, initial: t.out.state)
-        t.bb.castDenseProjectionInput = true                         // как во время обучения (fp32: без разницы)
+        t.bb.castWKVOutputToComputeDType = true                      // как во время обучения (fp32: без разницы)
         let again = LoRAFinetune.heldOutLoss(t.bb, set: set, batches: [batch(99, mask: 3), batch(98)], lossChunk: 0)
         XCTAssertEqual(again, r.bestLoss)
     }
