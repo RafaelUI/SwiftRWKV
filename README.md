@@ -35,7 +35,7 @@ print(out.text)
   the GPU. Greedy by default.
 - **Inference** — a parallel pass for whole sequences and a recurrent one with
   O(1) memory per token; prefill uses the parallel pass and is measured 94×
-  faster than folding the prompt token by token.
+  faster than folding the prompt token by token (1024 tokens, debug build).
 - **Reranking** — a cross-encoder head over backbone state, with a state cache,
   listwise training (resumable after an interruption, bit-identically) and an
   indexed serving path; caches record the attached initial state and refuse
@@ -59,7 +59,9 @@ print(out.text)
   on disk and trains on the shared trainer, reproducibly with a seed.
 - **State-tuning** — the base frozen, only the initial state of the recurrence
   trained (0.1B: 0.59 M numbers), kept in its own file with a fingerprint of the
-  base; a trained state and a folded prompt are one pluggable object.
+  base; a trained state and a folded prompt are one pluggable object. Early
+  stopping on held-out loss, export to and import from RWKV-PEFT `.pth`, and
+  weight streaming for training in little memory (1.5B over `.rwkvq`: 1.58 GB).
 - **Pre-training from scratch** — x070 initialisation, `.bin` token streams, a
   shared trainer with LR schedules and resumable checkpoints.
 - **Custom Metal WKV-7 kernel** — forward + a hand-written differentiable
@@ -185,7 +187,7 @@ is missing and what was tried and rejected is in
 
 Experimental, but validated end to end on real models rather than on toys —
 RWKV-7 World 0.1B, g1d 0.1B / 0.4B dense and as `.rwkvq`, and 1.5B / 2.9B for
-inference. 595 tests, plus mutation suites that deliberately break the code and
+inference; state-tuning on 1.5B. 669 tests, plus mutation suites that deliberately break the code and
 require the tests to notice — the interesting failures in this problem are
 silent, so "the tests pass" is not by itself evidence.
 
