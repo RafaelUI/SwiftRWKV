@@ -55,6 +55,8 @@ struct Args {
     var cacheGB = 0.25
     var seed: UInt64 = 0
     var dtype = "bf16"
+    /// Приведение выхода WKV: auto (умолчание модели, по пути базы) | on | off.
+    var wkvCast = "auto"
     var stateLR: Float = 3e-4
     var stateParts = "wkv"
     var stateOut: String? = nil
@@ -149,6 +151,7 @@ func parse() -> Args {
         case "--curriculum": a.curriculum = v()
         case "--run-dir": a.runDir = v()
         case "--sample-seed": a.sampleSeed = UInt64(v())
+        case "--wkv-cast": a.wkvCast = v()
         case "--dtype": a.dtype = v()                          // плотная база: bf16 | fp16 | fp32        // контроль: на второй стадии вместо состояния — голова
         default:
             FileHandle.standardError.write("неизвестный ключ \(k)\n".data(using: .utf8)!)
@@ -236,6 +239,12 @@ final class FootprintWatch: @unchecked Sendable {
 let watch = FootprintWatch(guardGB: args.guardGB)
 var t = Date()
 let (base, quantised) = try loadBase(args.model, dtype: denseDType(args.dtype))
+switch args.wkvCast {
+case "auto": break
+case "on": base.castWKVOutputToComputeDType = true
+case "off": base.castWKVOutputToComputeDType = false
+default: print("--wkv-cast: auto | on | off"); exit(2)
+}
 print(String(format: "база: %@, L=%d D=%d; загрузка %.1f с; MLX активная %.2f ГБ, footprint +%.2f ГБ",
              quantised ? ".rwkvq" : "плотная", base.cfg.nLayer, base.cfg.nEmbd,
              Date().timeIntervalSince(t), Double(GPU.activeMemory) / 1e9, footprintGB() - f0))
@@ -798,6 +807,7 @@ if case .state = mode, let state = base.initialState {
 }
 if let path = args.headOut { try model.saveHead(to: URL(fileURLWithPath: expand(path))) }
 report["seed"] = Int(args.seed); report["per_row"] = perRow
+report["wkv_cast"] = base.castWKVOutputToComputeDType
 report["state_scope"] = stateScope.rawValue
 report["dtype"] = quantised ? "rwkvq" : args.dtype
 if let out = args.out {

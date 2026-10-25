@@ -881,9 +881,14 @@ fixture taken from it are without the cast, so the parity tests — and the
 tests of exact identities between paths (recurrent against parallel, chunked
 against whole, GradCache against the plain pass), which hold to ~1e-6 only in
 float32 activations — set the flag off explicitly; under the cast those paths
-agree to ~1e-2, which the tests of the flag itself bound. What was measured
-with the cast **off** and not re-measured with it on: the embedding and
-reranker quality numbers in their guides.
+agree to ~1e-2, which the tests of the flag itself bound.
+
+Training an embedder under the cast does not measurably change quality
+(25.10): g1d 0.1B dense bf16, top 4 layers, retrieval, 200 steps, 300 held-out
+queries, three seeds, `embed-run --wkv-cast on|off` — MRR 0.756 with the cast
+against 0.759 without, −0.003 [−0.009; +0.001] (paired bootstrap over queries,
+`python -m rwkv_metal.stats.paired`). The other embedding and reranker quality
+numbers in their guides were measured with the cast off and not re-measured.
 
 It does **not** change which pass you are in. Recurrent decode on a quantised
 backbone matches the parallel pass on the *same* quantised backbone to
