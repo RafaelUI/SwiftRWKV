@@ -882,7 +882,7 @@ func wideBackwardAB(_ path: String, _ args: Args) throws {
 /// Загрузка, префилл T=512 и декод одной модели: скорость и память.
 func appBench(_ path: String, _ args: Args) throws {
     let win = try loadArrays(url: URL(fileURLWithPath: expand(args.windows)))["ids"]!
-    let pre = (win[0].asArray(Int32.self) + win[4].asArray(Int32.self)).map(Int.init)   // en + ru, 512
+    let pre = (win[0].asArray(Int32.self) + win[4].asArray(Int32.self)).map { Int($0) }   // en + ru, 512
     let dec = win[8].asArray(Int32.self).prefix(72).map(Int.init)                       // sr
     let f0 = processFootprintGB()
     let t0 = Date()
@@ -1065,7 +1065,7 @@ func prefillProfile(_ path: String, _ args: Args) throws {
     let sc = try RwkvqSidecar.open(expand(path))
     GPU.clearCache()
     let win = try loadArrays(url: URL(fileURLWithPath: expand(args.windows)))["ids"]!
-    let pre = (win[0].asArray(Int32.self) + win[4].asArray(Int32.self)).map(Int.init)
+    let pre = (win[0].asArray(Int32.self) + win[4].asArray(Int32.self)).map { Int($0) }
     func med(_ f: () -> Void) -> Double {
         f()
         return median((0 ..< 5).map { _ in let t = Date(); f(); return Date().timeIntervalSince(t) * 1e3 })
