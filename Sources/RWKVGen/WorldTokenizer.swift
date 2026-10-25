@@ -11,15 +11,86 @@ import Foundation
 //  Без внешних зависимостей (только Foundation). Greedy longest-match по байтам.
 // ───────────────────────────────────────────────────────────────────────
 
-private final class TrieNode {
-    var children: [UInt8: TrieNode] = [:]
-    var value: (bytes: [UInt8], id: Int)? = nil
+/// Дерево префиксов в плоских массивах (25.10): узел — номер; у узла с
+/// многими детьми переходы — плотная таблица на 256, у остальных — короткий
+/// отсортированный список (линейный проход). Раньше узел был классом со
+/// словарём детей: хеш на каждый байт и подсчёт ссылок на каждый шаг.
+struct FlatTrie {
+    /// id токена, кончающегося в узле, или -1.
+    var token: [Int32] = [-1]
+    /// Плотная таблица узла: смещение в `dense` или -1.
+    var denseAt: [Int32] = [0]
+    /// Короткий список: начало и длина в `edgeByte` / `edgeTo`.
+    var edgeStart: [Int32] = [0]
+    var edgeCount: [Int32] = [0]
+    var edgeByte: [UInt8] = []
+    var edgeTo: [Int32] = []
+    var dense: [Int32] = [Int32](repeating: 0, count: 256)
+
+    /// Узлы с числом детей больше порога получают плотную таблицу.
+    static let denseThreshold = 8
+
+    /// Собрать из (байты, id). Корень — узел 0, плотный.
+    init(_ entries: [(bytes: [UInt8], id: Int)]) {
+        // сначала обычное дерево на словарях, потом раскладка
+        var children: [[UInt8: Int32]] = [[:]]
+        var tok: [Int32] = [-1]
+        for (bytes, id) in entries {
+            var n = 0
+            for b in bytes {
+                if let c = children[n][b] { n = Int(c) } else {
+                    let c = Int32(children.count)
+                    children[n][b] = c
+                    children.append([:]); tok.append(-1)
+                    n = Int(c)
+                }
+            }
+            tok[n] = Int32(id)
+        }
+        token = tok
+        let N = children.count
+        denseAt = [Int32](repeating: -1, count: N)
+        edgeStart = [Int32](repeating: 0, count: N)
+        edgeCount = [Int32](repeating: 0, count: N)
+        dense = []
+        for n in 0 ..< N {
+            let ch = children[n]
+            if n == 0 || ch.count > Self.denseThreshold {
+                denseAt[n] = Int32(dense.count)
+                var row = [Int32](repeating: 0, count: 256)      // 0 — нет перехода (в корень не ведёт ничто)
+                for (b, c) in ch { row[Int(b)] = c }
+                dense.append(contentsOf: row)
+            } else {
+                edgeStart[n] = Int32(edgeByte.count)
+                edgeCount[n] = Int32(ch.count)
+                for (b, c) in ch.sorted(by: { $0.key < $1.key }) { edgeByte.append(b); edgeTo.append(c) }
+            }
+        }
+    }
+
+    /// Переход по байту; 0 — нет.
+    @inline(__always)
+    func next(_ n: Int, _ b: UInt8) -> Int {
+        let d = denseAt[n]
+        if d >= 0 { return Int(dense[Int(d) + Int(b)]) }
+        let s = Int(edgeStart[n]), e = s + Int(edgeCount[n])
+        var i = s
+        while i < e {
+            let x = edgeByte[i]
+            if x == b { return Int(edgeTo[i]) }
+            if x > b { return 0 }
+            i += 1
+        }
+        return 0
+    }
 }
 
 /// Байтовый TRIE-токенизатор RWKV World.
 public final class WorldTokenizer {
-    private let root = TrieNode()
-    private let idx2token: [Int: [UInt8]]
+    private let trie: FlatTrie
+    /// Байты по id (индекс — id); пустой — id нет в словаре.
+    private let idx2token: [[UInt8]]
+    private let loaded: Int
 
     /// Загружает токенизатор из текстового vocab-файла.
     /// Возвращает `nil`, если файл не читается.
@@ -39,6 +110,7 @@ public final class WorldTokenizer {
         let all = [UInt8](data)
 
         var map: [Int: [UInt8]] = [:]
+        var entries: [(bytes: [UInt8], id: Int)] = []
         var start = 0
         while start <= all.count {
             var end = start
@@ -62,15 +134,14 @@ public final class WorldTokenizer {
             }
 
             map[idx] = bytes
-            var node = root
-            for byte in bytes {
-                if node.children[byte] == nil { node.children[byte] = TrieNode() }
-                node = node.children[byte]!
-            }
-            node.value = (bytes: bytes, id: idx)
+            entries.append((bytes, idx))
             if end >= all.count { break }
         }
-        self.idx2token = map
+        var table = [[UInt8]](repeating: [], count: (map.keys.max() ?? -1) + 1)
+        for (k, v) in map { table[k] = v }
+        self.idx2token = table
+        self.loaded = map.count
+        self.trie = FlatTrie(entries)
     }
 
     private static func parseInt(_ bytes: ArraySlice<UInt8>) -> Int? {
@@ -85,42 +156,77 @@ public final class WorldTokenizer {
     }
 
     /// Размер словаря (число загруженных токенов).
-    public var count: Int { idx2token.count }
+    public var count: Int { loaded }
 
     /// Кодирует строку в id токенов (greedy longest-match по байтам).
     public func encode(_ text: String) -> [Int] {
-        let src = Array(text.utf8)
-        var idx = 0
-        var tokens: [Int] = []
+        var text = text
+        return text.withUTF8 { encodeBytes($0) }
+    }
 
-        while idx < src.count {
-            var node = root
-            var lastMatch: (endIdx: Int, id: Int)? = nil
-            var i = idx
-            while i < src.count {
-                guard let next = node.children[src[i]] else { break }
-                node = next; i += 1
-                if let val = node.value { lastMatch = (endIdx: i, id: val.id) }
+    /// То же по байтам UTF-8.
+    ///
+    /// Массивы дерева читаются через указатели один раз на вызов: на каждом
+    /// байте иначе стояли бы проверка границ и удержание буфера.
+    public func encodeBytes(_ src: UnsafeBufferPointer<UInt8>) -> [Int] {
+        var tokens: [Int] = []
+        tokens.reserveCapacity(src.count / 3 + 1)
+        let n = src.count
+        trie.token.withUnsafeBufferPointer { token in
+        trie.denseAt.withUnsafeBufferPointer { denseAt in
+        trie.dense.withUnsafeBufferPointer { dense in
+        trie.edgeStart.withUnsafeBufferPointer { edgeStart in
+        trie.edgeCount.withUnsafeBufferPointer { edgeCount in
+        trie.edgeByte.withUnsafeBufferPointer { edgeByte in
+        trie.edgeTo.withUnsafeBufferPointer { edgeTo in
+            @inline(__always) func next(_ node: Int, _ b: UInt8) -> Int {
+                let d = denseAt[node]
+                if d >= 0 { return Int(dense[Int(d) &+ Int(b)]) }
+                var i = Int(edgeStart[node])
+                let e = i &+ Int(edgeCount[node])
+                while i < e {
+                    let x = edgeByte[i]
+                    if x == b { return Int(edgeTo[i]) }
+                    if x > b { return 0 }
+                    i &+= 1
+                }
+                return 0
             }
-            if let match = lastMatch {
-                tokens.append(match.id); idx = match.endIdx
-            } else {
-                idx += 1   // fallback: пропуск байта (не должно происходить с полным vocab)
+            var idx = 0
+            while idx < n {
+                var node = 0
+                var lastEnd = -1, lastId = -1
+                var i = idx
+                while i < n {
+                    let nx = next(node, src[i])
+                    if nx == 0 { break }
+                    node = nx; i &+= 1
+                    let t = token[node]
+                    if t >= 0 { lastEnd = i; lastId = Int(t) }
+                }
+                if lastEnd >= 0 {
+                    tokens.append(lastId); idx = lastEnd
+                } else {
+                    idx &+= 1   // fallback: пропуск байта (не должно происходить с полным vocab)
+                }
             }
-        }
+        }}}}}}}
         return tokens
     }
 
     /// Декодирует последовательность токенов в строку.
     public func decode(_ tokens: [Int]) -> String {
         var bytes: [UInt8] = []
-        for tok in tokens { if let b = idx2token[tok] { bytes.append(contentsOf: b) } }
+        for tok in tokens where tok >= 0 && tok < idx2token.count { bytes.append(contentsOf: idx2token[tok]) }
         return String(bytes: bytes, encoding: .utf8)
             ?? String(bytes: bytes, encoding: .isoLatin1) ?? "?"
     }
 
     /// Сырые байты токена — для byte-safe стриминга многобайтовых символов.
-    public func rawBytes(_ id: Int) -> [UInt8]? { idx2token[id] }
+    public func rawBytes(_ id: Int) -> [UInt8]? {
+        guard id >= 0, id < idx2token.count, !idx2token[id].isEmpty else { return nil }
+        return idx2token[id]
+    }
 
     /// Разбор Python-repr токена в байты.
     ///

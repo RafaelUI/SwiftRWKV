@@ -86,6 +86,17 @@ pre-tokenisers, dropout, byte fallback — is refused at load rather than
 approximated. Special tokens are skipped in `decode` and in streamed output,
 as in `tokenizers`.
 
+The World tokenizer walks a flat prefix tree — a dense 256-way table for nodes
+with many children, a short sorted list for the rest. M4, release, 12.5 MB of
+Russian and English text (7234 texts, 2.76 million tokens, identical ids in
+every implementation), best of three, processes interleaved, no swap:
+**126 MB/s** against 43.7 before the flat tree, and 48 MB/s for the Rust
+tokenizer from Python (`pyrwkv-tokenizer`, the conversion from Python strings
+included), 9.4 for the Python reference. Strings that are bridged `NSString`s
+(from `JSONSerialization`, for example) cost a conversion to UTF-8 first —
+0.16 s on this corpus, more than the encoding itself; read text as native Swift
+strings where speed matters (`decode-bench --tok-bench`).
+
 That is the whole surface for the common case. `generate` defaults to **greedy**
 decoding — `SamplingConfig()` has `temperature = 0` — because a package that
 produces different text on every run by default cannot be debugged.

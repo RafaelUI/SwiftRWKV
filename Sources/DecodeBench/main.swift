@@ -126,6 +126,7 @@ struct Args {
     var prefillProfile: String? = nil
     /// Короткий параллельный проход: ядра GEMV против «деквант + матмул» по длинам.
     var shortBench: String? = nil
+    var tokBench: String? = nil
     /// Шаг QLoRA над базой из .rwkvq: время и память по длинам (TrainBench.swift).
     var trainBench: String? = nil
     var tb = TrainBenchOptions()
@@ -172,6 +173,7 @@ func parseArgs() -> Args {
         case "--no-read-ahead": RwkvqContainer.readAheadEnabled = false
         case "--prefill-profile": a.prefillProfile = it.next()
         case "--short-bench": a.shortBench = it.next()
+        case "--tok-bench": a.tokBench = it.next()
         case "--train-bench": a.trainBench = it.next()
         case "--tb-profile": a.tb.profile = true
         case "--tb-seq": a.tb.sequential = true
@@ -1179,6 +1181,10 @@ if let T = args.tbMicro {
 }
 if let path = args.trainBench {
     try trainBench(path, args.tb)
+    exit(0)
+}
+if let path = args.tokBench {
+    try tokBench(path, args.vocab)
     exit(0)
 }
 if let path = args.shortBench {

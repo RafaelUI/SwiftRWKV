@@ -104,6 +104,21 @@ final class WorldTokenizerTests: XCTestCase {
         }
     }
 
+    /// Каждый токен, поданный своими байтами, кодируется САМ СОБОЙ: самый
+    /// длинный префикс байтов токена — он сам (длиннее в них нет). Это
+    /// проходит каждый путь дерева, в том числе узлы с коротким списком детей,
+    /// которые обычный текст задевает редко.
+    func testEveryTokenEncodesToItself() throws {
+        let tok = try loadTokenizer()
+        let ref = try loadReference()
+        var bad: [Int] = []
+        for (id, bytes) in ref {
+            let got = bytes.withUnsafeBufferPointer { tok.encodeBytes($0) }
+            if got != [id] { bad.append(id) }
+        }
+        XCTAssertTrue(bad.isEmpty, "\(bad.count) токенов из \(ref.count) кодируются не собой, например \(bad.sorted().prefix(5))")
+    }
+
     /// Комбинирующие знаки — та самая ловушка графемных кластеров.
     /// Отдельно от общего теста: если сломается именно она, сообщение должно
     /// называть причину, а не «расходится 57 токенов».
