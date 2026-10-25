@@ -68,7 +68,9 @@ read with that in mind:
   The compiled documentation lives in `Scripts/check_docs.sh`.
 - **Decode is still `B = 1`.** Batched state exists for the parallel pass; a
   batched recurrent step does not.
-- **The tokenizer is still World-only.**
+- **The tokenizer was World-only until 25.10;** `BPETokenizer` (HuggingFace
+  `tokenizer.json`, byte-level BPE) now sits behind the same `RWKVTokenizer`
+  protocol (question 4 below — resolved as a minimal BPE implementation).
 
 What follows is the design record as written at the start of the port.
 
@@ -259,7 +261,9 @@ equivalent library, which makes this a genuine open question rather than a
 transcription: either a minimal BPE implementation, or restricting pretraining
 to a byte-level or World vocabulary. It does not block anything except
 pretraining on a custom vocabulary, so it should not be resolved early — but it
-should not be discovered late either.
+should not be discovered late either. *(Resolved 25.10: a minimal byte-level
+BPE, `BPETokenizer`, checked id for id against `tokenizers`; every consumer
+takes `any RWKVTokenizer`.)*
 
 **Decision: promote the block to a first-class type.** Blocks currently exist as
 internal methods on the backbone. The reranker head is a short stack of RWKV

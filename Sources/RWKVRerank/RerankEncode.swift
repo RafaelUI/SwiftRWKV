@@ -188,7 +188,7 @@ public enum RerankEncoder {
     /// Куски токенизируются ПО ОТДЕЛЬНОСТИ, чтобы обрезка документа была
     /// ровно по токенам, а не по символам: обрезав строку, легко разрубить
     /// многобайтовый символ или изменить границы токенов у соседей.
-    public static func prefixIds(_ tok: WorldTokenizer, _ cfg: RerankEncodeConfig,
+    public static func prefixIds(_ tok: any RWKVTokenizer, _ cfg: RerankEncodeConfig,
                           instruct: String, document: String) -> [Int] {
         guard cfg.template.docFirst else {
             return tok.encode("Instruct: \(instruct)\n")
@@ -198,7 +198,7 @@ public enum RerankEncoder {
         return head + body + tok.encode("\n")
     }
 
-    public static func suffixIds(_ tok: WorldTokenizer, _ cfg: RerankEncodeConfig,
+    public static func suffixIds(_ tok: any RWKVTokenizer, _ cfg: RerankEncodeConfig,
                           document: String, query: String) -> [Int] {
         var ids = tok.encode("Query: ")
                 + Array(tok.encode(query).prefix(cfg.maxQueryTokens))
@@ -251,7 +251,7 @@ public enum RerankEncoder {
     ///   состояний не проверить, только структурно. Заодно годится для
     ///   отладки: видно, сколько разных форм создаёт прогон.
     public static func encodePairs(
-        _ model: Reranker, tokenizer: WorldTokenizer,
+        _ model: Reranker, tokenizer: any RWKVTokenizer,
         pool: [String], samples: [RerankSample],
         config: RerankEncodeConfig = RerankEncodeConfig(),
         path: URL? = nil, sources: [Int]? = nil,
@@ -383,7 +383,7 @@ public enum RerankEncoder {
     /// расхождение между ними означает, что перенос состояния через границу
     /// префикса что-то теряет.
     public static func encodePairsDirect(
-        _ model: Reranker, tokenizer: WorldTokenizer,
+        _ model: Reranker, tokenizer: any RWKVTokenizer,
         pairs: [(instruct: String, document: String, query: String)],
         config: RerankEncodeConfig = RerankEncodeConfig(),
         batchSize: Int = 8, sources: [Int]? = nil

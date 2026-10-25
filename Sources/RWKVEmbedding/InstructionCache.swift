@@ -46,7 +46,7 @@ public final class InstructionCache {
     public static let queryMarker = "\nQuery: "
 
     public let model: EmbeddingModel
-    public let tokenizer: WorldTokenizer
+    public let tokenizer: any RWKVTokenizer
     private var folded: [String: RWKVBatchState] = [:]
     private var foldedOver = StateFile.noInitialState
 
@@ -62,7 +62,7 @@ public final class InstructionCache {
     /// Счёт тот же до порядка сложения.
     public var foldChunkTokens = 512
 
-    public init(model: EmbeddingModel, tokenizer: WorldTokenizer) {
+    public init(model: EmbeddingModel, tokenizer: any RWKVTokenizer) {
         self.model = model
         self.tokenizer = tokenizer
     }

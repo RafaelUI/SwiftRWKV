@@ -200,7 +200,7 @@ public enum ClassificationLabels {
 ///   только от позиций ≤ t, а вектор снимается с poolIndex — то есть ни один
 ///   добитый токен в него не входит. Это РАВЕНСТВО, а не приближение, и оно
 ///   проверяется тестом. nil ⇒ не выравнивать (путь инференса не меняется).
-public func encodeBatch(tokenizer: WorldTokenizer, texts: [String],
+public func encodeBatch(tokenizer: any RWKVTokenizer, texts: [String],
                         terminator: Int = 0,
                         maxTokens: Int? = nil,
                         padMultiple: Int? = nil) -> (idx: MLXArray, poolIndex: MLXArray) {
@@ -209,7 +209,7 @@ public func encodeBatch(tokenizer: WorldTokenizer, texts: [String],
 }
 
 /// Токены одной строки: обрезка до `maxTokens` вместе с терминатором.
-func encodeRow(tokenizer: WorldTokenizer, text: String, terminator: Int = 0, maxTokens: Int? = nil) -> [Int] {
+func encodeRow(tokenizer: any RWKVTokenizer, text: String, terminator: Int = 0, maxTokens: Int? = nil) -> [Int] {
     var ids = tokenizer.encode(text)
     if let m = maxTokens, ids.count > m - 1 { ids = Array(ids.prefix(m - 1)) }
     ids.append(terminator)
@@ -319,7 +319,7 @@ func stateRows(_ rows: [EmbeddingSample]) -> MLXArray? {
 
 public struct TripletBatcher {
     private let samples: [EmbeddingSample]
-    private let tokenizer: WorldTokenizer
+    private let tokenizer: any RWKVTokenizer
     private let batchSize: Int
     private let terminator: Int
     private let maxTokens: Int?
@@ -328,7 +328,7 @@ public struct TripletBatcher {
 
     /// - padMultiple: выравнивание T (см. `encodeBatch`). Для обучения с
     ///   размороженными слоями базы обязано быть WKV7_CHUNK.
-    public init(samples: [EmbeddingSample], tokenizer: WorldTokenizer,
+    public init(samples: [EmbeddingSample], tokenizer: any RWKVTokenizer,
                 batchSize: Int, terminator: Int = 0, maxTokens: Int? = 512,
                 shuffle: Bool = true, seed: UInt64 = 0,
                 padMultiple: Int? = nil) {
@@ -377,7 +377,7 @@ public struct ClassificationBatcher {
     private let samples: [EmbeddingSample]
     private let candidates: [[String]]
     private let targets: [Int]
-    private let tokenizer: WorldTokenizer
+    private let tokenizer: any RWKVTokenizer
     private let batchSize: Int
     private let terminator: Int
     private let maxTokens: Int?
@@ -388,7 +388,7 @@ public struct ClassificationBatcher {
     ///   Труднее и честнее для оценки; для обучения оставляйте false, чтобы
     ///   совпадать с тем, как построен датасет.
     /// - padMultiple: выравнивание T (см. `encodeBatch`).
-    public init(samples: [EmbeddingSample], tokenizer: WorldTokenizer,
+    public init(samples: [EmbeddingSample], tokenizer: any RWKVTokenizer,
                 batchSize: Int, terminator: Int = 0, maxTokens: Int? = 512,
                 shuffle: Bool = true, seed: UInt64 = 0,
                 useFullPool: Bool = false,

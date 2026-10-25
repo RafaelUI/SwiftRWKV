@@ -177,8 +177,9 @@ guard !args.model.isEmpty, !args.vocab.isEmpty, !args.questions.isEmpty || args.
 guard ["inline", "fold", "none"].contains(args.mode) else { print("--mode: inline | fold | none"); exit(2) }
 guard args.mode == "none" || !args.system.isEmpty || args.stateBench != nil
         || (!args.distill && args.stateIn != nil && !args.stateOut.isEmpty) else { print("--mode \(args.mode): нужен --system"); exit(2) }
-guard let tok = WorldTokenizer(vocabURL: URL(fileURLWithPath: expand(args.vocab))) else {
-    print("не удалось прочитать словарь"); exit(2)
+// словарь World (rwkv_vocab_*.txt) или tokenizer.json HuggingFace (BPE)
+guard let tok = try? loadTokenizer(URL(fileURLWithPath: expand(args.vocab))) else {
+    print("не удалось прочитать словарь \(args.vocab)"); exit(2)
 }
 func lines(_ path: String) throws -> [String] {
     try String(contentsOfFile: expand(path), encoding: .utf8)

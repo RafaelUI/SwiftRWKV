@@ -204,8 +204,9 @@ guard !args.model.isEmpty, !args.vocab.isEmpty, !args.data.isEmpty || args.curri
     print("нужны --model, --vocab, --data"); exit(2)
 }
 guard let task = EmbeddingTask(rawValue: args.task) else { print("задача \(args.task)?"); exit(2) }
-guard let tok = WorldTokenizer(vocabURL: URL(fileURLWithPath: expand(args.vocab))) else {
-    print("не удалось прочитать словарь"); exit(2)
+// словарь World (rwkv_vocab_*.txt) или tokenizer.json HuggingFace (BPE)
+guard let tok = try? loadTokenizer(URL(fileURLWithPath: expand(args.vocab))) else {
+    print("не удалось прочитать словарь \(args.vocab)"); exit(2)
 }
 
 let f0 = footprintGB()

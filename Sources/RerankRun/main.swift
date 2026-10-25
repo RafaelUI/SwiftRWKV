@@ -311,8 +311,8 @@ report.set("data", ["rows": rows.count, "pool": pool.count,
 print("\n── модель ──")
 let backbone = try loadBase(args.model)
 let cfg = backbone.cfg
-guard let tokenizer = WorldTokenizer(
-        vocabURL: URL(fileURLWithPath: expand(args.vocab))) else {
+// словарь World (rwkv_vocab_*.txt) или tokenizer.json HuggingFace (BPE)
+guard let tokenizer = try? loadTokenizer(URL(fileURLWithPath: expand(args.vocab))) else {
     print("не удалось прочитать словарь \(args.vocab)")
     exit(2)
 }

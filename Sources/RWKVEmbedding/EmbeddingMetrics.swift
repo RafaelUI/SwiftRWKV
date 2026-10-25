@@ -115,7 +115,7 @@ public enum EmbeddingMetrics {
     /// `.queriesOnly` документы идут без подключённого состояния.
     /// `states` — номер состояния банка у каждого текста
     /// (`X070Backbone.initialStateBank`); nil — без банка.
-    public static func embedAll(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    public static func embedAll(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                                 texts: [String], batchSize: Int = 16,
                                 terminator: Int = 0,
                                 maxTokens: Int? = 512,
@@ -179,7 +179,7 @@ public enum EmbeddingMetrics {
     ///   запрос платит только за хвост. Тот же счёт, что с инструкцией в
     ///   строке, кроме обрезки: `maxTokens` действует на хвост. Только пулинг
     ///   `.last`. Документы — как без свёртки.
-    public static func evaluateRetrieval(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    public static func evaluateRetrieval(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                                          rows: [EmbeddingSample],
                                          maxChars: Int = 800,
                                          ks: [Int] = [1, 5, 10],
@@ -280,7 +280,7 @@ public enum EmbeddingMetrics {
     /// человеческих оценок похожести, а LitRetrieval размечен бинарно —
     /// положительный/отрицательный. Считать по бинарной разметке корреляцию
     /// можно, но она мерила бы не то, чем её принято называть.
-    public static func evaluateSTS(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    public static func evaluateSTS(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                                    rows: [EmbeddingSample],
                                    maxChars: Int = 800,
                                    terminator: Int = 0,
@@ -326,7 +326,7 @@ public enum EmbeddingMetrics {
     /// пуле их 25 на всю выборку, и повторять это на каждую строку — ровно
     /// та же арифметика, умноженная на N.
     public static func evaluateClassification(model: EmbeddingModel,
-                                              tokenizer: WorldTokenizer,
+                                              tokenizer: any RWKVTokenizer,
                                               rows: [EmbeddingSample],
                                               maxChars: Int = 800,
                                               useFullPool: Bool = true,

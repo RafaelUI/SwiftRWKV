@@ -111,7 +111,7 @@ extension X070Backbone {
     @discardableResult
     public func generate(prompt: [Int],
                          config: GenerationConfig,
-                         tokenizer: WorldTokenizer,
+                         tokenizer: any RWKVTokenizer,
                          state: inout RWKVState,
                          onToken: ((String, Int) -> Bool)? = nil) -> GenerationResult {
         precondition(!prompt.isEmpty, "generate: пустой промпт")
@@ -206,7 +206,7 @@ extension X070Backbone {
     public func generate(prompt: String,
                          maxTokens: Int = 128,
                          config: SamplingConfig = .greedy,
-                         tokenizer: WorldTokenizer,
+                         tokenizer: any RWKVTokenizer,
                          stopStrings: [String] = [],
                          stopTokens: Set<Int> = [],
                          onToken: ((String, Int) -> Bool)? = nil) -> GenerationResult {

@@ -74,6 +74,18 @@ let result = base.generate(prompt: "The capital of France is",
 print(result.text, result.tokens.count, result.stopReason)
 ```
 
+A model with its own vocabulary (ru60m and other models trained from scratch)
+comes with a HuggingFace `tokenizer.json`; `BPETokenizer(tokenizerURL:)` reads
+it, and everything that takes a tokenizer — generation, the embedder, the
+reranker, token streams — takes `any RWKVTokenizer`, so either kind works.
+`loadTokenizer(_:)` picks the kind by file (`.json` — BPE, otherwise a World
+vocabulary). The BPE tokenizer is byte-level BPE as GPT-2 defines it and is
+checked id for id against `tokenizers` (1540 texts, 705 thousand tokens);
+anything it cannot reproduce exactly — a post-processor, other normalisers or
+pre-tokenisers, dropout, byte fallback — is refused at load rather than
+approximated. Special tokens are skipped in `decode` and in streamed output,
+as in `tokenizers`.
+
 That is the whole surface for the common case. `generate` defaults to **greedy**
 decoding — `SamplingConfig()` has `temperature = 0` — because a package that
 produces different text on every run by default cannot be debugged.

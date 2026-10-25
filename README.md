@@ -33,6 +33,9 @@ print(out.text)
   temperature, top-k, top-p and repetition penalties, seeded and reproducible,
   streaming with stop strings and cancellation; the sampler can run entirely on
   the GPU. Greedy by default.
+- **Tokenizers** — the RWKV World vocabulary, and HuggingFace `tokenizer.json`
+  (byte-level BPE, checked id for id against `tokenizers`) for models with their
+  own vocabulary; everything takes `any RWKVTokenizer`.
 - **Inference** — a parallel pass for whole sequences and a recurrent one with
   O(1) memory per token; prefill uses the parallel pass and is measured 94×
   faster than folding the prompt token by token (1024 tokens, debug build).
@@ -133,6 +136,7 @@ Sources/
 │   ├── GPUSampler.swift         #   the same sampler without a CPU read per token
 │   ├── Generate.swift           #   generation loop: stop conditions, byte-safe streaming
 │   ├── WorldTokenizer.swift     #   RWKV World trie tokenizer
+│   ├── BPETokenizer.swift       #   HuggingFace tokenizer.json (byte-level BPE), RWKVTokenizer protocol
 │   ├── RwkvqBase.swift          #   attaching a .rwkvq base to an already-loaded dense backbone
 │   ├── RwkvqStandaloneLoad.swift#   a backbone from one .rwkvq file, no dense file needed
 │   ├── LoRA.swift               #   LoRA/QLoRA spec, add/merge/save/load, base quantization

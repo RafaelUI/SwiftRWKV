@@ -240,10 +240,10 @@ public struct DocIndex {
 public final class RerankerInference {
 
     public let model: Reranker
-    public let tokenizer: WorldTokenizer
+    public let tokenizer: any RWKVTokenizer
     public let config: RerankServingConfig
 
-    public init(model: Reranker, tokenizer: WorldTokenizer,
+    public init(model: Reranker, tokenizer: any RWKVTokenizer,
                 config: RerankServingConfig = RerankServingConfig()) {
         self.model = model
         self.tokenizer = tokenizer
@@ -256,7 +256,7 @@ public final class RerankerInference {
     /// негде. Собранная вручную конфигурация может отличаться от обучения
     /// молча — формы сойдутся, качество упадёт, причину искать будет негде.
     public static func fromCheckpoint(
-        base: X070Backbone, tokenizer: WorldTokenizer, head url: URL,
+        base: X070Backbone, tokenizer: any RWKVTokenizer, head url: URL,
         allowOtherBase: Bool = false,
         overrides: ((inout RerankServingConfig) -> Void)? = nil
     ) throws -> RerankerInference {

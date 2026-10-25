@@ -201,7 +201,7 @@ public enum TokenStreamWriter {
     /// held-out.
     @discardableResult
     public static func tokenizeText(
-        at input: URL, tokenizer: WorldTokenizer,
+        at input: URL, tokenizer: any RWKVTokenizer,
         trainOut: URL, valOut: URL,
         valEvery: Int = 200, documentDelimiter: Int? = 0
     ) throws -> (trainTokens: Int, valTokens: Int) {

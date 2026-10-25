@@ -8,6 +8,7 @@
 //  до символа. Пропускается без фикстур.
 //
 import XCTest
+import MLX
 @testable import RWKVGen
 
 final class BPETokenizerTests: XCTestCase {
@@ -171,6 +172,22 @@ final class BPETokenizerTests: XCTestCase {
         XCTAssertEqual(tok.encode("<eos>"), [3])
         XCTAssertEqual(tok.encode("а<eos>ив"), tok.encode("а") + [16000] + tok.encode("в"))
         XCTAssertEqual(tok.decode([16000]), "<eos>и", "не специальный — в декодировании остаётся")
+    }
+
+    /// Генерация с BPE: протокол проходит через цикл, поток кусков равен
+    /// `decode` выданных токенов (в том числе специальных — их нет в обоих).
+    func testGenerationStreamEqualsDecode() throws {
+        let (tok, _) = try load()
+        let (bb, _) = TinyBackbone.make(nLayer: 2, vocab: tok.count, seed: 7)
+        var streamed = ""
+        var state = RWKVState(cfg: bb.cfg)
+        let r = bb.generate(prompt: tok.encode("Привет, мир"), config: GenerationConfig(maxTokens: 24, pipelined: false),
+                            tokenizer: tok, state: &state, onToken: { chunk, _ in streamed += chunk; return true })
+        XCTAssertEqual(r.tokens.count, 24)
+        XCTAssertEqual(r.text, tok.decode(r.tokens))
+        XCTAssertEqual(streamed, r.text)
+        // принудительно специальный токен в выдаче: в тексте его нет
+        XCTAssertEqual(tok.decode(r.tokens + [3]), r.text)
     }
 
     /// `loadTokenizer` выбирает реализацию по файлу.

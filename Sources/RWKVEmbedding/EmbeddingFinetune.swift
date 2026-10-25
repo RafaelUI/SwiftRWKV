@@ -166,7 +166,7 @@ public enum EmbeddingFinetune {
     /// Прогнать одну стадию: оценка до, обучение, оценка после.
     @discardableResult
     public static func runStage(model: EmbeddingModel,
-                                tokenizer: WorldTokenizer,
+                                tokenizer: any RWKVTokenizer,
                                 trainable: TrainableSet,
                                 stage: EmbeddingStage,
                                 terminator: Int = 0,
@@ -214,7 +214,7 @@ public enum EmbeddingFinetune {
     /// Потолок кэша MLX из конфигурации стадии (0 — не трогать).
     /// Оценка под своим потолком кэша (`EmbeddingStage.evaluationCacheLimitGB`);
     /// после неё — потолок обучения.
-    static func evaluateUnderCacheLimit(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    static func evaluateUnderCacheLimit(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                                         stage: EmbeddingStage, terminator: Int) -> EmbeddingEvaluation {
         guard let gb = stage.evaluationCacheLimitGB else {
             return evaluate(model: model, tokenizer: tokenizer, stage: stage, terminator: terminator)
@@ -236,7 +236,7 @@ public enum EmbeddingFinetune {
     /// Curriculum: стадии подряд над одной моделью, обучаемое множество общее.
     @discardableResult
     public static func run(model: EmbeddingModel,
-                           tokenizer: WorldTokenizer,
+                           tokenizer: any RWKVTokenizer,
                            mode: BaseTrainingMode,
                            stages: [EmbeddingStage],
                            terminator: Int = 0,
@@ -263,7 +263,7 @@ public enum EmbeddingFinetune {
         return out
     }
 
-    static func checkVocab(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    static func checkVocab(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                            stage: EmbeddingStage, terminator: Int) throws {
         let probe = stage.train.prefix(4).flatMap {
             [String($0.anchor.prefix(stage.maxChars)),
@@ -282,7 +282,7 @@ public enum EmbeddingFinetune {
 
     // ── Обучение одной стадии ────────────────────────────────────────
 
-    private static func train(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    private static func train(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                               trainable: TrainableSet, stage: EmbeddingStage,
                               terminator: Int,
                               isCancelled: () -> Bool,
@@ -353,7 +353,7 @@ public enum EmbeddingFinetune {
 
     // ── Оценка ───────────────────────────────────────────────────────
 
-    public static func evaluate(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    public static func evaluate(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                                 stage: EmbeddingStage,
                                 terminator: Int = 0) -> EmbeddingEvaluation {
         evaluationProbe?()

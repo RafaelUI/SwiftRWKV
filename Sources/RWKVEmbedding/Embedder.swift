@@ -224,7 +224,7 @@ public final class EmbeddingModel {
 public struct Embedder {
 
     public let model: EmbeddingModel
-    public let tokenizer: WorldTokenizer
+    public let tokenizer: any RWKVTokenizer
     /// Контракт подачи текста: терминатор и обрезка.
     ///
     /// Пулинг живёт в модели и в контракт входит для сверки при загрузке
@@ -248,7 +248,7 @@ public struct Embedder {
     /// Расхождение замерено, а не предположено (см. `EmbeddingSmokeTests`).
     public var maxTokens: Int? { contract.maxTokens }
 
-    public init(model: EmbeddingModel, tokenizer: WorldTokenizer,
+    public init(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                 contract: EmbeddingContract? = nil) {
         self.model = model
         self.tokenizer = tokenizer
@@ -266,7 +266,7 @@ public struct Embedder {
     /// чём голова обучалась; подать текст иначе не ошибка формы, а тихая
     /// потеря качества.
     public static func fromCheckpoint(backbone: X070Backbone,
-                                      tokenizer: WorldTokenizer,
+                                      tokenizer: any RWKVTokenizer,
                                       head url: URL,
                                       allowOtherBase: Bool = false) throws -> Embedder {
         let (model, contract) = try EmbeddingModel.fromHead(backbone: backbone,

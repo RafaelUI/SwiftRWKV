@@ -119,7 +119,7 @@ public enum EmbeddingCurriculum {
     /// - Returns: отчёт; `finished == false`, если прогон отменён.
     @discardableResult
     public static func run(model: EmbeddingModel,
-                           tokenizer: WorldTokenizer,
+                           tokenizer: any RWKVTokenizer,
                            mode: BaseTrainingMode,
                            stages: [EmbeddingStage],
                            directory: URL,

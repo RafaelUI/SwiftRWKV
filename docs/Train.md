@@ -546,8 +546,6 @@ legitimate training input.
   `base_fingerprint` and `LoRA.load` refuses adapters of another base
   (`LoRA.LoadError.otherBase`, `allowOtherBase: true` to load anyway); a file
   without the key — older, or from rwkv-metal — is loaded unchecked.
-- **No tokeniser for non-World vocabularies**, which limits pretraining on a
-  custom vocabulary: Swift has no equivalent of HuggingFace `tokenizers`.
 ## Fixed defects worth knowing
 
 - **Fixed 10.10: NaN gradients and GPU faults on real models.** Training a
