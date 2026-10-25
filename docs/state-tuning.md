@@ -264,15 +264,20 @@ print(back.wkv.shape, ignored)          // keys other than blocks.{i}.att.time_s
   refused unless `dropShifts: true`; importing gives zero shifts. A state trained
   only on WKV from zero has none, but one trained from a folded prompt keeps the
   fold's shifts, and the trained matrix leans on them. g1j 1.5B, "Neuron" (system
-  prompt distilled into a state, 300 steps, folded start): the persona answers
-  the name questions 10/10 with its shifts and 0/10 with them dropped. Started
-  from the fold with the shifts zeroed (`gen-run --init fold-wkv`), the same
-  training reaches a lower loss (0.391 against 0.419) and, loaded from the
-  `.pth`, answers the four name questions 10/10 each again ("what can you do?"
-  3/10 against 10/10). General questions (199 checkable answers, one training
-  seed, 4 samples each): 0.828 against 0.818 with shifts (+0.010 [−0.014;
-  +0.035]) and 0.799 for the model without a prompt. For a state that will be
-  exported, start from zero or from a fold without shifts.
+  prompt distilled into a state, 300 steps, folded start), the state of one
+  training seed: the persona answers the name questions 10/10 with its shifts
+  and 0/10 with them dropped — a stark difference, but one state.
+- **The fix is measured on one seed only** (seed 7), not the three this page
+  otherwise requires; treat it as a lead, not a result. Started from the fold
+  with the shifts zeroed (`gen-run --init fold-wkv`), the same training reached
+  a lower training loss (0.391 against 0.419) and, loaded from the `.pth`,
+  answered the four name questions 10/10 each again ("what can you do?" 3/10
+  against 10/10). General questions (199 checkable answers, 4 samples each,
+  bootstrap over questions only): 0.828 against 0.818 with shifts (+0.010
+  [−0.014; +0.035], not significant) and 0.799 for the model without a prompt.
+  So for a state that will be exported, do not rely on the shifts: start from
+  zero or from a fold without shifts. That the fold without shifts loses
+  nothing against the full fold is not yet shown.
 
 ## Embeddings
 
