@@ -37,17 +37,39 @@
   отвечать — остановиться, сказать Алексею, действия не повторять; сначала
   проверить, применились ли они.
 - Работать без отчётов, пока не нужно решение Алексея. Писать ему по-русски.
+- Тесты паритета с Python и тесты точных тождеств путей выставляют
+  `castWKVOutputToComputeDType = false` явно (эталоны сняты без приведения).
 - `swift test` — debug; любой замер скорости — только `-c release`.
 
-## Состояние на 25.10
+## Состояние на 25.10 (вечер)
 
-**Тесты:** 669 (шесть пропускаются — ручные дампы и замеры: «Снимок
+**Тесты:** 694 (шесть пропускаются — ручные дампы и замеры: «Снимок
 бэкбона», `PartialFinetuneDump`, `RwkvqLegacyDump`, `RwkvqLoadDump`,
-`StateCastDump`, `PEFTStateCrossCheck`), все зелёные; `check_docs` — 50
-примеров собираются.
+`StateCastDump`, `PEFTStateCrossCheck`), все зелёные; `check_docs` — 51
+пример собирается. Чистый клон собирается (`swift build --build-tests`).
 
-**Не запушено:** SwiftRWKV — 51 коммитов с `bc4ec0c`; rwkv-metal —
-5; rwkv-quant — 8. Пуш — только по слову Алексея.
+**Запушено 25.10** (по слову Алексея) всё до `1349dea` / `8d21e64` /
+`0faee1f`; резервные копии — `swr_bench_keep/backup/*.bundle`. **Не
+запушено после:** SwiftRWKV — 16, rwkv-metal — 2, rwkv-quant — 1. Пуш и
+тег 0.4.0 (черновик заметок — `swr_bench_keep/w1025/release_0.4.0.md`) —
+только по слову Алексея.
+
+**Сделано 25.10 после пуша** (подробно — коммиты и docs):
+- отпечаток базы (`base_fingerprint`) в кэше пар и индексе реранкера, в
+  головах реранкера и эмбеддера, в LoRA-адаптерах; `allowOtherBase`;
+- приведение выхода WKV — умолчание на плотной базе (на норме `.rwkvq`
+  выключено); тесты паритета и тождеств путей выставляют флаг явно false;
+  обучение эмбеддера с ним качество не меняет (−0.003 [−0.009; +0.001]);
+- `BPETokenizer` (tokenizer.json, побитно как `tokenizers`), протокол
+  `RWKVTokenizer` во всех потребителях, `loadTokenizer`; плоское дерево
+  `WorldTokenizer` — 126 МБ/с против 43.7;
+- батчевый декод (опция): `generateBatch`, до ×3.4 при 8 строках;
+- `RerankTraining`: кэш меньше пачки больше не роняет процесс;
+- rwkv-metal: `rwkv_metal.stats.paired` (общий парный бутстрэп, CLI);
+  мутационные гейты отличают сломанную мутацию от пойманной;
+- docs: формулировка про `.pth` и fold-wkv (один сид), устаревшее о
+  квантованном декоде, ARCHITECTURE «Where things stand», README (что меняет
+  поведение после 0.3.0); CI — только сборка (у GitHub-машин нет Metal).
 
 | модуль | что есть |
 |---|---|
@@ -138,20 +160,20 @@ Neuron (системная строка «Ты — Neuron…» → состоя�
 - Банк состояний: MAIR — только ради локальности; файл банка; банк для sts и
   классификации.
 - rwkv-metal: перенести `.pth` RWKV-PEFT, раннюю остановку, подкачку `.rwkvq`?
-- Большие файлы в `WKV-kvant`: 13B / 7.2B (`files_0310`, 12.4 ГБ), `gguf_0310`
-  (6.3 ГБ) — оставить или в Корзину.
+- Neuro: замер подкачки весов и state-tuning на настоящем iPhone (решено —
+  когда всё будет готово).
+- Пуш 25.10-вечер и тег 0.4.0; CI на GitHub не проверялся (заработает после
+  пуша; если сборка mlx-swift на раннере потребует Metal-тулчейн — добавить
+  шаг `xcodebuild -downloadComponent MetalToolchain`).
 - Из старых записок (до 08.10; подробно — LOG «Пробелы» и «Открытые
   вопросы»), перепроверено против кода 25.10. Остаются:
-  - 1а: в инференсе приведение выхода WKV по умолчанию выключено
-    (`castWKVOutputToComputeDType = false`; в rwkv-metal `CAST_WKV_OUTPUT =
-    False`); включать согласованно с обеих сторон, пересмотрев допуски
-    паритета. При норме fp16 приведение не выверено (KL на 0.1B 3.7–4.8e-6 →
-    1.0e-5, п. 08.10).
+  - 1а закрыт в SwiftRWKV (умолчание по пути базы, 25.10); rwkv-metal —
+    эталон — остаётся без приведения (`CAST_WKV_OUTPUT = False`). При норме
+    fp16 приведение не выверено (KL на 0.1B 3.7–4.8e-6 → 1.0e-5) — поэтому
+    там оно и выключено.
   - вход родного ядра sb6 (`rwkvqNativeInputDType`, fp32 +27 % декода против
     fp16 +2.3e-6 KL) — после 11.10 касается только `useNativeKernel: true`.
-  - нет батчевого декода (батчевого `step`).
-  - кэш состояний и чекпоинт головы реранкера не знают базу: в контракте кэша
-    текст и `initial_state`, отпечатка базы (`StateFile.baseFingerprint`) нет.
+  - батчевый декод без конвейера и GPU-сэмплера.
   - индекс документов не дополняется; при слиянии кэшей пачка строк целиком в
     MLX; «Пробел 4» — не делается намеренно.
   Закрыты (с чем): разрыв с Python на кодировании — нет (25.10, ниже);
@@ -171,6 +193,9 @@ Neuron (системная строка «Ты — Neuron…» → состоя�
 | `w1017/`, `w1018/`, `w1019/` | состояние вместо инструкции; Tool_Use / MAIR (`tool/part*.jsonl`); кэш свёрнутых инструкций |
 | `w1020/` | банк состояний (`bank/`), Neuron 0.4B (`neuron/`: `checks.tsv`, `teacher4.json`, `c4_*.safetensors`, `paired2.py`, `transfer.*`) |
 | `w1022/n15/` | Neuron 1.5B (`run15.sh`, `teacher15.json`, `s15_fold_s*.safetensors`, `paired15.py`) |
+| `w1025/` | замер кодирования против Python (`enc/`), вырожденные блоки sb6, эмбеддер с приведением WKV и без (`castab/`), скорость токенизаторов (`tok/`), батчевый декод (`batch/`), заметки к 0.4.0 |
+| `backup/` | `git bundle` трёх репозиториев на 25.10 (до пуша) |
+| `fixtures/` | копии `.testdata`: срезы reranker / LitRetrieval, `tokenizer_ru16k.json`, `bpe_ru16k_ref.json` |
 | `w1023/` | `models/g1j_1.5b.safetensors` (плотная bf16), `Preen/` (клон + uv: MLX, torch — для сверки `.pth`), `ab/` (замеры шага и памяти), `peft/`, `es/` (fold-wkv, кривая 1.5B), `dtype/` (ошибка градиента, серия типов 0.4B), `bin/` (собранные gen-run), `meas1024.sh` |
 
 Модели: `~/Develop/WKV-kvant/` (`.pth` 0.1B/0.4B/1.5B/2.9B, `files_0110/` —
@@ -199,11 +224,16 @@ swift test -c release --filter …    # ЛЮБОЙ замер скорости �
 `rwkvq_gemv`, `rwkvq_backward`, `load`), обучение (`partial`), состояние
 (`state`, `state_contract`, `state_scope`, `state_bank`, `snapshot`,
 `instruction_cache`, `state_cast`, `weight_streaming`, `rwkvq_streaming`,
-`peft_state`, `early_stopping`). `sampling` идёт ~15 минут.
+`peft_state`, `early_stopping`, `wkv_cast_default`), контракты (`base_contract`),
+токенизаторы (`bpe`, `world_tokenizer`), батчевый декод (`batch_decode`).
+`sampling` идёт ~15 минут.
 
 rwkv-metal: гейты `tests/test_*.py` (запуск `python tests/<гейт>.py`,
 мутации — `--mutations`), в том числе `test_state_cast.py`,
-`test_weight_stream.py`, `test_state_tuning.py`, `test_sequential_backward.py`.
+`test_weight_stream.py`, `test_state_tuning.py`, `test_sequential_backward.py`,
+`test_paired_stats.py` (общий парный бутстрэп: `python -m rwkv_metal.stats.paired
+--a 'w/s*_on.json' --b 'w/s*_off.json' --ranks` — сводка качества по сидам
+вместо разовых скриптов).
 
 Порядок надёжности, от слабого к сильному: структурные тесты → эталон из
 Python → побитовое равенство → мутационная проверка самих тестов.
