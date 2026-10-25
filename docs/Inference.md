@@ -97,6 +97,11 @@ included), 9.4 for the Python reference. Strings that are bridged `NSString`s
 0.16 s on this corpus, more than the encoding itself; read text as native Swift
 strings where speed matters (`decode-bench --tok-bench`).
 
+The BPE tokenizer on the same corpus with `tokenizer_ru16k.json`: 22.4 MB/s
+against 6.1 MB/s for `tokenizers` called text by text from Python, with
+identical ids for all 3.77 million tokens — a second parity check, on a corpus
+seventeen times the size of the fixture.
+
 That is the whole surface for the common case. `generate` defaults to **greedy**
 decoding — `SamplingConfig()` has `temperature = 0` — because a package that
 produces different text on every run by default cannot be debugged.
