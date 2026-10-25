@@ -323,6 +323,50 @@ a snapshot of a prompt and a folded prompt are one object. What is not in the
 file: sampler settings and the penalty history, which `generate` starts afresh
 on every call anyway.
 
+### Batched decode (opt-in)
+
+Several independent generations can share one pass per token:
+
+```swift
+let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+guard let tok = WorldTokenizer(
+        vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+    fatalError("cannot read vocabulary")
+}
+let results = base.generateBatch(prompts: ["The capital of France is", "Two plus two is"],
+                                 config: GenerationConfig(maxTokens: 32, stopTokens: [0]),
+                                 tokenizer: tok)
+for r in results { print(r.text, r.stopReason) }
+```
+
+`prefillBatch` runs all prompts through one parallel pass (right padding, a
+mask, each row ending on its last real token) and `stepBatch` advances every
+row by one token through the same pass at T = 1 with a batched state — the path
+the reranker's prefix cache already uses, no arithmetic of its own. Stopping is
+per row, as in `generate` (limit, stop tokens, stop strings); a row that stops
+leaves the batch. Row `i` samples with seed `sampling.seed + i` through the CPU
+`Sampler`; greedy rows do not depend on the seed. There is no streaming and no
+cancellation — it is a path for batch work.
+
+It is an option rather than the path of `generate` for two reasons. Memory
+grows with the batch — the state of a row is L·H·S·S fp32 numbers (0.1B
+2.4 MB, 1.5B 12.6 MB) plus the prefill activations. And a single row is
+slower: the step runs the parallel kernel rather than the compiled recurrent
+one. Its logits agree with `generate` to ~1e-6 in fp32 (tested on every row,
+next to its neighbours and alone); with the WKV cast in bf16 the two paths
+differ by ~1e-2, so a near-tie in greedy decoding can resolve differently.
+
+M4, release, greedy, 32-token prompts, separate processes interleaved, two
+rounds (they agree within 3 %), no swap; tokens per second over all rows,
+against the same prompts one after another with `generate`:
+
+| | one by one | batch of 1 | batch of 4 | batch of 8 | peak footprint, 8 |
+|---|---|---|---|---|---|
+| g1d 0.1B bf16, 64 steps | 212 | 161 | 392 (×1.85) | 682 (×3.2) | 0.74 GB against 0.50 |
+| g1j 1.5B bf16, 32 steps | 29.5 | 26.2 | 57.4 (×1.95) | 101 (×3.4) | 3.80 GB against 3.23 |
+
+(`decode-bench --batch-bench <model> --batch B --arm batch|single`.)
+
 ### What sampling costs
 
 Measured on 0.1B, **debug build**, 64 tokens each, after warm-up (see the note
@@ -973,11 +1017,9 @@ moved.
 
 ## Not done
 
-- **No batched decode.** `RWKVState` is single-sequence. Serving several
-  independent generations means several states and several passes. (The
-  pipelined loop with the GPU sampler overlaps the per-token read of the chosen
-  id with the next step; a batched step would need the same for a batch of
-  ids.)
+- **Batched decode is not pipelined.** `generateBatch` reads the chosen ids
+  back to the CPU every step and samples on the CPU; the GPU sampler and the
+  pipelined loop of `generate` are single-row.
 - **No beam search or the more exotic selection schemes** (typical sampling,
   mirostat). Temperature, top-k, top-p and the penalties are there; each
   further scheme adds a branch to one loop, and is worth adding against a

@@ -569,6 +569,33 @@ func doc_Inference_4() throws {
             vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
         fatalError("cannot read vocabulary")
     }
+    let results = base.generateBatch(prompts: ["The capital of France is", "Two plus two is"],
+                                     config: GenerationConfig(maxTokens: 32, stopTokens: [0]),
+                                     tokenizer: tok)
+    for r in results { print(r.text, r.stopReason) }
+}
+
+func doc_Inference_5() throws {
+    func loadBackbone(_ path: String) throws -> X070Backbone {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        let weights = try loadArrays(url: url)
+        // Geometry is derived from weight shapes. There is simply no
+        // configuration here that could be specified incorrectly.
+        let nLayer = weights.keys.compactMap { k -> Int? in
+            guard k.hasPrefix("blocks.") else { return nil }
+            return Int(k.split(separator: ".")[1])
+        }.max().map { $0 + 1 } ?? 0
+        let cfg = X070Config(nLayer: nLayer,
+                             nEmbd: weights["ln_out.weight"]!.shape[0],
+                             headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
+                             vocab: weights["head.weight"]!.shape[0])
+        return X070Backbone(weights: weights, cfg: cfg)
+    }
+    let base = try loadBackbone("~/models/world_0.1b_x070.safetensors")
+    guard let tok = WorldTokenizer(
+            vocabURL: URL(fileURLWithPath: "rwkv_vocab_v20230424.txt")) else {
+        fatalError("cannot read vocabulary")
+    }
 
     // The text-feeding contract is read FROM the checkpoint, never from defaults.
     let inf = try RerankerInference.fromCheckpoint(
@@ -581,7 +608,7 @@ func doc_Inference_4() throws {
     }
 }
 
-func doc_Inference_5() throws {
+func doc_Inference_6() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -613,7 +640,7 @@ func doc_Inference_5() throws {
     print(cosineSimilarity(query, vectors).shape)
 }
 
-func doc_Inference_6() throws {
+func doc_Inference_7() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -634,7 +661,7 @@ func doc_Inference_6() throws {
     print(model.prefill([1, 2, 3], state: &st).shape)
 }
 
-func doc_Inference_7() throws {
+func doc_Inference_8() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)
@@ -668,7 +695,7 @@ func doc_Inference_7() throws {
     base.detachRwkvq()   // only meaningful with dropDenseWeights: false
 }
 
-func doc_Inference_8() throws {
+func doc_Inference_9() throws {
     func loadBackbone(_ path: String) throws -> X070Backbone {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         let weights = try loadArrays(url: url)

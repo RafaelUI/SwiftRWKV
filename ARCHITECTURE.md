@@ -57,17 +57,18 @@ Two properties are non-negotiable, because both repos already depend on them:
 
 **Today (25.10).** Everything listed as absent below now exists — pretraining,
 embeddings, reranking, the `.rwkvq` backend, batched boundary state for training
-and encoding, a shared trainer; the README lists what the package does. Three
-parts of this design were *not* carried out, and the sections below should be
-read with that in mind:
+and encoding, a shared trainer; the README lists what the package does. One part
+of this design was *not* carried out and two arrived late; the sections below
+should be read with that in mind:
 
 - **The module split.** `RWKVCore` and `RWKVTraining` were not split out: the
   backbone and the training infrastructure live inside `RWKVGen`, and there is
   no umbrella target — the products are `RWKVGen`, `RWKVQuant`, `RWKVEmbedding`
   and `RWKVRerank` (the reranker module is `RWKVRerank`, not `RWKVReranker`).
   The compiled documentation lives in `Scripts/check_docs.sh`.
-- **Decode is still `B = 1`.** Batched state exists for the parallel pass; a
-  batched recurrent step does not.
+- **Decode was `B = 1` until 25.10;** batched decode now exists as an option
+  (`generateBatch`, through the parallel pass at T = 1), while `generate` keeps
+  the compiled recurrent step.
 - **The tokenizer was World-only until 25.10;** `BPETokenizer` (HuggingFace
   `tokenizer.json`, byte-level BPE) now sits behind the same `RWKVTokenizer`
   protocol (question 4 below — resolved as a minimal BPE implementation).

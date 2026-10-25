@@ -36,6 +36,8 @@ print(out.text)
 - **Tokenizers** — the RWKV World vocabulary, and HuggingFace `tokenizer.json`
   (byte-level BPE, checked id for id against `tokenizers`) for models with their
   own vocabulary; everything takes `any RWKVTokenizer`.
+- **Batched decode** (opt-in) — several generations in one pass per token,
+  up to 3.4× the throughput at 8 rows (`generateBatch`).
 - **Inference** — a parallel pass for whole sequences and a recurrent one with
   O(1) memory per token; prefill uses the parallel pass and is measured 94×
   faster than folding the prompt token by token (1024 tokens, debug build).
