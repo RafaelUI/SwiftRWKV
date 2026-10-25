@@ -4,6 +4,9 @@
 # считает на GPU (mlx-swift по той же причине гоняет тесты на своих машинах).
 # Полный прогон — `swift test` на Apple Silicon; без фикстур .testdata
 # тесты на настоящих моделях пропускаются, а не падают.
+#
+# Ошибки сборки выводятся аннотациями (::error::) — их видно на странице
+# прогона без входа в журнал.
 name: build
 on:
   push:
@@ -14,9 +17,20 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Swift
-        run: swift --version
+      - name: Newest Xcode on the runner
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | grep -v beta | sort -V | tail -1)
+          sudo xcode-select -s "$X"
+          xcodebuild -version
+          swift --version
+          xcodebuild -showComponent MetalToolchain || xcodebuild -downloadComponent MetalToolchain || true
       - name: Build (library, executables, tests)
-        run: swift build --build-tests
+        run: |
+          set -o pipefail
+          swift build --build-tests 2>&1 | tee build.log || {
+            grep -E 'error:' build.log | sort -u | head -20 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
       - name: Documentation examples compile
         run: ./Scripts/check_docs.sh
