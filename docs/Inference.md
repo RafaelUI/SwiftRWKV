@@ -739,14 +739,18 @@ print(base.attachRwkvq(try RwkvqSidecar(path: "~/models/q.rwkvq_mlx"),
 ```
 
 `useNativeKernel` is the one option that changes speed rather than what is
-quantised. Off (the default), every projection unpacks the whole matrix into a
-dense transient and then does an ordinary matmul. On, the sb6 data is
+quantised. On the norm path (`baseDType: .float16`, the default) the recurrent
+step already runs every projection through the GEMV kernels over the packed
+codes (as `load(fromRwkvq:)` does), and only the parallel pass — prefill,
+training — unpacks a matrix per call into a dense transient. On, the sb6 data is
 relayouted once at load into the container MLX's own `quantizedMM` expects, and
-no dense matrix is ever materialised. The numbers are identical — it is a
-relayout, not a requantisation, and the parity is asserted rather than assumed
-— while decode on 2.9B goes from 151 to 30 ms/token. It defaults to off because
-the unpack-per-call behaviour is deliberate for QLoRA, where the frozen base
-has to stay compressed in memory; for inference it is simply a cost.
+no dense matrix is materialised on either pass. The numbers are identical — it
+is a relayout, not a requantisation, and the parity is asserted rather than
+assumed. On the older path (`baseDType: nil`, which the measurements below
+describe) it took decode on 2.9B from 151 to 30 ms/token; against the GEMV
+kernels the trade is the one in the `load(fromRwkvq:)` section above. It
+defaults to off because the unpack-per-call behaviour is deliberate for QLoRA,
+where the frozen base has to stay compressed in memory.
 
 **The embedding table is not quantised by default**, and that is a
 considered choice rather than an omission: the sb6 format packs codes in
@@ -758,12 +762,15 @@ covers it, but it costs memory to save memory.
 ### What quantisation does and does not change
 
 It **does** change the numbers, materially. Measured on this 0.1B with the
-`reduction` sidecar: relative difference on logits versus the dense model is
+`reduction` sidecar of the test fixtures (exported in July 2026, an older
+preset than today's `files_0110`): relative difference on logits versus the dense model is
 **0.62**, and the top-1 token differs on a short prompt. Do not expect
 identical output from a quantised and a dense model.
 
-On the default path it also costs about **2.4× on every projection**, and that
-cost does not go away with scale. Each projection unpacks the whole matrix and
+On the older path (`baseDType: nil`; on the norm path today this applies to
+the parallel pass only — the recurrent step uses the GEMV kernels) it also
+costs about **2.4× on every projection**, and that cost does not go away with
+scale. Each projection unpacks the whole matrix and
 then does an ordinary matmul; on a `[1, D]` vector both halves are
 bandwidth-bound over the same matrix, so unpacking is roughly a second pass.
 (`useNativeKernel` removes this entirely — the table below describes the
@@ -787,9 +794,9 @@ are large. It does not: it is already 76–86% of the work at 0.1B, and its
 *share* is slightly lower at 2.9B. The penalty is a roughly constant factor,
 not a scale-dependent one.
 
-What a fused decode-time GEMV would remove is visible in the traffic. Today
-each projection reads the packed data, writes a dense float32 copy, and reads
-it back — for the whole 2.9B model that is 1795 MB + 11 328 MB + 11 328 MB,
+What the decode-time GEMV kernels (09–11.10) removed is visible in the
+traffic. On the older path each projection reads the packed data, writes a
+dense float32 copy, and reads it back — for the whole 2.9B model that is 1795 MB + 11 328 MB + 11 328 MB,
 about **13.6× the packed size**. A kernel decoding the packed format in place
 reads the packed data and nothing else.
 
@@ -893,7 +900,8 @@ attaching.
 | decode with LoRA vs parallel | 1.1e-5 relative | single prompt |
 | quantised vs dense, logits | 0.62 relative, different top-1 | single prompt |
 | `.rwkvq` attach, 0.1B `reduction` | 73 tensors, 270 MB freed, 153 MB packed | — |
-| reranker prefix / tail | 72.0 ± 0.2 ms / 6.1 ± 0.0 ms | 200 prefixes, 3 runs |
+| reranker prefix / tail | 72.0 ± 0.2 ms / 6.1 ± 0.0 ms | 200 prefixes, 3 runs (July) |
+| reranker encoding, Swift vs Python (rwkv-metal) | 8.77 s vs 9.40 s; prefix 37.6 / 40.1 ms, tail 7.17 / 7.04 ms | `Scripts/bench_compare.sh`, release, 200 prefixes of ≤ 600 characters, 3 runs interleaved, no swap (25.10) |
 | reranker direct vs indexed | 6.5e-4 absolute, same ordering on 640 pairs | single run |
 | embedding, raw base cos+ / cos− | 0.8619 / 0.8723 | 40 rows, single run |
 | **decode, greedy, release build** | **5.58 ms/token (179 tok/s)** | 48 tokens, WKV output cast on |
@@ -918,9 +926,10 @@ moved.
 ## Not done
 
 - **No batched decode.** `RWKVState` is single-sequence. Serving several
-  independent generations means several states and several passes. Sampling
-  also synchronises once per token — it has to read the chosen id back to the
-  CPU — which is cheap now but becomes the shared bottleneck under batching.
+  independent generations means several states and several passes. (The
+  pipelined loop with the GPU sampler overlaps the per-token read of the chosen
+  id with the next step; a batched step would need the same for a batch of
+  ids.)
 - **No beam search or the more exotic selection schemes** (typical sampling,
   mirostat). Temperature, top-k, top-p and the penalties are there; each
   further scheme adds a branch to one loop, and is worth adding against a
@@ -929,17 +938,6 @@ moved.
   sidecar or, when only the native container is left, through MLX's own
   `dequantized`. That is a one-off cost and the right tool for copying weights
   out; on the hot path go through the projection instead.
-- **Decode dequantises per projection per token — unless you ask it not to.**
-  This is the default and it is what makes a quantised backbone usable at all,
-  but it costs 2.21× against dense bf16 at 2.9B, because writing and re-reading
-  a dense transient turns a 1.9 GB read into 13.6 GB of traffic per token.
-  `RwkvqAttachOptions(useNativeKernel: true)` relayouts sb6 into MLX's own
-  quantised container once at load and runs `quantizedMM` instead: same
-  numbers to the last bit, no dense transient, 5.1× faster than the default
-  path and 2.3× faster than dense, at the same memory. It is off by default
-  because the dequantise-per-call path is the right trade for *QLoRA* (the
-  base must stay compressed) and the wrong one for inference; the two uses
-  have not been separated in the API yet.
 - **An old sidecar is not self-contained.** `X070Backbone.load(fromRwkvq:)`
   builds a model from the `.rwkvq` alone (above), and a sidecar from a *full*
   `export_mlx` export — every tensor, not only the quantised projections —

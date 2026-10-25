@@ -323,7 +323,10 @@ QLoRA*, and false as a general rule — for inference the transient is the whole
 cost. That is what `RwkvqAttachOptions.useNativeKernel` addresses: relayout once
 into MLX's quantised container, never materialise a dense matrix, identical
 numbers. The API has not yet been split along the two uses, which is why the
-option exists rather than the behaviour simply changing.
+option exists rather than the behaviour simply changing. *(Since 09–11.10 the
+recurrent step needs neither: GEMV kernels read the packed codes directly — sym
+and sb6, the latter held in the file's K3 interleave — so the transient remains
+only on the parallel pass, where QLoRA needs it.)*
 
 ---
 
