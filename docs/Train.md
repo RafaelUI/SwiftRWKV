@@ -363,7 +363,9 @@ base.initialState = state                // body / prefill / embedder start from
 ```
 
 The full guide — attaching and prompt caches, the file and the fingerprint,
-the embedder mode, the learning rate (the often-quoted 1 -> 0.01 destroys the
+export to RWKV-PEFT `.pth`, early stopping on held-out loss, weight streaming
+(training a 1.5B state over `.rwkvq` in 1.58 GB), the types during training, the
+embedder mode, the learning rate (the often-quoted 1 -> 0.01 destroys the
 model; 3e-4 is measured) and the measured quality, transfer between a model and
 its `.rwkvq` files, and cost — is **[state-tuning.md](state-tuning.md)**.
 
