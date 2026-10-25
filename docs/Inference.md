@@ -825,9 +825,11 @@ before multiplying. Measured on 0.1B *(debug build)*:
 
 Casting the WKV output back to the compute dtype right after the recurrence is
 how the reference implementations do it (state in float32, activations in the
-model dtype). It sits behind `X070Backbone.castWKVOutputToComputeDType`,
-**off by default**, and the flag flips on a live object so both branches can be
-timed in one process.
+model dtype). It is `X070Backbone.castWKVOutputToComputeDType`, and since
+25.10 it is **on by default on a dense base** (including QLoRA and the older
+`.rwkvq` path with `baseDType: nil`) and off on the `.rwkvq` norm path (below).
+The flag flips on a live object so both branches can be timed in one process;
+`wkvOutputCast = nil` returns to the default.
 
 End to end, **release build**, A/B interleaved, two independent runs:
 
@@ -862,13 +864,26 @@ as "degradation near zero, suitable as a QLoRA base". So the trade is **2.82×
 decode for 0.090% perplexity**, and the cost is smaller than what this family
 of projects already treats as negligible.
 
-The flag is still off by default, for two reasons that are about process
-rather than merit: the parity tolerances against the Python reference have to
-be re-derived deliberately rather than loosened until green, and rwkv-metal
-has the same leak — so today this package matches its reference and with the
-flag on it would not. Perplexity has also only been measured on 0.1B; a deeper
-model accumulates more bfloat16 rounding and should be checked before the same
-number is promised for it.
+On a deeper model the cost is smaller, not larger: 1.5B (24 layers) +0.018%
+(measured in rwkv-metal). **The default, since 25.10:**
+
+- **dense base — on.** That is how the official implementation and mlx-lm
+  compute, and the price above is below what this family of projects treats
+  as negligible.
+- **`.rwkvq` norm path (fp16 base, `load(fromRwkvq:)`) — off.** There the
+  residual stream is float32 by design, as in rwkv-quant, the decode step runs
+  a fused tail kernel that the cast bypasses, and the cast measurably moves the
+  numbers away from exact computation (KL on 0.1B 3.7–4.8e-6 → 1.0e-5).
+- **an explicit choice wins** (`castWKVOutputToComputeDType = true / false`).
+
+The Python reference (rwkv-metal, `CAST_WKV_OUTPUT = False`) and every parity
+fixture taken from it are without the cast, so the parity tests — and the
+tests of exact identities between paths (recurrent against parallel, chunked
+against whole, GradCache against the plain pass), which hold to ~1e-6 only in
+float32 activations — set the flag off explicitly; under the cast those paths
+agree to ~1e-2, which the tests of the flag itself bound. What was measured
+with the cast **off** and not re-measured with it on: the embedding and
+reranker quality numbers in their guides.
 
 It does **not** change which pass you are in. Recurrent decode on a quantised
 backbone matches the parallel pass on the *same* quantised backbone to

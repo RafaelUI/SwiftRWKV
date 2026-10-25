@@ -18,6 +18,7 @@ final class EmbeddingStateBankTests: XCTestCase {
     func makeModel(vocab: Int = 64) -> EmbeddingModel {
         let cfg = TinyBackbone.config(nLayer: 3, vocab: vocab)
         let bb = X070Backbone(weights: TinyBackbone.weights(cfg, seed: 3), cfg: cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let head = EmbeddingHead(dim: cfg.nEmbd, seed: 3)
         MLXRandom.seed(103)
         head.fc2 = MLXRandom.normal([cfg.nEmbd, head.hidden]) * 0.05

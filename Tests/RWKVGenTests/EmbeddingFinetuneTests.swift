@@ -27,6 +27,7 @@ final class EmbeddingFinetuneTests: XCTestCase {
     func makeModel(seed: UInt64 = 3, nLayer: Int = 2, vocab: Int = 64) -> EmbeddingModel {
         let cfg = TinyBackbone.config(nLayer: nLayer, vocab: vocab)
         let bb = X070Backbone(weights: TinyBackbone.weights(cfg, seed: seed), cfg: cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let head = EmbeddingHead(dim: cfg.nEmbd, seed: seed)
         // fc2 штатно нулевой (голова = тождество). Для тестов обучения это
         // плохая стартовая точка: нулевой fc2 даёт нулевой градиент по fc1

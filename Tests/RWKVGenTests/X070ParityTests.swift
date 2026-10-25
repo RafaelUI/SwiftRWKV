@@ -98,6 +98,7 @@ final class X070ParityTests: XCTestCase {
     func testFullForwardMatchesReference() throws {
         let f = try skipIfMissing(try loadFixtures())
         let bb = X070Backbone(weights: f.weights, cfg: f.cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let ids = f.reference["ids"]!
 
         let hidden = bb.body(ids)
@@ -125,6 +126,7 @@ final class X070ParityTests: XCTestCase {
     func testPredictionsMatchReference() throws {
         let f = try skipIfMissing(try loadFixtures())
         let bb = X070Backbone(weights: f.weights, cfg: f.cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let logits = bb(f.reference["ids"]!).asType(.float32)
         let refLogits = f.reference["logits"]!.asType(.float32)
 
@@ -168,6 +170,7 @@ final class X070ParityTests: XCTestCase {
     func testStateMatchesReference() throws {
         let f = try skipIfMissing(try loadFixtures())
         let bb = X070Backbone(weights: f.weights, cfg: f.cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let st = bb.states(f.reference["ids"]!)
 
         let dw = relDiff(f.reference["state_wkv"]!, st.wkv)
@@ -185,6 +188,7 @@ final class X070ParityTests: XCTestCase {
     func testSplitContinuationMatchesReference() throws {
         let f = try skipIfMissing(try loadFixtures())
         let bb = X070Backbone(weights: f.weights, cfg: f.cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let ids = f.reference["ids"]!
         let T = ids.shape[1], half = T / 2
 
@@ -204,6 +208,7 @@ final class X070ParityTests: XCTestCase {
     func testMaskedStateMatchesReference() throws {
         let f = try skipIfMissing(try loadFixtures())
         let bb = X070Backbone(weights: f.weights, cfg: f.cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let ids = f.reference["ids"]!
         let T = ids.shape[1]
 
@@ -231,6 +236,7 @@ final class X070ParityTests: XCTestCase {
     func testRecurrentDecodeMatchesParallelOnRealWeights() throws {
         let f = try skipIfMissing(try loadFixtures())
         let bb = X070Backbone(weights: f.weights, cfg: f.cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let ids = f.reference["ids"]!
         eval(ids)
         let row = ids[0 ..< 1]

@@ -53,7 +53,9 @@ final class RwkvqBaseTests: XCTestCase {
                              nEmbd: weights["ln_out.weight"]!.shape[0],
                              headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
                              vocab: weights["head.weight"]!.shape[0])
-        return Fixtures(backbone: X070Backbone(weights: weights, cfg: cfg),
+        let bb = X070Backbone(weights: weights, cfg: cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
+        return Fixtures(backbone: bb,
                         sidecar: try RwkvqSidecar(path: sidecarPath),
                         reference: try loadArrays(url: URL(fileURLWithPath: refPath)),
                         cfg: cfg)

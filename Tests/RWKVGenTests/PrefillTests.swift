@@ -41,7 +41,9 @@ final class PrefillTests: XCTestCase {
                              vocab: w["head.weight"]!.shape[0])
         guard let tok = WorldTokenizer(vocabURL: URL(fileURLWithPath: vp))
         else { throw XCTSkip("словарь не разобрался") }
-        return (X070Backbone(weights: w, cfg: cfg), tok, cfg)
+        let bb = X070Backbone(weights: w, cfg: cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
+        return (bb, tok, cfg)
     }
 
     /// Логиты последнего токена совпадают, и совпадает argmax.

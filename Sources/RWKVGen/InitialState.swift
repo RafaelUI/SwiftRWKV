@@ -411,13 +411,14 @@ extension StateTuning {
     /// для `run` и `heldOutLoss`: отложенный лосс считается при тех же флагах, что обучение.
     static func setTrainingFlags(_ bb: X070Backbone, _ cfg: StateTuneConfig) -> () -> Void {
         let savedLayers = bb.trainLayers, savedCheckpoint = bb.useBlockCheckpoint
-        let savedProjectionCast = bb.castDenseProjectionInput, savedWKVCast = bb.castWKVOutputToComputeDType
+        let savedProjectionCast = bb.castDenseProjectionInput, savedWKVCast = bb.wkvOutputCast
         bb.useBlockCheckpoint = false
         bb.castDenseProjectionInput = cfg.castProjectionInput
         bb.castWKVOutputToComputeDType = cfg.castWKVOutput
         return {
             bb.trainLayers = savedLayers; bb.useBlockCheckpoint = savedCheckpoint
-            bb.castDenseProjectionInput = savedProjectionCast; bb.castWKVOutputToComputeDType = savedWKVCast
+            // явный выбор или «по пути базы» — как было, а не действующее значение
+            bb.castDenseProjectionInput = savedProjectionCast; bb.wkvOutputCast = savedWKVCast
         }
     }
 

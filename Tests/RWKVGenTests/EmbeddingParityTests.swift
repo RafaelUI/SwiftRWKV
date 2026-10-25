@@ -81,6 +81,7 @@ final class EmbeddingParityTests: XCTestCase {
                              headSize: weights["blocks.0.tmix.k_k"]!.shape[1],
                              vocab: weights["head.weight"]!.shape[0])
         let bb = X070Backbone(weights: weights, cfg: cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
 
         // Голова — из эталона, а не сгенерированная заново.
         let head = EmbeddingHead(dim: cfg.nEmbd)

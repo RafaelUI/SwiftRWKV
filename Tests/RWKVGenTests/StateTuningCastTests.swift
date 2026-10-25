@@ -98,7 +98,28 @@ final class StateTuningCastTests: XCTestCase {
         XCTAssertFalse(c.castProjectionInput, "приведение входа проекций — по выбору")
         let (bb, _) = bf16Tiny()
         XCTAssertFalse(bb.castDenseProjectionInput, "у самого бэкбона флаг выключен: инференс не меняется")
-        XCTAssertFalse(bb.castWKVOutputToComputeDType)
+        XCTAssertNil(bb.wkvOutputCast, "у бэкбона приведение выхода WKV не выбрано явно — по пути базы")
+    }
+
+    /// Бэкбон без явного выбора приведения выхода WKV (умолчание по пути базы)
+    /// остаётся без него и после обучения и после отложенного лосса — а не
+    /// получает явное значение, которое переживёт смену базы.
+    func testRunKeepsTheAutomaticWKVCast() {
+        let (bb, cfg) = bf16Tiny()
+        XCTAssertNil(bb.wkvOutputCast)
+        var c = StateTuneConfig()
+        c.maxSteps = 2; c.logEvery = 0; c.cacheLimitGB = 0; c.lossChunkTokens = 0
+        c.castWKVOutput = false
+        let b = batch(cfg, B: 1, T: 32, seed: 13)
+        let out = StateTuning.run(bb, nextBatch: { b }, config: c)
+        eval(out.state.wkv)
+        XCTAssertNil(bb.wkvOutputCast, "после обучения приведение стало явным: \(String(describing: bb.wkvOutputCast))")
+        _ = StateTuning.heldOutLoss(bb, state: out.state, batches: [b], config: c)
+        XCTAssertNil(bb.wkvOutputCast, "после отложенного лосса приведение стало явным")
+        bb.wkvOutputCast = false
+        var on = c; on.castWKVOutput = true
+        _ = StateTuning.run(bb, nextBatch: { b }, config: on)
+        XCTAssertEqual(bb.wkvOutputCast, false, "явный выбор не вернулся")
     }
 
     /// Результат обучения зависит только от StateTuneConfig, а не от флагов, с

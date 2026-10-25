@@ -134,11 +134,15 @@ final class RwkvqDTypeTests: XCTestCase {
                              vocab: w["head.weight"]!.shape[0])
         let ids = MLXArray([Int32(510), 610, 710], [1, 3])
 
+        // Без приведения выхода WKV (явно; умолчание с 25.10 — с ним): тест
+        // сторожит саму течь — где она начинается и куда доходит.
         let dense = X070Backbone(weights: w, cfg: cfg)
+        dense.castWKVOutputToComputeDType = false
         let denseOut = dense.body(ids)
         eval(denseOut)
 
         let quant = X070Backbone(weights: w, cfg: cfg)
+        quant.castWKVOutputToComputeDType = false
         XCTAssertGreaterThan(quant.attachRwkvq(sc, options: .init(baseDType: nil)).attached, 0, "сайдкар не подключился")
         let quantOut = quant.body(ids)
         eval(quantOut)

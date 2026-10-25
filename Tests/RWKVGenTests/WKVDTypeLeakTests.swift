@@ -43,16 +43,37 @@ final class WKVDTypeLeakTests: XCTestCase {
         return (X070Backbone(weights: w, cfg: cfg), tok, cfg, w)
     }
 
-    /// Умолчание — ВЫКЛЮЧЕНО, и проход остаётся float32.
+    /// Умолчание (25.10) — по пути базы: на плотной базе ВКЛЮЧЕНО, и проход
+    /// идёт в типе вычислений; на норме `.rwkvq` (fp16-база) — выключено.
+    /// Явная запись побеждает, nil возвращает умолчание. Без приведения
+    /// (явно) проход — float32: течь, ради которой флаг заведён.
     ///
-    /// Сторожит границу: если кто-то поменяет умолчание, эталоны паритета
-    /// поедут молча, а причина будет видна здесь.
-    func testFlagIsOffByDefaultAndPassStaysFloat32() throws {
+    /// Сторожит границу: эталоны паритета с Python сняты без приведения, и
+    /// смена умолчания без явного флага в тестах паритета сдвинула бы их молча.
+    func testDefaultFollowsBasePath() throws {
         let (bb, _, _, _) = try backbone()
-        XCTAssertFalse(bb.castWKVOutputToComputeDType, "умолчание сдвинулось")
-        let out = bb.body(MLXArray([Int32(510), 610, 710], [1, 3]))
-        eval(out)
-        XCTAssertEqual(out.dtype, .float32)
+        XCTAssertNil(bb.wkvOutputCast)
+        XCTAssertTrue(bb.castWKVOutputToComputeDType, "плотная база без приведения по умолчанию")
+        let ids = MLXArray([Int32(510), 610, 710], [1, 3])
+        let on = bb.body(ids); eval(on)
+        XCTAssertEqual(bb.w["ln0.weight"]!.dtype, .bfloat16, "модель не в bf16 — тест типов ничего не различает")
+        XCTAssertEqual(on.dtype, .bfloat16, "по умолчанию проход не в типе вычислений")
+        bb.castWKVOutputToComputeDType = false
+        XCTAssertEqual(bb.wkvOutputCast, false)
+        let off = bb.body(ids); eval(off)
+        XCTAssertEqual(off.dtype, .float32)
+        bb.wkvOutputCast = nil
+        XCTAssertTrue(bb.castWKVOutputToComputeDType)
+
+        // норма .rwkvq — выключено, явная запись всё равно побеждает
+        bb.rwkvqBaseDType = .float16
+        XCTAssertFalse(bb.castWKVOutputToComputeDType, "на норме .rwkvq приведение включилось само")
+        bb.castWKVOutputToComputeDType = true
+        XCTAssertTrue(bb.castWKVOutputToComputeDType)
+        bb.wkvOutputCast = nil
+        XCTAssertFalse(bb.castWKVOutputToComputeDType)
+        bb.rwkvqBaseDType = nil
+        XCTAssertTrue(bb.castWKVOutputToComputeDType)
     }
 
     /// С флагом проход идёт в типе вычислений — и в параллельном пути, и в

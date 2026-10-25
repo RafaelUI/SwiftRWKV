@@ -18,6 +18,7 @@ final class EmbeddingSequentialTests: XCTestCase {
     func makeModel(seed: UInt64 = 3, nLayer: Int = 3, vocab: Int = 64) -> EmbeddingModel {
         let cfg = TinyBackbone.config(nLayer: nLayer, vocab: vocab)
         let bb = X070Backbone(weights: TinyBackbone.weights(cfg, seed: seed), cfg: cfg)
+        bb.castWKVOutputToComputeDType = false   // без приведения выхода WKV (явно): проверяется точное тождество путей / эталон из Python, снятый без него
         let head = EmbeddingHead(dim: cfg.nEmbd, seed: seed)
         // штатный нулевой fc2 даёт нулевой градиент по fc1
         MLXRandom.seed(seed &+ 100)
