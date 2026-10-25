@@ -1,7 +1,9 @@
 #!/bin/bash
 # Замер кодирования: Swift против Python на ОДНОМ файле входа.
 #
-#   ./Scripts/bench_compare.sh [файл входа] [повторов]
+#   ./Scripts/bench_compare.sh [файл входа] [повторов] [каталог вывода]
+#
+# Вывод — по умолчанию в ~/Develop/swr_bench_keep/bench (данные — не в /tmp).
 #
 # Стороны гоняются ПО ОЧЕРЕДИ, а не параллельно: GPU один, и одновременный
 # запуск мерил бы конкуренцию за него, а не реализации.
@@ -25,7 +27,7 @@ echo "драйвер: pid $$ (убить целиком: kill -9 -$$  или  pk
 
 INPUT="${1:-/tmp/bench_input.json}"
 REPEATS="${2:-2}"
-OUT=/tmp/bench
+OUT="${3:-$HOME/Develop/swr_bench_keep/bench}"
 MODEL=~/Develop/SwiftRWKV/.testdata/world_0.1b_x070.safetensors
 VOCAB=.testdata/rwkv_vocab_v20230424.txt
 PYREPO=~/Develop/rwkv-metal
