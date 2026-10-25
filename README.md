@@ -89,7 +89,7 @@ Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/RafaelUI/SwiftRWKV", from: "0.3.0"),
+    .package(url: "https://github.com/RafaelUI/SwiftRWKV", from: "0.4.0"),
 ],
 targets: [
     .target(name: "YourApp", dependencies: [
@@ -104,13 +104,11 @@ targets: [
 
 Or in Xcode: **File → Add Package Dependencies…** → paste the repo URL.
 
-The latest tag is `0.3.0`. Changes since `0.2.4` that need attention when
-upgrading: `DocIndex.check` takes a contract (use
-`RerankerInference.prefixContract()`), and an embedding model with
-`stateScope = .queriesOnly` needs the role of each text (`role: .query` /
-`.document`); everything else is additive.
+CI builds the library, executables and tests on a clean machine with Xcode 26.3
+(Swift 6.2); development is on newer Xcode. Tests need Apple Silicon with Metal.
 
-On `main` since `0.3.0`, not yet tagged — what changes behaviour:
+The latest tag is `0.4.0`. Changes since `0.3.0` that need attention when
+upgrading:
 
 - **The WKV output is cast to the compute type by default on a dense base**
   (`castWKVOutputToComputeDType`; on the `.rwkvq` norm path it stays off):
@@ -214,7 +212,7 @@ is missing and what was tried and rejected is in
 
 Experimental, but validated end to end on real models rather than on toys —
 RWKV-7 World 0.1B, g1d 0.1B / 0.4B dense and as `.rwkvq`, and 1.5B / 2.9B for
-inference; state-tuning on 1.5B. 669 tests, plus mutation suites that deliberately break the code and
+inference; state-tuning on 1.5B. 694 tests, plus mutation suites that deliberately break the code and
 require the tests to notice — the interesting failures in this problem are
 silent, so "the tests pass" is not by itself evidence.
 
