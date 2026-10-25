@@ -110,6 +110,27 @@ upgrading: `DocIndex.check` takes a contract (use
 `stateScope = .queriesOnly` needs the role of each text (`role: .query` /
 `.document`); everything else is additive.
 
+On `main` since `0.3.0`, not yet tagged — what changes behaviour:
+
+- **The WKV output is cast to the compute type by default on a dense base**
+  (`castWKVOutputToComputeDType`; on the `.rwkvq` norm path it stays off):
+  decode ×2.8 on 0.1B for +0.09 % perplexity, numbers move by ~1e-2 relative.
+  Set the flag to `false` for the previous arithmetic.
+- **Checkpoints and caches record their base** (`base_fingerprint`): a reranker
+  or embedding head, LoRA adapters, a pair cache or a serving index made on
+  another base is refused (`RerankerError.otherBase`,
+  `EmbeddingCheckpointError.otherBase`, `LoRA.LoadError.otherBase`;
+  `allowOtherBase: true` to load anyway). Files without the key are not
+  checked. A reranker training checkpoint (`checkpoint:`) from before no longer
+  resumes.
+- **Tokenizers are a protocol** (`RWKVTokenizer`): everything that took a
+  `WorldTokenizer` takes `any RWKVTokenizer` — passing a `WorldTokenizer`
+  still compiles; code that read `.tokenizer` as a `WorldTokenizer` needs a cast.
+- **State-tuning defaults**: gradient clipping at 1.0 and the WKV-output cast
+  during training (see [docs/state-tuning.md](docs/state-tuning.md)).
+- New: `BPETokenizer`, `generateBatch`, early stopping, RWKV-PEFT `.pth`,
+  weight streaming.
+
 ## Project layout
 
 ```
