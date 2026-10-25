@@ -6,7 +6,7 @@
 # тесты на настоящих моделях пропускаются, а не падают.
 #
 # Ошибки сборки выводятся аннотациями (::error::) — их видно на странице
-# прогона без входа в журнал.
+# прогона без входа в журнал; версия Xcode и Swift — аннотацией-заметкой.
 name: build
 on:
   push:
@@ -24,12 +24,16 @@ jobs:
           sudo xcode-select -s "$X"
           xcodebuild -version
           swift --version
+          echo "::notice::$(xcodebuild -version | head -1); $(swift --version 2>&1 | head -1)"
           xcodebuild -showComponent MetalToolchain || xcodebuild -downloadComponent MetalToolchain || true
       - name: Build (library, executables, tests)
         run: |
           set -o pipefail
           swift build --build-tests 2>&1 | tee build.log || {
-            grep -E 'error:' build.log | sort -u | head -20 | while IFS= read -r l; do echo "::error::$l"; done
+            # GitHub показывает не больше 10 аннотаций на шаг, поэтому все
+            # ошибки — одной аннотацией, строки через %0A.
+            msg=$(grep -E '^/.*error:' build.log | sed "s|$PWD/||" | sort -u | head -60 | awk '{printf "%s%%0A", $0}')
+            echo "::error::$msg"
             exit 1
           }
       - name: Documentation examples compile
