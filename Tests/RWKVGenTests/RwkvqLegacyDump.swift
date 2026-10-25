@@ -35,7 +35,7 @@ final class RwkvqLegacyDump: XCTestCase {
         let weights = try loadArrays(url: URL(fileURLWithPath: modelPath))
         let cfg = X070Config(nLayer: 12, nEmbd: 768, headSize: 64, vocab: 65536)
         let sidecar = try RwkvqSidecar(path: sidecarPath)
-        let ids = MLXArray((0 ..< 48).map { Int32(($0 * 7919 + 13) % 60000 + 100) }, [1, 48])
+        let ids = MLXArray((0 ..< 48).map { (i: Int) -> Int32 in Int32((i * 7919 + 13) % 60000 + 100) }, [1, 48])
 
         var out: [String: MLXArray] = [:]
         for (tag, native, emb) in [("dequant", false, false), ("native", true, false),

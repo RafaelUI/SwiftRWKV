@@ -78,7 +78,7 @@ final class RwkvqLoadTests: XCTestCase {
         let rows = 16, IN = 512, NB = IN / 16
         let codes = MLXArray((0 ..< rows * IN).map { UInt8(truncatingIfNeeded: $0 &* 37 &+ $0 / IN) }, [rows, IN])
         let qs = MLXArray((0 ..< rows * NB).map { UInt8(truncatingIfNeeded: $0 &* 11 &+ 3) }, [rows, NB])
-        let d = MLXArray((0 ..< rows * 2).map { Float($0 % 2 == 0 ? 1 : -1) * (0.001 + Float($0) * 0.0007) },
+        let d = MLXArray((0 ..< rows * 2).map { (i: Int) -> Float in Float(i % 2 == 0 ? 1 : -1) * (0.001 + Float(i) * 0.0007) },
                          [rows, 2]).asType(.float16)
         XCTAssertGreaterThan((qs .>= 128).asType(.int32).sum().item(Int.self), 100)
         let table = RwkvqSymRowTable(codes: codes, qs: qs, d: d, rowCount: rows, inFeatures: IN)

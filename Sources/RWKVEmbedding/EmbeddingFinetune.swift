@@ -265,10 +265,10 @@ public enum EmbeddingFinetune {
 
     static func checkVocab(model: EmbeddingModel, tokenizer: any RWKVTokenizer,
                            stage: EmbeddingStage, terminator: Int) throws {
-        let probe = stage.train.prefix(4).flatMap {
-            [String($0.anchor.prefix(stage.maxChars)),
-             String($0.positive.prefix(stage.maxChars)),
-             String($0.negative.prefix(stage.maxChars))]
+        let probe: [String] = stage.train.prefix(4).flatMap { (p) -> [String] in
+            [String(p.anchor.prefix(stage.maxChars)),
+             String(p.positive.prefix(stage.maxChars)),
+             String(p.negative.prefix(stage.maxChars))]
         }
         guard !probe.isEmpty else { return }
         let (idx, _) = encodeBatch(tokenizer: tokenizer, texts: probe,

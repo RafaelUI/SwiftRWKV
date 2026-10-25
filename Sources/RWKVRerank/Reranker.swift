@@ -69,7 +69,7 @@ public final class Reranker {
     public static let checkpointFormat = "rwkv-metal-reranker-head-v1"
 
     func metadata(_ extra: [String: String]? = nil) -> [String: String] {
-        var md = [
+        var md: [String: String] = [
             "format": Self.checkpointFormat,
             "layer_idx": head.layerIdx.map(String.init).joined(separator: ","),
             "shared_state": head.cfg.sharedState ? "1" : "0",

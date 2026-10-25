@@ -278,7 +278,7 @@ final class RwkvqDownstreamTests: XCTestCase {
             // Выдача с адаптерами идёт ПРЯМЫМ путём (замороженные ядра, короткий
             // проход), обучение — дифференцируемым. Адаптеры обязаны входить в
             // оба одинаково: иначе обучается одна модель, а выдаётся другая.
-            let ids = MLXArray((0 ..< 32).map { Int32(($0 * 7919 + 13) % 60000 + 100) }, [2, 16])
+            let ids = MLXArray((0 ..< 32).map { (i: Int) -> Int32 in Int32((i * 7919 + 13) % 60000 + 100) }, [2, 16])
             let pool = MLXArray([Int32(15), Int32(15)])
             let viaTrain = model.embed(ids, poolIndex: pool).asType(.float32)
             let kernBefore = Self.kernelCalls(bb) + bb.cmixFrozenCalls

@@ -171,7 +171,7 @@ final class SequentialBackwardTests: XCTestCase {
         liven(bb)
         let set = LoRATrainableSet(bb)
         let ps = set.initialParameters()
-        let ids = MLXArray((0 ..< 33).map { Int32(($0 * 7919 + 13) % 60000 + 100) }, [1, 33])
+        let ids = MLXArray((0 ..< 33).map { (i: Int) -> Int32 in Int32((i * 7919 + 13) % 60000 + 100) }, [1, 33])
         let b: LoRABatch = (x: ids[0..., 0 ..< 32], y: ids[0..., 1 ... 32])
         let (lossRef, gRef) = whole(bb, set, ps, b)
         let r = LoRAFinetune.sequentialGradients(bb, set: set, parameters: ps, batch: b, lossChunk: 16)
