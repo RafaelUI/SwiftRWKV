@@ -1,0 +1,22 @@
+# Сборка на чистой машине: библиотека, исполняемые цели, тестовая цель и
+# примеры из docs/*.md (Scripts/check_docs.sh). Тесты здесь НЕ запускаются:
+# на виртуальных macOS-машинах GitHub нет доступа к Metal, а каждый тест
+# считает на GPU (mlx-swift по той же причине гоняет тесты на своих машинах).
+# Полный прогон — `swift test` на Apple Silicon; без фикстур .testdata
+# тесты на настоящих моделях пропускаются, а не падают.
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift
+        run: swift --version
+      - name: Build (library, executables, tests)
+        run: swift build --build-tests
+      - name: Documentation examples compile
+        run: ./Scripts/check_docs.sh
