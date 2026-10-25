@@ -30,6 +30,8 @@ public enum RerankerError: Error, CustomStringConvertible {
     case emptyLayerIdx
     case checkpointMismatch(String, String, String)
     case notARerankerCheckpoint(String)
+    /// Голова обучена на другой базе (отпечаток `base_fingerprint`).
+    case otherBase(file: String, model: String)
 
     public var description: String {
         switch self {
@@ -48,6 +50,13 @@ public enum RerankerError: Error, CustomStringConvertible {
                 \(path): нет метаданных реранкера. Либо это чужой файл, либо \
                 чекпоинт, сохранённый до появления метаданных — тогда собери \
                 Reranker вручную и позови loadHead(..., strict: false).
+                """
+        case .otherBase(let f, let m):
+            return """
+                голова обучена на другой базе (base_fingerprint): отпечаток \(f.prefix(12))… в файле, \
+                \(m.prefix(12))… у модели. Формы сходятся, а числа — состояния \
+                другой базы; плотная модель и её .rwkvq-файлы — тоже разные базы. \
+                allowOtherBase: true — загрузить всё равно.
                 """
         }
     }

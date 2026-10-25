@@ -78,6 +78,10 @@ public final class Reranker {
             "base_n_layer": String(base.cfg.nLayer),
             "base_n_embd": String(base.cfg.nEmbd),
             "base_n_head": String(base.cfg.nHead),
+            // База, на чьих состояниях голова обучена. `extra` (контракт
+            // обучающего кэша) её перекрывает: важнее, с какой базы сняты
+            // состояния, чем к какой база подключена в момент записи.
+            StateFile.baseContractKey: base.baseFingerprint,
         ]
         if let extra { for (k, v) in extra { md[k] = v } }
         return md
@@ -103,8 +107,15 @@ public final class Reranker {
     }
 
     @discardableResult
-    public func loadHead(from url: URL, strict: Bool = true) throws -> Reranker {
+    public func loadHead(from url: URL, strict: Bool = true,
+                         allowOtherBase: Bool = false) throws -> Reranker {
         let (weights, md) = try loadArraysAndMetadata(url: url)
+        // База сверяется, если файл её знает (записанный до ключа или
+        // rwkv-metal — не знает, и сверять не с чем).
+        if strict, !allowOtherBase, let inFile = md[StateFile.baseContractKey] {
+            let here = base.baseFingerprint
+            if inFile != here { throw RerankerError.otherBase(file: inFile, model: here) }
+        }
         if strict, (md["format"] ?? "").hasPrefix("rwkv-metal-reranker-head") {
             let want = metadata()
             for key in ["layer_idx", "shared_state", "n_probe",
@@ -130,7 +141,8 @@ public final class Reranker {
     /// формы тензоров от этого не зависят.
     public static func fromHead(base: X070Backbone, url: URL,
                                 freezeBase: Bool = true,
-                                headDType: DType = .float32) throws -> Reranker {
+                                headDType: DType = .float32,
+                                allowOtherBase: Bool = false) throws -> Reranker {
         let md = try readHeadMetadata(url)
         guard (md["format"] ?? "").hasPrefix("rwkv-metal-reranker-head") else {
             throw RerankerError.notARerankerCheckpoint(url.path)
@@ -143,7 +155,7 @@ public final class Reranker {
             headHidden: hidden.isEmpty ? nil : Int(hidden))
         let model = try Reranker(base: base, cfg: cfg, freezeBase: freezeBase,
                                  headDType: headDType)
-        try model.loadHead(from: url)
+        try model.loadHead(from: url, allowOtherBase: allowOtherBase)
         return model
     }
 }

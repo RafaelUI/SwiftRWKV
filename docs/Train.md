@@ -542,9 +542,10 @@ legitimate training input.
 
 ## Not done
 
-- **The backbone is fingerprinted only in state files** (`StateFile`). Adapter
-  and head checkpoints still are not: a head trained on one backbone and loaded
-  onto another differs in neither shape nor contract.
+- **Adapters from rwkv-metal carry no base fingerprint.** `LoRA.save` writes
+  `base_fingerprint` and `LoRA.load` refuses adapters of another base
+  (`LoRA.LoadError.otherBase`, `allowOtherBase: true` to load anyway); a file
+  without the key — older, or from rwkv-metal — is loaded unchecked.
 - **No tokeniser for non-World vocabularies**, which limits pretraining on a
   custom vocabulary: Swift has no equivalent of HuggingFace `tokenizers`.
 ## Fixed defects worth knowing

@@ -60,6 +60,8 @@ struct Args {
     var serveCheck: String? = nil
     /// Оценка готовой головы на ГОТОВОМ кэше, без обучения.
     var evalHead: String? = nil
+    /// Голова с другой базы (--eval-head, --serve-check): не отказывать.
+    var allowOtherBase = false
     /// Замер кодирования по фазам на общем с Python файле входа.
     var bench: String? = nil
     var benchWarmup = 3
@@ -103,6 +105,7 @@ func parseArgs() -> Args {
         case "--cache": a.cachePath = val()
         case "--serve-check": a.serveCheck = val()
         case "--eval-head": a.evalHead = val()
+        case "--allow-other-base": a.allowOtherBase = true
         case "--bench": a.bench = val()
         case "--bench-warmup": a.benchWarmup = Int(val()) ?? a.benchWarmup
         case "--bench-bucket": a.benchBucket = Int(val()) ?? a.benchBucket
@@ -367,7 +370,8 @@ if let headPath = args.evalHead {
         exit(2)
     }
     let (m, contract) = try RerankTraining.evaluate(base: backbone,
-                                                    head: headURL, cache: cache)
+                                                    head: headURL, cache: cache,
+                                                    allowOtherBase: args.allowOtherBase)
     print("контракт чекпоинта: "
           + contract.sorted { $0.key < $1.key }
                     .map { "\($0.key)=\($0.value)" }.joined(separator: ", "))
@@ -400,7 +404,8 @@ if let headPath = args.serveCheck {
                .map { "\($0.key)=\($0.value)" }.joined(separator: ", "))
 
     let inf = try RerankerInference.fromCheckpoint(
-        base: backbone, tokenizer: tokenizer, head: headURL)
+        base: backbone, tokenizer: tokenizer, head: headURL,
+        allowOtherBase: args.allowOtherBase)
     print("голова читает слои \(inf.model.head.uniqueSources)")
 
     // Ранжируем ровно те же отложенные запросы и теми же кандидатами, что
@@ -479,7 +484,8 @@ let encCfg = RerankEncodeConfig(maxDocTokens: args.maxDocTokens,
 // начального состояния (`none` без него) — кэш, снятый с другим состоянием,
 // не переиспользуется и не обучает голову.
 let cacheContract = encCfg.contract.merging(
-    [StateFile.contractKey: backbone.initialStateFingerprint]) { a, _ in a }
+    [StateFile.contractKey: backbone.initialStateFingerprint,
+     StateFile.baseContractKey: backbone.baseFingerprint]) { a, _ in a }
 
 func buildCache(_ samples: [RerankSample], tag: String) throws -> StateCache {
     let base = args.cachePath.map {

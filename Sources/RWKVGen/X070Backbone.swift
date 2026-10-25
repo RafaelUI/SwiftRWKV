@@ -93,6 +93,12 @@ public final class X070Backbone {
     /// эти свойства (у каждого didSet); по ней собранный шаг узнаёт, что
     /// его пора пересобрать, — см. `step` в X070Generation.swift.
     var stepVersion = 0
+    /// Отпечаток базы (`StateFile.baseFingerprint`) и `stepVersion`, при
+    /// которой он снят. Отпечаток читает веса (на `.rwkvq` — разворачивая две
+    /// проекции), а контракты реранкера спрашивают его на каждом запросе;
+    /// `stepVersion` растёт при любой записи в веса, так что устаревшим
+    /// значение не бывает — бывает лишний пересчёт.
+    var baseFingerprintMemo: (version: Int, value: String)? = nil
     /// Собранный (mx.compile) рекуррентный шаг и версия, под которую он собран.
     var compiledStepFn: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
     var compiledStepVersion = -1

@@ -175,15 +175,38 @@ public enum LoRA {
         return d
     }
 
+    /// Адаптеры с отпечатком базы (`base_fingerprint`), на которой они
+    /// обучены: адаптер — поправка к ЭТИМ весам, на другой базе формы те же,
+    /// а смысл другой.
     public static func save(_ bb: X070Backbone, to url: URL) throws {
         let st = adapterState(bb); eval(Array(st.values))
-        try MLX.save(arrays: st, url: url)
+        try MLX.save(arrays: st, metadata: [StateFile.baseContractKey: bb.baseFingerprint], url: url)
+    }
+
+    public enum LoadError: Error, CustomStringConvertible {
+        /// Адаптеры обучены на другой базе.
+        case otherBase(file: String, model: String)
+        public var description: String {
+            switch self {
+            case .otherBase(let f, let m):
+                return "адаптеры обучены на другой базе (base_fingerprint): отпечаток \(f.prefix(12))… в файле, "
+                    + "\(m.prefix(12))… у модели (плотная модель и её квантованные версии — "
+                    + "разные базы); allowOtherBase: true — загрузить всё равно"
+            }
+        }
     }
 
     /// Загрузить тензоры адаптеров в УЖЕ навешенную через add(...) модель
     /// (scale/слои берутся из add). Перезаписывает loraA/loraB по имени.
-    public static func load(_ bb: X070Backbone, from url: URL) throws {
-        let w = try loadArrays(url: url)
+    /// База сверяется, если файл её знает (записанный до ключа или
+    /// rwkv-metal — не знает).
+    public static func load(_ bb: X070Backbone, from url: URL,
+                            allowOtherBase: Bool = false) throws {
+        let (w, md) = try loadArraysAndMetadata(url: url)
+        if !allowOtherBase, let inFile = md[StateFile.baseContractKey] {
+            let here = bb.baseFingerprint
+            if inFile != here { throw LoadError.otherBase(file: inFile, model: here) }
+        }
         let dt = bb.loraA.values.first?.dtype ?? .bfloat16
         for (k, v) in w {
             if k.hasSuffix(".lora_a") { bb.loraA[String(k.dropLast(7))] = v.asType(dt) }

@@ -948,8 +948,6 @@ moved.
   with `RwkvqError.partialExport`, whose message says what is missing and what
   to do instead: re-export with a full `export_mlx`, or load the `.rwkvq`
   directly.
-- **The backbone is not recorded in any checkpoint.** A reranker or embedding
-  head loaded onto the wrong backbone differs in neither shape nor contract.
 - **Prefill is single-sequence.** It runs the parallel pass, but for one
   prompt at a time; several prompts mean several passes rather than one padded
   batch. `bodyWithState` already accepts a mask and per-row end indices, so

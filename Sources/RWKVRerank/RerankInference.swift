@@ -74,8 +74,12 @@ public struct RerankServingConfig: Sendable {
     /// `RerankerInference.prefixContract`. Отсутствие ключа в индексе —
     /// `none` (индекс, записанный до появления ключа, считается снятым без
     /// состояния).
+    ///
+    /// `base_fingerprint` — отпечаток базы (`StateFile.baseFingerprint`), тоже
+    /// свойство модели. Индекс без ключа (записанный до его появления) по
+    /// базе не сверяется.
     public static let prefixKeys = ["template", "instruct", "max_doc_tokens",
-                                    StateFile.contractKey]
+                                    StateFile.contractKey, StateFile.baseContractKey]
 
     public var prefixContract: [String: String] {
         contract.filter { Self.prefixKeys.contains($0.key) }
@@ -253,10 +257,11 @@ public final class RerankerInference {
     /// молча — формы сойдутся, качество упадёт, причину искать будет негде.
     public static func fromCheckpoint(
         base: X070Backbone, tokenizer: WorldTokenizer, head url: URL,
+        allowOtherBase: Bool = false,
         overrides: ((inout RerankServingConfig) -> Void)? = nil
     ) throws -> RerankerInference {
         let md = try Reranker.readHeadMetadata(url)
-        let model = try Reranker.fromHead(base: base, url: url)
+        let model = try Reranker.fromHead(base: base, url: url, allowOtherBase: allowOtherBase)
         var cfg = RerankServingConfig(metadata: md)
         overrides?(&cfg)
         return RerankerInference(model: model, tokenizer: tokenizer, config: cfg)
@@ -272,6 +277,7 @@ public final class RerankerInference {
         var c = config.prefixContract
         if let instruct { c["instruct"] = instruct }
         c[StateFile.contractKey] = model.base.initialStateFingerprint
+        c[StateFile.baseContractKey] = model.base.baseFingerprint
         return c
     }
 

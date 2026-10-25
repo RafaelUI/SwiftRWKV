@@ -287,7 +287,9 @@ var model = EmbeddingModel(backbone: base,
                            head: EmbeddingHead(dim: base.cfg.nEmbd, seed: args.seed),
                            stateScope: stateScope)
 // готовые состояние и голова (перенос на другую базу, оценка без обучения)
-if let path = args.headIn { model = try model.loadHead(from: URL(fileURLWithPath: expand(path))) }
+if let path = args.headIn {
+    model = try model.loadHead(from: URL(fileURLWithPath: expand(path)), allowOtherBase: args.allowOtherBase)
+}
 if let path = args.stateIn {
     let (state, info) = try StateFile.load(URL(fileURLWithPath: expand(path)), base: base,
                                            allowOtherBase: args.allowOtherBase)

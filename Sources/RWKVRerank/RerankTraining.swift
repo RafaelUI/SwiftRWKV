@@ -126,7 +126,7 @@ public enum RerankTraining {
         _ model: Reranker, cache: StateCache,
         contract: [String: String]? = nil, batchSize: Int = 64
     ) throws -> RankingMetrics {
-        let want = contract ?? cache.contract
+        let want = expected(contract, cache: cache, model)
         try cache.checkCompatible(head: model.head, contract: want)
         return try RerankMetrics.evaluate(model.head, cache: cache,
                                           batchSize: batchSize,
@@ -140,11 +140,13 @@ public enum RerankTraining {
     /// превращается в число, которое некому проверить.
     public static func evaluate(
         base: X070Backbone, head url: URL, cache: StateCache,
-        batchSize: Int = 64, headDType: DType = .float32
+        batchSize: Int = 64, headDType: DType = .float32,
+        allowOtherBase: Bool = false
     ) throws -> (metrics: RankingMetrics, contract: [String: String]) {
         let md = try Reranker.readHeadMetadata(url)
         let model = try Reranker.fromHead(base: base, url: url,
-                                          headDType: headDType)
+                                          headDType: headDType,
+                                          allowOtherBase: allowOtherBase)
         // Из метаданных берутся только ключи контракта подачи текста:
         // остальное там — форма головы, и её уже сверил `fromHead`.
         // Отпечаток начального состояния — тоже: голова училась на
@@ -157,6 +159,8 @@ public enum RerankTraining {
         if want[StateFile.contractKey] == nil {
             want[StateFile.contractKey] = StateFile.noInitialState
         }
+        // База головы уже сверена с моделью в `fromHead` (или разрешена
+        // чужая); кэш сверяется с базой МОДЕЛИ — её подставит `evaluate`.
         return (try evaluate(model, cache: cache, contract: want,
                              batchSize: batchSize), want)
     }
@@ -190,7 +194,7 @@ public enum RerankTraining {
         // может разъехаться, — отложенный кэш, собранный с другими
         // обрезками или другим шаблоном. Он отдельный файл и собирается
         // отдельным вызовом, так что это не гипотетический случай.
-        let want = contract ?? trainCache.contract
+        let want = expected(contract, cache: trainCache, model)
 
         // Срез разрешается ОДИН раз на прогон и дальше передаётся явно.
         // Это же и проверка совместимости: слои, которых в кэше нет, здесь
@@ -396,6 +400,20 @@ public enum RerankTraining {
     /// Ключ обучения для чекпоинта: всё, от чего зависят числа, — числа
     /// конфигурации (без частоты логов), формы кэшей и их контракт, срез
     /// слоёв, состав и формы параметров головы.
+    /// Ожидаемый контракт: заданный или контракт кэша, а база — из заданного,
+    /// если он её называет, иначе база МОДЕЛИ (из контракта самого кэша её
+    /// брать нельзя: кэш сверялся бы сам с собой). Голова инициализируется
+    /// из базы и учится на состояниях из кэша; кэш с другой базы (ключ есть и
+    /// не тот) — отказ, кэш без ключа по базе не сверяется.
+    static func expected(_ contract: [String: String]?, cache: StateCache,
+                         _ model: Reranker) -> [String: String] {
+        var c = contract ?? cache.contract
+        if contract?[StateFile.baseContractKey] == nil {
+            c[StateFile.baseContractKey] = model.base.baseFingerprint
+        }
+        return c
+    }
+
     static func resumeKey(config c: RerankTrainConfig, head: RerankerHead, trainCache: StateCache,
                           evalCache: StateCache?, contract: [String: String], trainSlots: [Int]) -> String {
         var parts = ["rerank-resume-v1", "\(c.lr)", "\(c.weightDecay)", "\(c.gradClip)", "\(c.batchSize)",

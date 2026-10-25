@@ -135,6 +135,16 @@ public extension X070Backbone {
     /// контракты кэшей реранкера.
     var initialStateFingerprint: String { StateFile.stateFingerprint(initialState) }
 
+    /// Отпечаток базы (`StateFile.baseFingerprint`), запомненный до первой
+    /// записи в веса. Входит в контракты кэшей и чекпоинтов, снятых на этой
+    /// базе (ключ `StateFile.baseContractKey`).
+    var baseFingerprint: String {
+        if let m = baseFingerprintMemo, m.version == stepVersion { return m.value }
+        let v = StateFile.baseFingerprint(self)
+        baseFingerprintMemo = (stepVersion, v)
+        return v
+    }
+
     /// Состояние для ПОШАГОВОГО декода с самого начала: подключённое либо
     /// нули. (`prefill` стартует с подключённого сам — он идёт параллельным
     /// проходом; это нужно тому, кто декодирует `step` с пустого места.)
@@ -519,7 +529,17 @@ public enum StateFile {
         // его в fp32 и округляет так же): через fp16, иначе два округления
         // подряд разошлись бы с одним.
         for name in ["blocks.0.tmix.r_proj", "blocks.\(cfg.nLayer - 1).cmix.value"] {
-            let row = bb.weight(name + ".weight")[0]
+            // База QLoRA (MLX-квантование на месте, `LoRA.quantizeBase`)
+            // плотной копии не держит: строка — из её кодов, через bf16.
+            // Раньше `weight(_:)` на такой базе падал.
+            let full: MLXArray
+            if let q = bb.quant[name + ".weight"] {
+                full = dequantized(q.wq, scales: q.scales, biases: q.biases,
+                                   groupSize: q.groupSize, bits: q.bits, dtype: .bfloat16)
+            } else {
+                full = bb.weight(name + ".weight")
+            }
+            let row = full[0]
             feed(name, row, lattice: row.dtype == .float16 ? .float16 : .bfloat16)
         }
         return h.finalize().map { String(format: "%02x", $0) }.joined()
@@ -534,6 +554,12 @@ public enum StateFile {
 
     /// Ключ отпечатка подключённого состояния в контрактах кэшей.
     public static let contractKey = "initial_state"
+    /// Ключ отпечатка БАЗЫ в контрактах кэшей и метаданных чекпоинтов
+    /// (кэш пар и индекс реранкера, головы реранкера и эмбеддера, адаптеры) —
+    /// тот же, что в файле состояния. Файл без ключа (записанный до его
+    /// появления или другим инструментом) по базе не сверяется: «неизвестно»
+    /// не значит «та же».
+    public static let baseContractKey = "base_fingerprint"
     /// Значение «состояния нет». Им же читается ОТСУТСТВИЕ ключа в файле,
     /// записанном до появления ключа: такой кэш считается снятым без
     /// состояния. Кэш, снятый с состоянием до этой правки, от него не

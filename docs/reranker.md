@@ -178,6 +178,22 @@ That is right for every such file except one built with a state attached
 between the arrival of states and this check; nothing in the file tells the two
 apart, so rebuild an index or cache that was made with a state.
 
+**So is the base.** States are a function of the base's weights, and a head is
+initialised from them, so the pair cache, the index and the head checkpoint
+also record `base_fingerprint` — `StateFile.baseFingerprint`, the same value a
+state file carries (a dense model, its `reduction` file and its `compression`
+file are three different bases; the same weights loaded as bf16 or fp32 are
+one). Training and evaluation compare the cache with the base of the **model**,
+not with the cache's own contract; serving compares the index with it;
+`Reranker.fromHead` / `RerankerInference.fromCheckpoint` refuse a head trained
+on another base with `RerankerError.otherBase` unless `allowOtherBase: true`
+(`rerank-run --allow-other-base` for `--eval-head` and `--serve-check`; the
+cache is then compared with the model's base). A cache, index or head written
+before the key existed — or by rwkv-metal, which does not write it yet — is
+not checked against the base: unknown is not the same as equal. A resumable
+training checkpoint (`checkpoint:`) written before this change no longer
+matches its run, because the expected contract now includes the base.
+
 One rule: **never assemble a serving configuration by hand when a checkpoint
 exists.** Defaults are the most likely source of silent quality loss here,
 precisely because they look plausible.
@@ -606,11 +622,6 @@ way.
 
 ## Not done
 
-- **The backbone is not recorded in the cache contract.** Caches from
-  **different** models are indistinguishable by shape and by contract;
-  merging catches this numerically via overlapping layers, but training on a
-  substituted cache does not. A weight fingerprint in the contract would close
-  the hole completely.
 - **Memory peak during merging.** `merged` assembles the result in row
   batches, but a batch itself lives in MLX in full; for very wide states that
   is noticeable.

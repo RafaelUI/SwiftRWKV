@@ -364,6 +364,9 @@ public enum RerankEncoder {
         // него (`model.encode` без явного состояния), так что кэш — функция и
         // его. Ключ пишется всегда, `none` — без состояния.
         contract[StateFile.contractKey] = model.base.initialStateFingerprint
+        // И база: состояния — функция её весов. Кэш с другой базы даёт
+        // правдоподобные формы и чужие числа.
+        contract[StateFile.baseContractKey] = model.base.baseFingerprint
 
         return try writer.finish(pairIndex: pairIndex,
                                  labels: samples.map { $0.label },

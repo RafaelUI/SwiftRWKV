@@ -267,9 +267,11 @@ public struct Embedder {
     /// потеря качества.
     public static func fromCheckpoint(backbone: X070Backbone,
                                       tokenizer: WorldTokenizer,
-                                      head url: URL) throws -> Embedder {
+                                      head url: URL,
+                                      allowOtherBase: Bool = false) throws -> Embedder {
         let (model, contract) = try EmbeddingModel.fromHead(backbone: backbone,
-                                                            url: url)
+                                                            url: url,
+                                                            allowOtherBase: allowOtherBase)
         return Embedder(model: model, tokenizer: tokenizer, contract: contract)
     }
 

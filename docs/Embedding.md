@@ -114,6 +114,15 @@ configured with the other (`initial_state_scope` in the checkpoint; a checkpoint
 without it means `.allTexts`). Without that check it would load fine and quietly produce plausible
 numbers from different geometry.
 
+The checkpoint also records the base it was trained on (`base_fingerprint`,
+`StateFile.baseFingerprint` — the dense model and its `.rwkvq` files are
+different bases; top layers committed by training are part of the base, an
+active trainable override is not). Loading onto another base is refused with
+`EmbeddingCheckpointError.otherBase`; `allowOtherBase: true` on
+`Embedder.fromCheckpoint`, `EmbeddingModel.fromHead` and `loadHead` (and
+`embed-run --allow-other-base` for `--head-in`) loads it anyway, for a
+deliberate transfer. A checkpoint without the key is not checked.
+
 `maxTokens` defaults to **512 everywhere** — serving, metrics and training
 stages alike. That was not always true: serving used to not truncate at all
 while evaluation truncated at 512, so on long texts the measured quality
@@ -913,9 +922,6 @@ IOAccelerator and only partly show up in `ps -o rss`. Use
 
 ## Not done
 
-- **The backbone is not recorded in the checkpoint.** A head trained on one
-  backbone and loaded onto another differs in neither shape nor contract. A
-  weight fingerprint would close this.
 - **A state bank has no file.** `StateFile` holds one state; a trained bank
   (`initialStateBank`) lives in memory, and its rows are known only by the order
   of the instructions it was built from.

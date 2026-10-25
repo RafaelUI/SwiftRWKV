@@ -73,6 +73,8 @@ public enum EmbeddingCheckpointError: Error, CustomStringConvertible {
     case shapeMismatch(String)
     case missingParameters([String])
     case contractMismatch(key: String, file: String, now: String)
+    /// Голова обучена на другой базе (отпечаток `base_fingerprint`).
+    case otherBase(file: String, model: String)
 
     public var description: String {
         switch self {
@@ -88,6 +90,13 @@ public enum EmbeddingCheckpointError: Error, CustomStringConvertible {
                 Вектор нормирован в обоих случаях, поэтому ошибки формы \
                 здесь не будет — будут правдоподобные числа от другой \
                 геометрии.
+                """
+        case .otherBase(let f, let m):
+            return """
+                голова обучена на другой базе (base_fingerprint): отпечаток \(f.prefix(12))… в файле, \
+                \(m.prefix(12))… у модели. Вектор нормирован и тут, ошибки формы \
+                не будет; плотная модель и её .rwkvq-файлы — тоже разные базы. \
+                allowOtherBase: true — загрузить всё равно.
                 """
         }
     }
@@ -110,6 +119,9 @@ extension EmbeddingModel {
         md["format"] = Self.checkpointFormat
         md["dim"] = String(head.dim)
         md["hidden"] = String(head.hidden)
+        // База, на которой голова обучена. Обученные верхние слои (подмена
+        // весов) и адаптеры в отпечаток не входят: он про базу.
+        md[StateFile.baseContractKey] = backbone.baseFingerprint
         if let extra { for (k, v) in extra { md[k] = v } }
 
         var arrays: [String: MLXArray] = [:]
@@ -131,9 +143,17 @@ extension EmbeddingModel {
     }
 
     @discardableResult
-    public func loadHead(from url: URL, strict: Bool = true) throws -> EmbeddingModel {
+    public func loadHead(from url: URL, strict: Bool = true,
+                         allowOtherBase: Bool = false) throws -> EmbeddingModel {
         let (weights, md) = try loadArraysAndMetadata(url: url)
         if strict {
+            // База сверяется, если файл её знает (записанный до ключа — нет).
+            if !allowOtherBase, let inFile = md[StateFile.baseContractKey] {
+                let here = backbone.baseFingerprint
+                if inFile != here {
+                    throw EmbeddingCheckpointError.otherBase(file: inFile, model: here)
+                }
+            }
             guard (md["format"] ?? "").hasPrefix("swiftrwkv-embedding-head") else {
                 throw EmbeddingCheckpointError.notAnEmbeddingHead(url.path)
             }
@@ -181,7 +201,8 @@ extension EmbeddingModel {
     /// Рекомендуемый способ загрузки. Пулинг и размеры головы не нужно
     /// помнить — а помнить пришлось бы: модель со сходными формами примет
     /// чужие веса молча, если не сверять.
-    public static func fromHead(backbone: X070Backbone, url: URL)
+    public static func fromHead(backbone: X070Backbone, url: URL,
+                                allowOtherBase: Bool = false)
         throws -> (model: EmbeddingModel, contract: EmbeddingContract) {
         let md = try readHeadMetadata(url)
         guard (md["format"] ?? "").hasPrefix("swiftrwkv-embedding-head") else {
@@ -193,7 +214,7 @@ extension EmbeddingModel {
         let head = EmbeddingHead(dim: dim, hidden: hidden)
         let model = EmbeddingModel(backbone: backbone, head: head,
                                    pooling: contract.pooling, stateScope: contract.stateScope)
-        try model.loadHead(from: url)
+        try model.loadHead(from: url, allowOtherBase: allowOtherBase)
         return (model, contract)
     }
 }
