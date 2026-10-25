@@ -87,6 +87,26 @@ final class RerankTrainingTests: XCTestCase {
                           "лосс не убыл")
     }
 
+    /// Кэш меньше пачки: обучение идёт пачками на весь кэш и даёт побитно то
+    /// же, что `batchSize = n` (раньше — выход за массив и падение процесса).
+    func testBatchLargerThanCache() throws {
+        func run(_ bs: Int) throws -> ([Float], Int) {
+            let (model, _) = try makeModel()
+            let cache = try makeLearnableCache(nSamples: 3, nCand: 4, nHead: model.base.cfg.nHead)
+            let r = try RerankTraining.train(model, trainCache: cache,
+                                             config: RerankTrainConfig(batchSize: bs, epochs: 3, seed: 3))
+            eval(model.head.fc2Weight)
+            return (model.head.fc2Weight.asArray(Float.self), r.steps)
+        }
+        let (big, steps) = try run(8)
+        let (exact, stepsExact) = try run(3)
+        XCTAssertEqual(steps, 3, "по шагу на эпоху")
+        XCTAssertEqual(steps, stepsExact)
+        XCTAssertEqual(big, exact, "пачка больше кэша обучила не так, как пачка на весь кэш")
+        let (one, _) = try run(1)
+        XCTAssertNotEqual(one, exact, "сравнение вырождено: размер пачки ни на что не влияет")
+    }
+
     /// Стартовый лосс — РОВНО ln(C), и это сообщается наружу.
     func testFirstLossIsLnC() throws {
         for C in [2, 4, 8] {

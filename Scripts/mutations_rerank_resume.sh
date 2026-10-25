@@ -50,3 +50,9 @@ run "моменты Adam не восстанавливаются" \
     "$TR" 'ms.append(d["m/" + name]?.asType(.float32)' 'ms.append(d["m_/" + name]?.asType(.float32)'
 run "счётчик Adam не восстанавливается" \
     "$TR" '            t = Int(meta[1].item(Int32.self))' '            t = 0'
+
+echo "── пачка больше кэша (25.10) ──"
+run "пачка не ограничена кэшем" \
+    "$RT" 'let bs = Swift.min(config.batchSize, n)' 'let bs = config.batchSize'
+run "пачка короче кэша при большом batchSize" \
+    "$RT" 'let bs = Swift.min(config.batchSize, n)' 'let bs = config.batchSize > n ? Swift.max(1, n - 1) : config.batchSize'

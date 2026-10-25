@@ -210,7 +210,10 @@ public enum RerankTraining {
         let head = model.head
         let n = trainCache.nSamples
         let C = trainCache.nCandidates
-        let stepsPerEpoch = Swift.max(1, n / config.batchSize)
+        // Пачка не больше кэша: запросов меньше, чем `batchSize`, — каждая
+        // пачка берёт их все (раньше срез выходил за массив и процесс падал).
+        let bs = Swift.min(config.batchSize, n)
+        let stepsPerEpoch = Swift.max(1, n / bs)
         let totalSteps = stepsPerEpoch * config.epochs
 
         let trainable = RerankerHeadTrainableSet(head)
@@ -234,12 +237,12 @@ public enum RerankTraining {
         var cursor = 0
 
         func nextBatch() -> [Int] {
-            if cursor + config.batchSize > order.count {
+            if cursor + bs > order.count {
                 order = rng.shuffled(order)
                 cursor = 0
             }
-            defer { cursor += config.batchSize }
-            return Array(order[cursor ..< cursor + config.batchSize])
+            defer { cursor += bs }
+            return Array(order[cursor ..< cursor + bs])
         }
 
         func objective(_ rows: [Int]) -> MLXArray {
