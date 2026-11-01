@@ -325,9 +325,22 @@ func stateBench(_ path: String) throws {
 
 /// Обучение состояния вместо системной строки (см. шапку).
 func distill() throws {
-    guard !args.system.isEmpty, !args.trainQuestions.isEmpty, !args.teacherCache.isEmpty,
-          !args.stateOut.isEmpty || !args.evalStates.isEmpty else {
-        print("--distill: нужны --system, --train-questions, --teacher-cache, --state-out"); exit(2)
+    // все проверки ключей — до учителя: ошибка в них не должна стоить минут генерации (01.11)
+    guard !args.system.isEmpty, !args.trainQuestions.isEmpty, !args.teacherCache.isEmpty else {
+        print("--distill: нужны --system, --train-questions, --teacher-cache"); exit(2)
+    }
+    guard ["state", "top", "lora"].contains(args.trainWhat) else { print("--train: state | top | lora"); exit(2) }
+    if args.trainWhat == "state" {
+        guard !args.stateOut.isEmpty || !args.evalStates.isEmpty else {
+            print("--distill --train state: нужен --state-out (или --eval-states)"); exit(2)
+        }
+    } else {
+        // сильный контроль: учатся веса, файл — --weights-out; состояния нет, --state-out не нужен
+        guard !args.weightsOut.isEmpty else { print("--train \(args.trainWhat): нужен --weights-out"); exit(2) }
+        guard args.heldOut == 0, args.evalStates.isEmpty else {
+            print("--held-out / --eval-states с --train \(args.trainWhat) не поддержаны"); exit(2)
+        }
+        guard args.initMode == "zero" else { print("--train \(args.trainWhat): --init не применим (состояния нет)"); exit(2) }
     }
     guard ["zero", "fold", "fold-wkv"].contains(args.initMode) else { print("--init: zero | fold | fold-wkv"); exit(2) }
     let cacheURL = URL(fileURLWithPath: expand(args.teacherCache))
@@ -462,13 +475,7 @@ func distill() throws {
     }
 
     if args.trainWhat != "state" {
-        // сильный контроль (30.10): те же данные и цикл, учатся веса; начального состояния нет
-        guard ["top", "lora"].contains(args.trainWhat) else { print("--train: state | top | lora"); exit(2) }
-        guard !args.weightsOut.isEmpty else { print("--train \(args.trainWhat): нужен --weights-out"); exit(2) }
-        guard heldBatches.isEmpty, args.evalStates.isEmpty else {
-            print("--held-out / --eval-states с --train \(args.trainWhat) не поддержаны"); exit(2)
-        }
-        guard args.initMode == "zero" else { print("--train \(args.trainWhat): --init не применим (состояния нет)"); exit(2) }
+        // сильный контроль (30.10): те же данные и цикл, учатся веса; начального состояния нет (ключи проверены в начале)
         let lc = LoRAConfig(lr: args.lr, gradClip: args.gradClip ?? 1.0, beta1: 0.9, beta2: 0.99,
                             maxSteps: args.steps, warmupSteps: min(20, args.steps / 10), cacheLimitGB: 0.25,
                             logEvery: args.logEvery, schedule: .cosine, lrMin: args.lr / 10)
