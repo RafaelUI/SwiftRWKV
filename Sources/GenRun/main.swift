@@ -396,6 +396,7 @@ func distill() throws {
             let r = base.generate(prompt: tok.encode(systemPart + userPart(q)), config: cfg,
                                   tokenizer: tok, state: &state)
             let a = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            GPU.clearCache()      // длины вопросов разные: без очистки кэш MLX копит буферы (01.11: пик 12.3 ГБ на статьях Lenta)
             total[kind, default: 0] += 1
             let ok: Bool
             switch kind {
@@ -694,6 +695,7 @@ for (qi, q) in questions.enumerated() {
             sampling: SamplingConfig(temperature: args.temp, topP: args.topP, seed: args.seed &+ UInt64(s)))
         let r = base.generate(prompt: tok.encode(prompt), config: cfg, tokenizer: tok, state: &state)
         answers.append(r.text.trimmingCharacters(in: .whitespacesAndNewlines))
+        GPU.clearCache()          // то же для --questions разной длины (на числа не влияет)
     }
     print("\n[\(qi)] \(q)")
     for (s, a) in answers.enumerated() { print("  #\(s): \(a.replacingOccurrences(of: "\n", with: " ⏎ "))") }
