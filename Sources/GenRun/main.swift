@@ -18,6 +18,13 @@ import RWKVGen
 //    none   — без системной строки (с --state-in — обученное состояние).
 //  Вопросы — по строке в файле; пустые и начинающиеся с # пропускаются.
 //
+//  Многоходовый диалог (--dialogues d.json вместо --questions, 01.11):
+//      [{"id": "…", "turns": ["q1", "q2", …], "max_tokens": [80, …, 120]?}, …]
+//  Ход k — генерация с нуля по префиксу (системная строка при inline) и всем прошлым
+//  ходам (Dialogue.run: вопрос + сырой ответ + «\n\n»); сид хода k сэмпла s —
+//  seed + s + 1000·k (ход 0 = одиночный вопрос побитно). В --out — ответы по сэмплам
+//  и ходам и длина промпта каждого хода в токенах.
+//
 //  Обучение состояния вместо системной строки (--distill):
 //      gen-run --model M --vocab V --system "…" --distill
 //              --train-questions t.txt --teacher-cache d.json
@@ -74,7 +81,7 @@ import RWKVGen
 
 struct Args {
     var model = "", vocab = "", questions = "", system = "", mode = "inline"
-    var stateIn: String? = nil, out: String? = nil
+    var stateIn: String? = nil, out: String? = nil, dialogues: String? = nil
     var samples = 1, temp: Float = 0, topP: Float = 1, seed: UInt64 = 0, maxTokens = 160
     var think = false
     var distill = false, trainQuestions = "", teacherCache = "", stateOut = ""
@@ -99,6 +106,7 @@ func parse() -> Args {
         case "--model": a.model = v()
         case "--vocab": a.vocab = v()
         case "--questions": a.questions = v()
+        case "--dialogues": a.dialogues = v()            // многоходовый диалог вместо --questions (01.11)
         case "--system": a.system = v()
         case "--mode": a.mode = v()
         case "--state-in": a.stateIn = v()
@@ -185,7 +193,8 @@ func loadBase(_ path: String) throws -> X070Backbone {
 }
 
 let args = parse()
-guard !args.model.isEmpty, !args.vocab.isEmpty, !args.questions.isEmpty || args.distill || args.stateBench != nil
+guard args.dialogues == nil || args.questions.isEmpty else { print("--dialogues и --questions вместе нельзя"); exit(2) }
+guard !args.model.isEmpty, !args.vocab.isEmpty, !args.questions.isEmpty || args.dialogues != nil || args.distill || args.stateBench != nil
         || (args.stateIn != nil && !args.stateOut.isEmpty) else {
     print("нужны --model, --vocab, --questions"); exit(2)
 }
@@ -202,7 +211,14 @@ func lines(_ path: String) throws -> [String] {
         .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }
 }
 let convert = !args.distill && args.stateIn != nil && !args.stateOut.isEmpty
-let questions = args.distill || args.stateBench != nil || convert ? [] : try lines(args.questions)
+let questions = args.distill || args.stateBench != nil || convert || args.dialogues != nil ? [] : try lines(args.questions)
+struct DialogueSpec: Decodable { let id: String; let turns: [String]; let max_tokens: [Int]? }
+let dialogues: [DialogueSpec] = try args.dialogues.map {
+    try JSONDecoder().decode([DialogueSpec].self, from: Data(contentsOf: URL(fileURLWithPath: expand($0))))
+} ?? []
+for d in dialogues where d.turns.isEmpty || (d.max_tokens.map { $0.count != d.turns.count } ?? false) {
+    print("диалог \(d.id): пустой или max_tokens не по числу ходов"); exit(2)
+}
 
 let t0 = Date()
 let base = try loadBase(args.model)
@@ -619,11 +635,48 @@ if let path = args.stateIn {
 }
 if args.mode == "fold" {
     precondition(args.stateIn == nil, "--mode fold и --state-in вместе: свёртка стартовала бы с обученного")
-    let whole = tok.encode(systemPart + userPart(questions[0]))
-    let pieces = tok.encode(systemPart) + tok.encode(userPart(questions[0]))
+    let q0 = questions.first ?? dialogues.first?.turns.first ?? "?"
+    let whole = tok.encode(systemPart + userPart(q0))
+    let pieces = tok.encode(systemPart) + tok.encode(userPart(q0))
     print(whole == pieces ? "токенизация кусков = сплошной (первый вопрос)"
                           : "ВНИМАНИЕ: токенизация кусков расходится со сплошной — fold не обязан совпасть с inline")
     base.initialState = base.foldPrompt(tok.encode(systemPart))
+}
+
+if !dialogues.isEmpty {
+    // многоходовый диалог (01.11): см. шапку и Dialogue.run
+    var drows: [[String: Any]] = []
+    for d in dialogues {
+        var answers: [[String]] = [], promptTokens: [[Int]] = []
+        for s in 0 ..< args.samples {
+            var lens: [Int] = []
+            let turns = Dialogue.run(prefix: args.mode == "inline" ? systemPart : "", turns: d.turns, userPart: userPart) { p, k in
+                let ids = tok.encode(p); lens.append(ids.count)
+                var state = base.startState()
+                let cfg = GenerationConfig(
+                    maxTokens: d.max_tokens?[k] ?? args.maxTokens, stopStrings: ["\n\nUser:", "\n\nSystem:"], stopTokens: [0],
+                    sampling: SamplingConfig(temperature: args.temp, topP: args.topP,
+                                             seed: args.seed &+ UInt64(s) &+ UInt64(k) &* 1000))
+                return base.generate(prompt: ids, config: cfg, tokenizer: tok, state: &state).text
+            }
+            answers.append(turns.map { $0.reply.trimmingCharacters(in: .whitespacesAndNewlines) })
+            promptTokens.append(lens)
+        }
+        print("\n[\(d.id)] ходов \(d.turns.count), промпт последнего хода \(promptTokens.first?.last ?? 0) токенов")
+        for (s, a) in answers.enumerated() { print("  #\(s): \(a.last!.replacingOccurrences(of: "\n", with: " ⏎ "))") }
+        fflush(stdout)
+        drows.append(["id": d.id, "turns": d.turns, "answers": answers, "prompt_tokens": promptTokens])
+    }
+    print(String(format: "\nвсего %.1f с", Date().timeIntervalSince(t0)))
+    if let out = args.out {
+        let report: [String: Any] = ["model": args.model, "mode": args.mode, "system": args.system,
+                                     "state_in": args.stateIn ?? "", "samples": args.samples,
+                                     "temp": Double(args.temp), "top_p": Double(args.topP),
+                                     "seed": Int(args.seed), "think": args.think, "dialogues": drows]
+        try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+            .write(to: URL(fileURLWithPath: expand(out)))
+    }
+    exit(0)
 }
 
 var rows: [[String: Any]] = []
