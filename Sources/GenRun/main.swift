@@ -657,7 +657,11 @@ if !dialogues.isEmpty {
                     maxTokens: d.max_tokens?[k] ?? args.maxTokens, stopStrings: ["\n\nUser:", "\n\nSystem:"], stopTokens: [0],
                     sampling: SamplingConfig(temperature: args.temp, topP: args.topP,
                                              seed: args.seed &+ UInt64(s) &+ UInt64(k) &* 1000))
-                return base.generate(prompt: ids, config: cfg, tokenizer: tok, state: &state).text
+                let text = base.generate(prompt: ids, config: cfg, tokenizer: tok, state: &state).text
+                // промпт растёт с каждым ходом: без очистки кэш MLX держит буферы под каждую длину
+                // (0.4B: пик 10–13 ГБ и +3 ГБ свопа за 4 плеча, 01.11); на числа не влияет
+                GPU.clearCache()
+                return text
             }
             answers.append(turns.map { $0.reply.trimmingCharacters(in: .whitespacesAndNewlines) })
             promptTokens.append(lens)
